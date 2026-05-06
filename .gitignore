@@ -1,0 +1,11 @@
+# macOS
+.DS_Store
+
+# Agent / IDE local state
+.claude/settings.local.json
+.omc/
+
+# Rust (for when src/ lands)
+/target
+**/*.rs.bk
+Cargo.lock
