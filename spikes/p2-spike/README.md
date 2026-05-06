@@ -1,53 +1,44 @@
-# P2 Spike
+# P2 Spike — VERIFIED 2026-05-06
 
-Throwaway binary that verifies the two load-bearing assumptions of `rok-bot` v0.1:
+The bash spike in this directory verified the two load-bearing assumptions of the rok-bot v0.1 architecture against an iOS-on-Mac (Catalyst-class) target.
 
-| Premise | What it tests |
+## Result
+
+| Test | Outcome |
 |---|---|
-| **P2a** | Can xcap capture an off-screen RoK window? |
-| **P2b** | Does an off-screen window accept a synthetic CGEvent click via enigo? |
+| **P2a:** capture an iOS-on-Mac window across Spaces / on a non-primary display | ✅ PASS — `screencapture -l <wid>` produced a 2238×1776 PNG of RoK on a BetterDisplay virtual screen at `(-1536, 59)` |
+| **P2b:** synthetic CGEvent click reaches RoK at virtual-display coordinates | ✅ PASS — 6,159,216 differing bytes between before/after captures |
 
-If P2a fails, the v0.1 architecture must use `screencapturekit` instead of `xcap`. If P2b fails, the off-screen-window technique is dead and v0.1 needs the visible-window-with-anti-focus-steal fallback documented in `../../TODOS.md`.
+Side findings recorded in `docs/rok_rust_bot_research.md` § 3:
 
-## Prerequisites
+| Mechanism we tried for "make RoK invisible" | Outcome |
+|---|---|
+| `osascript` / System Events `set position of window 1` | DEAD — RoK has 0 windows in the AX tree |
+| Private CGS `CGSMoveWindow` (default connection) | Silent no-op |
+| Private CGS `CGSMoveWindow` (owner connection) | Explicit `kCGErrorCannotComplete` denial |
+| `CGEventPostToPid` (process-targeted input) | DEAD — 0 differing bytes |
 
-1. **Rise of Kingdoms running.** Mac App Store version on Apple Silicon, macOS 12.3+. Launch it and let it sit at the world or city view.
-2. **Three permissions** for whatever process runs this binary (Terminal if `cargo run`, the binary itself if you build a release artifact). Each grant requires a binary restart:
-   - **Screen Recording** — for xcap's capture
-   - **Accessibility** — for enigo / CGEvent
-   - **Automation / AppleEvents** — for `osascript` controlling System Events
+**Conclusion:** No external process can hide, move, or process-target an iOS-on-Mac window on Apple Silicon. The architectural pivot: park RoK on a virtual display (BetterDisplay free version) and operate on it via standard `CGWindowListCopyWindowInfo` + `screencapture` + `CGEvent.post`. Verified.
 
-   First run will prompt; the binary will exit with a clear error each time. Grant the permission, re-run.
+## What's in this directory
 
-## Run
+- **`run.sh`** — the canonical, working spike. Bash + embedded Swift + `screencapture` + `cmp` for diff. Run from any terminal that has Screen Recording + Accessibility granted to it. RoK must be running.
+- **`README.md`** — this file.
+
+The original Rust spike was deleted because the `screencapturekit` Rust crate (1.5.x) has an internal Swift bridge that requires the full Xcode SDK to build. v0.1 will use `objc2-screen-capture-kit` instead, which does not have this constraint. See `docs/cargo_dependency_audit.md` for the dependency note.
+
+## To re-run
 
 ```bash
-cd spikes/p2-spike
-cargo run --release -- --title "Rise of Kingdoms"
+./run.sh RiseOfKingdoms
 ```
 
-If your installed RoK has a different window title (localization, regional version), pass a substring that matches it.
+Prerequisites:
+- RoK running, parked on a virtual display (BetterDisplay or equivalent).
+- Three macOS permissions granted to the terminal app: Screen Recording, Accessibility. (Automation/AppleEvents is *not* needed by `run.sh` directly, though some early iterations of the script invoked osascript reposition; the current version skips that step entirely.)
 
-## What it does
+Output is three PNGs in `/tmp/p2_spike_*.png` plus a verdict block on stdout.
 
-1. Enumerates windows via xcap, finds the RoK window, prints its title/app/position/size.
-2. Captures a baseline frame while the window is still visible (sanity check).
-3. Repositions the window to `(-9999, -9999)` via `osascript`.
-4. Verifies the window actually moved.
-5. **P2a:** captures an off-screen frame.
-6. **P2b:** posts a click at the off-screen window's center via enigo, waits 800ms, captures again, computes pixel diff.
-7. Restores the window to its original position.
-8. Prints PASS / LIKELY FAIL verdicts.
+## Disposable
 
-## Outputs
-
-Three PNGs in `/tmp/`:
-- `p2_spike_0_baseline.png` — visible RoK, sanity baseline.
-- `p2_spike_1_offscreen_before_click.png` — off-screen, pre-click.
-- `p2_spike_2_offscreen_after_click.png` — off-screen, post-click.
-
-The verdict on P2b is *probabilistic*: animations cause ~0.5–2.0 L1 channel delta per pixel even without any click effect. A real click landing on a button or popup typically pushes diff well above that. Visual inspection of the two off-screen PNGs is the final answer.
-
-## Throwaway
-
-Once P2 is resolved, delete `spikes/p2-spike/` and start v0.1. This directory has zero dependencies on the rest of the project and is safe to remove.
+This spike is a verification artifact. Once v0.1 is implementing the same architecture in Rust against `objc2-screen-capture-kit`, this directory can be deleted with no loss.

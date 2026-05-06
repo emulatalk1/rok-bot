@@ -129,43 +129,56 @@ main.py
 
 ## 3. Headless Mode Analysis
 
-### The Core Constraint
-`xcap` documentation explicitly states:
-> "minimized windows cannot be captured"
+> **Updated 2026-05-06 — major architectural finding from the P2 spike.**
+> The original "off-screen window via `osascript`" approach is dead for iOS-on-Mac apps. The autonomous-twin vision is preserved via a different mechanism: parking RoK on a virtual display.
 
-This is confirmed in the source code:
-```rust
-// From xcap source
-if window.is_minimized().unwrap() {
-    continue;  // skipped — cannot capture
-}
-```
+### The Catalyst / iOS-on-Mac Sandbox Constraint
 
-### Viable Headless Strategies (ranked)
+Rise of Kingdoms on Mac App Store is an iOS-on-macOS app (bundle ID `com.rok.ios.vn`, Catalyst-class runtime). These apps are **architecturally sandboxed from external window manipulation** by every mechanism we tested:
 
-| Strategy | How | Works with SCK? | Works with xcap? |
-|---|---|---|---|
-| Off-screen position | `osascript` move to `{-9999, -9999}` | ✅ Yes | ✅ Yes |
-| macOS Space | Full-screen in Space 2 | ✅ Yes | ✅ Yes |
-| Minimized | `set miniaturized to true` | ❌ No | ❌ No |
-| Hidden (`NSApp hide`) | Process hidden | ❌ Blocked by game | ❌ No |
+| Approach | Result | Evidence |
+|---|---|---|
+| `osascript` / System Events `set position of window 1` | ❌ DEAD | RoK exposes **0 windows** to the AX tree; only "menu bar" is visible. `tell process "RiseOfKingdoms" to count windows` returns `0`. |
+| Private CGS API `CGSMoveWindow` (default connection) | ❌ Silent no-op | Returns 0 (success) but window does not move. The system humors the call but does nothing. |
+| Private CGS API `CGSMoveWindow` (owner connection) | ❌ Explicit denial | Returns `kCGErrorCannotComplete` (268435459). The OS actively refuses cross-process manipulation of iOS-on-Mac windows. |
+| `CGEventPostToPid` (process-targeted input) | ❌ DEAD | 0 differing bytes after click via `postToPid`; same click via global `CGEvent.post` → 6.2M differing bytes. The API is a no-op for iOS-on-Mac. |
 
-**Recommended approach:**
-```bash
-# Move window off-screen — game renders, SCK captures, user not disturbed
-osascript -e 'tell application "System Events"
-    tell process "Rise of Kingdoms"
-        set position of window 1 to {-9999, -9999}
-    end tell
-end tell'
-```
+**Conclusion:** No external process can hide, move, or process-target an iOS-on-Mac window on Apple Silicon. The runtime is closed.
 
-### Verification Tasks
-```
-- [ ] Test xcap Window::capture_image() on off-screen window (should work)
-- [ ] Test xcap on minimized window (should fail/return error)
-- [ ] Confirm screencapturekit v1.5 works on off-screen window via SCContentFilter
-```
+### What does work — the virtual-display approach
+
+The autonomous-twin vision ("bot drives RoK while user works") is achievable via a **virtual / phantom display** rather than off-screen window manipulation. The setup:
+
+1. Create a virtual display via [BetterDisplay](https://github.com/waydabber/BetterDisplay) (free version supports basic virtual screens). One-time install, free for non-business use, native Apple Silicon, no kernel extensions.
+2. User manually drags RoK to the virtual display once (programmatic move is impossible per above; manual drag works because it goes through standard WindowServer hit-testing).
+3. RoK now lives on a display the user cannot see. The user works on the primary display fullscreen.
+4. The bot operates on RoK at its virtual-display coordinates using only **standard, public APIs**:
+   - **Capture:** `CGWindowListCopyWindowInfo` + `screencapture -l <wid>` (works across all displays and Spaces)
+   - **Click:** `CGEvent.post(tap: .cghidEventTap)` at the window's actual coordinates (which now fall on the virtual display)
+
+### Verified end-to-end (2026-05-06 spike)
+
+With RoK parked on a 1536×864 virtual display at `(-1536, 59)`:
+
+| Test | Result |
+|---|---|
+| `screencapture -l 64793 → 2238×1776 PNG` of RoK at virtual-display coords | ✅ PASS |
+| `CGEvent.post` left-click at the window's center on the virtual display | ✅ PASS |
+| Differing bytes between before/after frames after the click | **6,159,216** — definitive state change |
+
+### Hardware alternatives to BetterDisplay
+
+If software-virtual-display is undesirable for any reason:
+- **HDMI dummy plug** (~$5): plug into a Thunderbolt/USB-C-via-HDMI adapter. Mac sees a 1080p/4K monitor with no physical screen attached. EDID-only emulator, hardware-stable across macOS updates.
+- **iPad as Sidecar**: Apple's built-in feature. Park RoK on the iPad, put the iPad face-down. Free if you own a 2018+ iPad.
+- **Sidecar via iPhone**: not supported by Apple. Third-party tools (Duet Display etc.) exist but small screen + cost + flakiness make them worse than BetterDisplay or a dummy plug.
+
+### What's *not* required
+
+- No private CGS APIs (we proved they're blocked anyway).
+- No osascript / AppleScript (RoK doesn't expose AX windows).
+- No focus stealing (clicks land on the virtual display regardless of which Space the user is in).
+- No re-architecture if the user later adds a real second monitor (the bot just operates on whatever display RoK is on).
 
 ---
 
@@ -187,6 +200,7 @@ end tell'
 - **Last publish:** 2026-03-09
 - **crates.io:** https://crates.io/crates/screencapturekit
 - **GitHub:** https://github.com/doom-fish/screencapturekit-rs
+- **🚨 Build constraint discovered 2026-05-06:** the crate uses an internal Swift-bridge package that requires the **full Xcode** SDK to build (`xcrun --sdk macosx --show-sdk-platform-path` must succeed). Command Line Tools alone are not enough — the build script fails with `unable to lookup item 'PlatformPath' in SDK '/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk'`. **Recommend `objc2-screen-capture-kit` instead** (direct ObjC2 bindings, no Swift bridge, builds with CLT).
 - **Requires:** macOS 12.3+
 - **API style:** Async-first (tokio compatible), streaming frames via callback
 

@@ -67,7 +67,7 @@ The doc deliberately avoids two crates. Both calls hold up:
 
 | Crate | Doc pin | Resolves to | Last publish |
 |---|---|---|---|
-| screencapturekit | `1.5` | 1.5.4 | 2026-03-09 |
+| screencapturekit | `1.5` | 1.5.4 | 2026-03-09 | ⚠️ build needs full Xcode (Swift bridge); use `objc2-screen-capture-kit` instead
 | core-graphics | `0.25` | 0.25.0 | 2025-05-27 |
 | image | `0.25` | 0.25.10 | 2026-03-10 |
 | tesseract | `0.15` | 0.15.2 | 2025-04-19 |
@@ -90,7 +90,9 @@ Apply six pin changes (one fixes the build, five take advantage of newer release
 [dependencies]
 
 # Screen Capture
-screencapturekit = "1.5"      # 1.5.4 — current
+# screencapturekit = "1.5"   # ⚠️ Swift-bridge build requires full Xcode SDK
+# Use objc2-screen-capture-kit (raw ObjC2 bindings, builds with CLT alone) instead.
+objc2-screen-capture-kit = "0.3"  # ObjC2 SCK bindings — preferred for v0.1+
 xcap             = "0.9"      # was "0.8" — 0.9 is the new mainline
 
 # Input

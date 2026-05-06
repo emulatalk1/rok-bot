@@ -4,6 +4,8 @@
 # Agent / IDE local state
 .claude/settings.local.json
 .omc/
+.idea/
+.vscode/
 
 # Rust (for when src/ lands)
 /target
