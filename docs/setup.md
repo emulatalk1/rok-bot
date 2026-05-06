@@ -9,7 +9,7 @@
 
 The bot auto-detects which mode to use by reading where RoK's window is. No CLI flag, no config file. Drag RoK between displays to switch.
 
-This guide covers Mode 2 setup with **BetterDisplay** (free, no real hardware required). If you already have a second monitor or HDMI dummy plug, skip to [Author the shortcuts](#3-author-two-shortcuts) — Mode 2 detection works with any non-primary display.
+This guide covers Mode 2 setup with **BetterDisplay** (free, no real hardware required). If you already have a second monitor, HDMI dummy plug, or iPad via Sidecar, you can skip the shortcut authoring entirely — see [the alternatives section](#optional-hdmi-dummy-plug-or-ipad-sidecar-instead-of-betterdisplay) at the bottom. The bot's Mode 2 detection works with any always-on non-primary display, and the shortcuts are only needed when the bot manages BetterDisplay's virtual-display lifecycle.
 
 ---
 
