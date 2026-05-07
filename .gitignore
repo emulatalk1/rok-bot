@@ -6,8 +6,13 @@
 .omc/
 .idea/
 .vscode/
+.gstack/
 
 # Rust
 /target
 **/*.rs.bk
 # Cargo.lock IS committed (binary crate — reproducible builds)
+
+# Runtime artifacts (v0.1.1+ capture output, future per-run state)
+/rok-capture.png
+/rok-capture-*.png

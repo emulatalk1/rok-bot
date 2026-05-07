@@ -24,6 +24,15 @@ pub enum BotError {
          System Settings → Privacy & Security → {which}, then re-run."
     )]
     PermissionsMissing { which: &'static str },
+
+    /// `screencapture` subprocess returned non-zero or failed to spawn.
+    /// `exit_code` is `None` if the process couldn't be spawned (e.g.,
+    /// `/usr/sbin/screencapture` missing) or was killed by signal.
+    #[error(
+        "screencapture failed (exit code: {exit_code:?}). Ensure Screen Recording is \
+         granted to your terminal app and the RoK window ID is still valid."
+    )]
+    CaptureFailed { exit_code: Option<i32> },
 }
 
 impl BotError {
@@ -34,6 +43,7 @@ impl BotError {
             Self::WindowScreenUnresolved => 11,
             Self::RokNotOnPrimary => 12,
             Self::PermissionsMissing { .. } => 13,
+            Self::CaptureFailed { .. } => 14,
         }
     }
 }
@@ -54,6 +64,7 @@ mod tests {
                 which: "Screen Recording",
             }
             .exit_code(),
+            BotError::CaptureFailed { exit_code: Some(1) }.exit_code(),
         ];
         let mut sorted: Vec<i32> = codes.to_vec();
         sorted.sort_unstable();
@@ -74,6 +85,20 @@ mod tests {
             }
             .exit_code(),
             13
+        );
+        assert_eq!(
+            BotError::CaptureFailed { exit_code: Some(1) }.exit_code(),
+            14
+        );
+        assert_eq!(BotError::CaptureFailed { exit_code: None }.exit_code(), 14);
+    }
+
+    #[test]
+    fn capture_failed_message_mentions_screen_recording() {
+        let msg = BotError::CaptureFailed { exit_code: Some(1) }.to_string();
+        assert!(
+            msg.contains("Screen Recording"),
+            "capture failure should hint at the most likely root cause: {msg}"
         );
     }
 

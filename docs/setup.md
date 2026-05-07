@@ -27,14 +27,15 @@ Boot sequence (logged to stderr via `tracing`):
 1. **Screen Recording preflight.** First run on a fresh Mac triggers macOS's permission prompt and registers your terminal in System Settings → Privacy & Security → Screen Recording. Subsequent runs are silent. If you deny, exit code 13 (`PermissionsMissing`).
 2. **Find the RoK main window.** Filtered by `kCGWindowOwnerName == kCGWindowName == "RiseOfKingdoms"` AND backed by a process whose bundle ID starts with `com.rok.ios.` (anti-spoof gate against any local process that names itself "RiseOfKingdoms"). Exit 10 (`WindowNotFound`) if no match.
 3. **Classify display.** `CGDisplayIsBuiltin` test — built-in (laptop Retina panel) → `Mode::Visible`, anything else → `Mode::Virtual`. Exit 12 (`RokNotOnPrimary`) on Virtual in v0.1.
-4. **Mode::Visible:** log success and exit 0. v0.1 stops here. Future milestones add capture, target-image matching, and click synthesis.
+4. **Mode::Visible:** capture the RoK window to `./rok-capture.png` via `/usr/sbin/screencapture -l <window_id> -x -o` (silent, no shadow). Exit 14 (`CaptureFailed`) if `screencapture` returns non-zero. Otherwise log success and exit 0. v0.1.1 stops here. Future sub-milestones add target-image matching (v0.1.2), click synthesis (v0.1.3), and after-state verification (v0.1.4).
 
 Exit codes for shell users:
-- `0` = Mode 1 happy path
+- `0` = Mode 1 happy path (capture written)
 - `10` = `WindowNotFound`
 - `11` = `WindowScreenUnresolved`
 - `12` = `RokNotOnPrimary` (drag RoK to your built-in display, re-run)
 - `13` = `PermissionsMissing` (grant Screen Recording, re-run)
+- `14` = `CaptureFailed` (rare; usually means Screen Recording was revoked between preflight and capture)
 
 ## Optional — install pre-commit hooks (contributors)
 
