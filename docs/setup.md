@@ -1,25 +1,40 @@
 # Setup
 
-`rok-bot` runs in two modes depending on where Rise of Kingdoms is parked.
+> **v0.1 status:** Only **Mode 1 (visible)** is implemented today. The Mode 2 sections below describe the v0.2 plan and remain useful as a forward-looking guide, but if you run v0.1 with RoK on a non-built-in display, the bot will exit `RokNotOnPrimary` (exit 12) with a message asking you to drag RoK to your built-in display. See [TODOS.md](../TODOS.md) for the v0.2 Mode 2 lifecycle work.
 
-| Mode | RoK is on... | Bot behavior | Your machine while bot runs |
-|---|---|---|---|
-| **Mode 1 — Visible** | Primary (built-in) display | Bot runs in foreground, you watch | You can't really use the Mac |
-| **Mode 2 — Background** | A non-primary display (a BetterDisplay virtual display, an HDMI dummy plug, an iPad via Sidecar, or a real second monitor) | Bot runs invisibly on that display | You keep using the Mac normally |
+`rok-bot` is designed to run in two modes depending on where Rise of Kingdoms is parked.
+
+| Mode | RoK is on... | Bot behavior | Your machine while bot runs | Status |
+|---|---|---|---|---|
+| **Mode 1 — Visible** | Built-in display (laptop Retina panel; `CGDisplayIsBuiltin` test, NOT the menu-bar display) | Detect window + classify display; v0.1 stops here, future milestones add capture/click | Bot is idle in v0.1 today; once gameplay automation lands, you'll watch it work | **v0.1 ✅ shipped** |
+| **Mode 2 — Background** | A non-built-in display (a BetterDisplay virtual display, an HDMI dummy plug, an iPad via Sidecar, or a real second monitor) | Bot runs invisibly on that display via BD virtual-display lifecycle management | You keep using the Mac normally | **v0.2 — planned, not yet shipped** |
 
 The bot auto-detects which mode to use by reading where RoK's window is. No CLI flag, no config file. Drag RoK between displays to switch.
 
-This guide covers Mode 2 setup with **BetterDisplay** (free, no real hardware required). If you already have a second monitor, HDMI dummy plug, or iPad via Sidecar, you can skip the shortcut authoring entirely — see [the alternatives section](#optional-hdmi-dummy-plug-or-ipad-sidecar-instead-of-betterdisplay) at the bottom. The bot's Mode 2 detection works with any always-on non-primary display, and the shortcuts are only needed when the bot manages BetterDisplay's virtual-display lifecycle.
+The Mode 2 sections below cover setup with **BetterDisplay** (free, no real hardware required). If you already have a second monitor, HDMI dummy plug, or iPad via Sidecar, you can skip the shortcut authoring entirely — see [the alternatives section](#optional-hdmi-dummy-plug-or-ipad-sidecar-instead-of-betterdisplay) at the bottom. The bot's Mode 2 detection will work with any always-on non-built-in display once v0.2 ships; the shortcuts are only needed when the bot manages BetterDisplay's virtual-display lifecycle.
 
 ---
 
-## Mode 1 — zero setup
+## Mode 1 — zero setup (v0.1 shipped)
 
-Make sure RoK is on your built-in display, run the bot. That's it. Useful for first-run debugging, demos, or when you don't need the machine for other work.
+Make sure RoK is on your built-in display, then run the bot.
 
 ```sh
-cargo run
+cargo run --release
 ```
+
+Boot sequence (logged to stderr via `tracing`):
+1. **Screen Recording preflight.** First run on a fresh Mac triggers macOS's permission prompt and registers your terminal in System Settings → Privacy & Security → Screen Recording. Subsequent runs are silent. If you deny, exit code 13 (`PermissionsMissing`).
+2. **Find the RoK main window.** Filtered by `kCGWindowOwnerName == kCGWindowName == "RiseOfKingdoms"` AND backed by a process whose bundle ID starts with `com.rok.ios.` (anti-spoof gate against any local process that names itself "RiseOfKingdoms"). Exit 10 (`WindowNotFound`) if no match.
+3. **Classify display.** `CGDisplayIsBuiltin` test — built-in (laptop Retina panel) → `Mode::Visible`, anything else → `Mode::Virtual`. Exit 12 (`RokNotOnPrimary`) on Virtual in v0.1.
+4. **Mode::Visible:** log success and exit 0. v0.1 stops here. Future milestones add capture, target-image matching, and click synthesis.
+
+Exit codes for shell users:
+- `0` = Mode 1 happy path
+- `10` = `WindowNotFound`
+- `11` = `WindowScreenUnresolved`
+- `12` = `RokNotOnPrimary` (drag RoK to your built-in display, re-run)
+- `13` = `PermissionsMissing` (grant Screen Recording, re-run)
 
 ## Optional — install pre-commit hooks (contributors)
 
@@ -34,7 +49,9 @@ After that, every commit runs fmt-check and every push runs clippy + tests. Skip
 
 ---
 
-## Mode 2 — one-time setup
+## Mode 2 — one-time setup (v0.2 planned, not yet shipped)
+
+> The setup below describes the v0.2 plan. Authoring the shortcuts and creating the BD virtual display now is harmless and prepares you for v0.2 — but on v0.1 the bot will not actually use them. RoK on a non-built-in display in v0.1 returns `RokNotOnPrimary` (exit 12).
 
 ### 1. Install BetterDisplay
 

@@ -52,7 +52,7 @@ The two-mode runtime contract design splits into two milestones per Codex tensio
 ## P2 (partially done): TCC permissions preflight
 
 **Source:** /plan-eng-review codex tension 4
-**Status:** Screen Recording check ✅ DONE in v0.1 (`src/permissions.rs::check_screen_recording`, wired as the first step in `main.rs::run()`). Uses the safe `core_graphics::access::ScreenCaptureAccess::preflight()` wrapper — no unsafe code in our crate. Returns `BotError::PermissionsMissing { which: "Screen Recording" }` (exit code 13).
+**Status:** Screen Recording check ✅ DONE in v0.1 (`src/permissions.rs::check_screen_recording`). Uses the safe `core_graphics::access::ScreenCaptureAccess::preflight()` wrapper. After the /review pass at 76f9d41, also falls back to `request()` on first-run denial — without that, fresh-install Macs hit a permanent exit 13 with no UI to grant from. Returns `BotError::PermissionsMissing { which: "Screen Recording" }` (exit code 13).
 
 **Remaining: Accessibility check.**
 **Effort:** human ~1 hour / CC ~15 min
@@ -63,6 +63,49 @@ The bot will need Accessibility once it starts injecting clicks. Approach when t
 - macOS API: `AXIsProcessTrustedWithOptions` (in `ApplicationServices`); the safe wrapper lives in the `accessibility-sys` crate or can be a tiny extern. Or call `CGRequestPostEventAccess()` (introduced macOS 10.15) which returns bool.
 - Update `docs/setup.md` with the Accessibility grant step alongside the existing Screen Recording note.
 - Wire the new check into `main.rs::run()` immediately after `check_screen_recording()`.
+
+---
+
+## P2: v0.2 — snapshot retry loop for BD reconfig race (deferred from /review 76f9d41)
+
+**Source:** /review cross-model finding (Claude adversarial A8 + Codex adversarial #4, multi-confirmed)
+**Effort:** human ~1 hour / CC ~20 min
+**Depends on:** v0.2 Mode 2 lifecycle (the race becomes critical when the bot manages BD lifecycle)
+
+`main::run` takes two unrelated snapshots: first the RoK window frame via `find_rok_window`, then the live display arrangement via `display::detect_mode`. Between those calls (microseconds normally, longer under BetterDisplay reconnect storms / Sidecar attach-detach / sleep-wake / a user dragging the window between displays), the two snapshots can describe different worlds. Result: transient `WindowScreenUnresolved` or wrong-mode classification even when the steady-state setup is valid.
+
+**Approach for v0.2:**
+- Wrap the find-window + detect-mode pair in a retry loop with exponential backoff (~3 attempts, 100ms / 250ms / 500ms gaps). If the window+display pair stays inconsistent across all attempts, surface the original error.
+- Tolerate up to N consecutive transient errors before failing (per /plan-eng-review A3 — same pattern that v0.2's drop-detection thread will use).
+
+---
+
+## P2: v0.2 — switch from `OnScreenOnly` to `optionAll` with state-aware filtering (deferred from /review 76f9d41)
+
+**Source:** /review cross-model finding (Claude adversarial A10 + Codex adversarial #5, multi-confirmed)
+**Effort:** human ~2 hours / CC ~30 min
+**Depends on:** v0.2 Mode 2 lifecycle
+
+`src/window.rs` calls `copy_window_info(kCGWindowListOptionOnScreenOnly, ...)`. That flag excludes RoK windows that are minimized, on a different macOS Space, or temporarily off-screen during BD display churn. v0.1's narrow scope (RoK on built-in, foreground) doesn't expose this — but v0.2 Mode 2 explicitly involves moving RoK across displays, and Spaces interaction will surface false `WindowNotFound` errors that should really be "RoK is alive but not visible right now."
+
+**Approach for v0.2:**
+- Switch to `kCGWindowListOptionAll` (or `OnScreenOnly | IncludingWindow` if window IDs are cached).
+- Add a state filter: only consider windows where `kCGWindowIsOnscreen == 1` for the Mode classification step, but keep all RoK-owned windows in scope for "is RoK running at all?" detection.
+- Distinguish three states in error reporting: RoK process not running (rare), RoK running but window minimized/off-Space, RoK present and on-screen.
+
+---
+
+## P3: v0.1+ — area-majority window classification (deferred from /review 76f9d41)
+
+**Source:** /review Codex adversarial #6
+**Effort:** human ~30 min / CC ~10 min
+**Depends on:** the synthetic-input + capture milestone (the bug only matters when click coords or capture rects depend on the window's full area, not its center)
+
+`src/display.rs::classify` currently returns the Mode based on the window's center pixel. A window that's 90% on a virtual display but with center pixel landing on the built-in (drag a window so it straddles two displays) returns `Mode::Visible` — silently misclassifying. Today this is harmless (we just exit on either branch); once capture/click logic depends on the full client area, the wrong display assignment becomes a bug.
+
+**Approach:**
+- Replace center-point test with area-majority: compute the intersection area of the window frame with each display's bounds; pick the display with the largest overlap. `rect_contains` becomes `rect_intersection_area(window, display)`.
+- Test cases: window 100% on one display (current behavior preserved), window straddling 50/50 (deterministic tie-breaker — pick the first display in iteration order, document it), window straddling 90/10 (returns the 90% display).
 
 ---
 

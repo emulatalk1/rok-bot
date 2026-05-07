@@ -4,6 +4,8 @@
 **Source document:** `rok_rust_bot_research.md` § 5 (Full Verified Cargo.toml)
 **Method:** Live query of the crates.io JSON API (`/api/v1/crates/<name>`) for each dependency. crates.io is a client-rendered SPA, so HTML scraping returns an empty shell — only the API call returns real version data. All timestamps below are taken from the `versions[].updated_at` field.
 
+> **Status as of v0.1 (commit 76f9d41):** This audit was the pre-implementation pin set. v0.1 actually shipped a much smaller subset — see [Cargo.toml](../Cargo.toml) for the live deps. The v0.1 set is `core-graphics 0.25`, `core-foundation 0.10`, `objc2-app-kit 0.3` (NSRunningApplication only), `objc2-foundation 0.3` (NSString only), `thiserror 2`, `anyhow 1`, `tracing 0.1`, `tracing-subscriber 0.3`. Capture/input/OCR deps from this audit (`xcap`, `enigo`, `image`, `imageproc`, `tesseract`, `screencapturekit`/`objc2-screen-capture-kit`, `reqwest`, `tokio`, `dotenvy`, `rand`) are out of scope until the synthetic-input + capture milestone. The two new entries (`objc2-app-kit`, `objc2-foundation`) were added in 76f9d41 for the bundle-ID anti-spoof check via `NSRunningApplication.runningApplicationWithProcessIdentifier`.
+
 ---
 
 ## Executive summary
