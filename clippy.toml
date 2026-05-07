@@ -1,0 +1,44 @@
+msrv = "1.85"
+avoid-breaking-exported-api = false
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests  = true
+allow-dbg-in-tests    = true
+allow-print-in-tests  = true
+cognitive-complexity-threshold = 20
+too-many-arguments-threshold   = 7
+type-complexity-threshold      = 250
+
+# Prose-only abbreviations that shouldn't trigger `doc_markdown`. Add a name
+# here when it's domain vocabulary (game/app/framework name), not a Rust path.
+# Rust paths still get backticked everywhere.
+doc-valid-idents = [
+    "RoK",
+    "BetterDisplay",
+    "NSScreen",
+    "CGWindowList",
+    "CFDictionary",
+    "CFString",
+    "CFNumber",
+    "CFArray",
+    "CFType",
+    "CFTypeRef",
+    "CGEvent",
+    "CGRect",
+    "CGPoint",
+    "CGSize",
+    "CGDirectDisplayID",
+    "CGMainDisplayID",
+    "CGDisplayBounds",
+    "CGGetOnlineDisplayList",
+    "RokBot",
+    "RUST_LOG",
+    "Sequoia",
+    "Sidecar",
+    "HDMI",
+    "MacOS",
+    "macOS",
+    "iOS",
+    "..",
+]
+

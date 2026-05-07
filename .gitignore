@@ -7,7 +7,7 @@
 .idea/
 .vscode/
 
-# Rust (for when src/ lands)
+# Rust
 /target
 **/*.rs.bk
-Cargo.lock
+# Cargo.lock IS committed (binary crate — reproducible builds)

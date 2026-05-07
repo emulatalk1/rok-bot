@@ -1,0 +1,26 @@
+repos:
+  - repo: local
+    hooks:
+      - id: rust-fmt
+        name: cargo fmt (commit)
+        entry: bash -c 'cargo fmt --all -- --check'
+        language: system
+        files: '\.rs$'
+        pass_filenames: false
+        stages: [pre-commit]
+
+      - id: rust-clippy
+        name: cargo clippy strict (push)
+        entry: bash -c 'cargo clippy --all-targets --all-features --locked -- -D warnings'
+        language: system
+        files: '\.(rs|toml)$'
+        pass_filenames: false
+        stages: [pre-push]
+
+      - id: rust-test
+        name: cargo test (push)
+        entry: bash -c 'cargo test --locked'
+        language: system
+        files: '\.(rs|toml)$'
+        pass_filenames: false
+        stages: [pre-push]
