@@ -23,6 +23,18 @@ thiserror          = "2"
 anyhow             = "1"
 tracing            = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# image + imageproc: v0.1.2 template-matching pipeline. `image` is already
+# a transitive dep of imageproc; pinning it directly locks the feature set
+# (PNG decode only — no JPEG/GIF/TIFF/etc bloat). `imageproc`'s rayon
+# feature unlocks `match_template_parallel` for the ~4-8x speedup on M-series.
+image              = { version = "0.25", default-features = false, features = ["png"] }
+imageproc          = { version = "0.26", default-features = false, features = ["rayon"] }
+
+[dev-dependencies]
+# Round-trip tests for matcher::find_target write a haystack PNG to a tempfile,
+# match it back, and verify error paths via missing/corrupt files. tempfile
+# handles the tmpdir lifecycle so leaked test artifacts don't pollute /tmp.
+tempfile           = "3"
 
 [lints.rust]
 # Downgraded from forbid (mbrain) to deny: window.rs needs unsafe for CGWindowList FFI.

@@ -9,17 +9,19 @@
 //!     4. Detect which display it lives on.
 //!     5. Branch:
 //!          `Mode::Visible` → capture window screenshot to `rok-capture.png`,
-//!                            log "Mode 1" and exit 0 (v0.1.1 stops here).
+//!                            template-match the embedded target inside the
+//!                            capture, log coords + score, exit 0.
 //!          `Mode::Virtual` → exit `BotError::RokNotOnPrimary` (Mode 2 lives in v0.2).
 //!     6. Any error → log + exit with the variant's exit code.
 //!
-//! v0.1.1 (this milestone) adds the capture step. Next sub-milestones:
-//! v0.1.2 template-match a target image; v0.1.3 click via CGEvent.post +
-//! Accessibility preflight; v0.1.4 after-state verification.
+//! v0.1.2 (this milestone) adds template matching after capture. Next
+//! sub-milestones: v0.1.3 click via CGEvent.post + Accessibility preflight;
+//! v0.1.4 after-state verification.
 
 mod capture;
 mod display;
 mod error;
+mod matcher;
 mod permissions;
 mod window;
 
@@ -30,6 +32,7 @@ use tracing_subscriber::EnvFilter;
 use crate::capture::capture_window;
 use crate::display::{Mode, detect_mode, mode_to_result};
 use crate::error::{BotError, Result};
+use crate::matcher::find_target;
 use crate::permissions::check_screen_recording;
 use crate::window::find_rok_window;
 
@@ -60,6 +63,9 @@ const fn error_kind(err: &BotError) -> &'static str {
         BotError::RokNotOnPrimary => "RokNotOnPrimary",
         BotError::PermissionsMissing { .. } => "PermissionsMissing",
         BotError::CaptureFailed { .. } => "CaptureFailed",
+        BotError::TargetNotFound => "TargetNotFound",
+        BotError::ImageLoadFailed { .. } => "ImageLoadFailed",
+        BotError::TargetTooLarge { .. } => "TargetTooLarge",
     }
 }
 
@@ -100,6 +106,14 @@ fn run() -> Result<()> {
         path = %capture_path.display(),
         "captured RoK window"
     );
+
+    // v0.1.2: locate the embedded target needle inside the capture. None
+    // here means "best score below MATCH_THRESHOLD"; the matcher already
+    // logged the diagnostic numbers at warn before returning. We translate
+    // None to a typed BotError so the exit-code contract stays uniform —
+    // shell users distinguish "target absent" (15) from "image broken" (16)
+    // from "needle too big" (17) without parsing log lines.
+    find_target(&capture_path)?.ok_or(BotError::TargetNotFound)?;
     Ok(())
 }
 

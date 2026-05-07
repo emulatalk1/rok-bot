@@ -33,6 +33,35 @@ pub enum BotError {
          granted to your terminal app and the RoK window ID is still valid."
     )]
     CaptureFailed { exit_code: Option<i32> },
+
+    /// Best-match score below `matcher::MATCH_THRESHOLD`. The matcher already
+    /// logged the diagnostic numbers (`best_score`, `threshold`) at warn level
+    /// before this variant fires; this is the structured exit-code carrier.
+    #[error("target not found in capture (best match below confidence threshold)")]
+    TargetNotFound,
+
+    /// PNG decode or open failed for the haystack. The underlying
+    /// `image::ImageError` is logged at warn before mapping to this, mirroring
+    /// `capture_with_bin`'s `io::Error` handling. `which` distinguishes
+    /// haystack vs. needle in the log line; v0.1.x only fires for "haystack"
+    /// because the needle is `include_bytes!`-embedded.
+    #[error("failed to load {which} image — see prior warn log for the underlying error")]
+    ImageLoadFailed { which: &'static str },
+
+    /// Needle dimensions are not strictly less than haystack dimensions.
+    /// `imageproc::template_matching::match_template_parallel` panics when
+    /// `template.{w,h} >= image.{w,h}`; this guard converts that panic into
+    /// a typed exit. `>=`, not `>` — equal-size also panics per imageproc's
+    /// docstring. Tuple order: `(width, height)`.
+    #[error(
+        "target image is too large: needle {}x{} >= haystack {}x{} \
+         (needle dims must be strictly smaller)",
+        needle.0, needle.1, haystack.0, haystack.1
+    )]
+    TargetTooLarge {
+        needle: (u32, u32),
+        haystack: (u32, u32),
+    },
 }
 
 impl BotError {
@@ -44,6 +73,9 @@ impl BotError {
             Self::RokNotOnPrimary => 12,
             Self::PermissionsMissing { .. } => 13,
             Self::CaptureFailed { .. } => 14,
+            Self::TargetNotFound => 15,
+            Self::ImageLoadFailed { .. } => 16,
+            Self::TargetTooLarge { .. } => 17,
         }
     }
 }
@@ -65,6 +97,13 @@ mod tests {
             }
             .exit_code(),
             BotError::CaptureFailed { exit_code: Some(1) }.exit_code(),
+            BotError::TargetNotFound.exit_code(),
+            BotError::ImageLoadFailed { which: "haystack" }.exit_code(),
+            BotError::TargetTooLarge {
+                needle: (50, 50),
+                haystack: (40, 40),
+            }
+            .exit_code(),
         ];
         // HashSet invariant: dedup() only collapses adjacent equals, which
         // would silently pass for a non-adjacent collision if the sort step
@@ -97,6 +136,61 @@ mod tests {
             14
         );
         assert_eq!(BotError::CaptureFailed { exit_code: None }.exit_code(), 14);
+        assert_eq!(BotError::TargetNotFound.exit_code(), 15);
+        assert_eq!(
+            BotError::ImageLoadFailed { which: "haystack" }.exit_code(),
+            16
+        );
+        assert_eq!(
+            BotError::TargetTooLarge {
+                needle: (100, 100),
+                haystack: (80, 40),
+            }
+            .exit_code(),
+            17
+        );
+    }
+
+    #[test]
+    fn target_not_found_message_mentions_threshold() {
+        // Operator's first instinct on TargetNotFound is "did the matcher
+        // think there's a near-miss?" The pre-error warn log carries the
+        // numeric score; this Display string just needs to acknowledge the
+        // threshold concept so the operator knows where to look.
+        let msg = BotError::TargetNotFound.to_string();
+        assert!(
+            msg.to_lowercase().contains("threshold"),
+            "TargetNotFound msg should reference the threshold: {msg}"
+        );
+    }
+
+    #[test]
+    fn image_load_failed_message_includes_which() {
+        // The `which` field tags whether haystack vs. needle failed to decode.
+        // Display must surface it so operators don't have to cross-ref the
+        // pre-error warn log to know which file is broken.
+        let err = BotError::ImageLoadFailed { which: "haystack" };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("haystack"),
+            "ImageLoadFailed Display must include the `which` tag: {msg}"
+        );
+    }
+
+    #[test]
+    fn target_too_large_message_includes_dims() {
+        // Operators debugging an oversized-needle rebuild need both pairs of
+        // dimensions in the failure message — knowing only the needle size
+        // doesn't tell them whether the haystack shrank or the needle grew.
+        let err = BotError::TargetTooLarge {
+            needle: (200, 100),
+            haystack: (150, 80),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("200"), "needle width missing: {msg}");
+        assert!(msg.contains("100"), "needle height missing: {msg}");
+        assert!(msg.contains("150"), "haystack width missing: {msg}");
+        assert!(msg.contains("80"), "haystack height missing: {msg}");
     }
 
     #[test]
