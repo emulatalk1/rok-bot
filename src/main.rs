@@ -2,24 +2,29 @@
 //!
 //! Boot sequence:
 //!     1. Init tracing (RUST_LOG controls level; default INFO).
-//!     2. Find the RoK main window via Core Graphics.
-//!     3. Detect which display it lives on.
-//!     4. Branch:
+//!     2. Preflight: Screen Recording permission. Without it, CGWindowList
+//!        strips window titles and our owner+title filter silently misses
+//!        RoK — fail fast with `PermissionsMissing` instead.
+//!     3. Find the RoK main window via Core Graphics.
+//!     4. Detect which display it lives on.
+//!     5. Branch:
 //!          `Mode::Visible` → log "Mode 1" and exit 0 (v0.1 stops here).
 //!          `Mode::Virtual` → exit `BotError::RokNotOnPrimary` (Mode 2 lives in v0.2).
-//!     5. Any error → log + exit with the variant's exit code.
+//!     6. Any error → log + exit with the variant's exit code.
 //!
 //! The actual gameplay automation (capture, match, click, verify) is the
 //! next milestone after this binary proves it can find RoK and detect mode.
 
 mod display;
 mod error;
+mod permissions;
 mod window;
 
 use tracing_subscriber::EnvFilter;
 
 use crate::display::{Mode, detect_mode};
 use crate::error::{BotError, Result};
+use crate::permissions::check_screen_recording;
 use crate::window::find_rok_window;
 
 fn main() {
@@ -36,6 +41,9 @@ fn main() {
 
 fn run() -> Result<()> {
     tracing::info!(target: "rok_bot", "rok-bot v{} starting", env!("CARGO_PKG_VERSION"));
+
+    check_screen_recording()?;
+    tracing::info!(target: "rok_bot", "Screen Recording permission OK");
 
     let window = find_rok_window()?;
     tracing::info!(

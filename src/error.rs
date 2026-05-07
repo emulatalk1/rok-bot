@@ -15,10 +15,10 @@ pub enum BotError {
     )]
     RokNotOnPrimary,
 
-    /// Defined now per the /plan-eng-review error taxonomy. Constructed
-    /// once the TCC preflight TODO (TODOS.md P2) lands — it'll be returned
-    /// when Screen Recording or Accessibility is denied at startup.
-    #[allow(dead_code, reason = "wired up in v0.1 TCC preflight (TODOS.md P2)")]
+    /// Returned by `permissions::check_screen_recording` when
+    /// `CGPreflightScreenCaptureAccess` reports the running app lacks the
+    /// permission. v0.1 only checks Screen Recording; Accessibility is added
+    /// when the synthetic-input milestone lands `CGEvent.post`.
     #[error(
         "Missing macOS permission: {which}. Grant it to your terminal app in \
          System Settings → Privacy & Security → {which}, then re-run."

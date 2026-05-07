@@ -49,20 +49,20 @@ The two-mode runtime contract design splits into two milestones per Codex tensio
 
 ---
 
-## P2: v0.1 TCC permissions preflight (deferred from /plan-eng-review 2026-05-07)
+## P2 (partially done): TCC permissions preflight
 
-**Source:** /plan-eng-review codex tension 4 (TCC permissions missing from setup)
-**Effort:** human ~2 hours / CC ~20 min
-**Depends on:** v0.1 hello-world clicks landed (Accessibility check needs CGEvent.post in scope)
+**Source:** /plan-eng-review codex tension 4
+**Status:** Screen Recording check ✅ DONE in v0.1 (`src/permissions.rs::check_screen_recording`, wired as the first step in `main.rs::run()`). Uses the safe `core_graphics::access::ScreenCaptureAccess::preflight()` wrapper — no unsafe code in our crate. Returns `BotError::PermissionsMissing { which: "Screen Recording" }` (exit code 13).
 
-The bot needs Screen Recording (for capture) and Accessibility (for synthetic input via `CGEvent.post`). First-run failures from missing permissions look like cryptic data corruption — `CGWindowListCopyWindowInfo` returns titles as `nil`, `CGEvent.post` silently no-ops.
+**Remaining: Accessibility check.**
+**Effort:** human ~1 hour / CC ~15 min
+**Depends on:** the synthetic-input milestone (first `CGEvent.post` call landing in src/)
 
-**Work:**
-1. Update `docs/setup.md` with a TCC section: "After install, grant **Screen Recording** AND **Accessibility** to your terminal app (Terminal.app, iTerm2, etc.) when macOS prompts. Both are required."
-2. Implement preflight in `src/main.rs` startup:
-   - Screen Recording check: call `CGWindowListCopyWindowInfo([.optionAll], kCGNullWindowID)`, scan results for any non-bot window where `kCGWindowName` is non-nil. If ALL titles are nil, Screen Recording is denied → exit `PermissionsMissing { which: "Screen Recording" }`.
-   - Accessibility check: call `CGEventSourceKeyState(.combinedSessionState, .keyA)` (read-only) — returns `false` consistently if Accessibility denied vs flickering with real keyboard state if granted. Or simpler: just inject a no-op CGEvent and check `CGRequestPostEventAccess()` returns true.
-3. Both checks ship the same `PermissionsMissing` error variant in the `BotError` enum.
+The bot will need Accessibility once it starts injecting clicks. Approach when that milestone arrives:
+- Mirror the Screen Recording shape: a `check_accessibility()` in `src/permissions.rs` returning `BotError::PermissionsMissing { which: "Accessibility" }` on denial.
+- macOS API: `AXIsProcessTrustedWithOptions` (in `ApplicationServices`); the safe wrapper lives in the `accessibility-sys` crate or can be a tiny extern. Or call `CGRequestPostEventAccess()` (introduced macOS 10.15) which returns bool.
+- Update `docs/setup.md` with the Accessibility grant step alongside the existing Screen Recording note.
+- Wire the new check into `main.rs::run()` immediately after `check_screen_recording()`.
 
 ---
 
