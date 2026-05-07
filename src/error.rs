@@ -66,10 +66,16 @@ mod tests {
             .exit_code(),
             BotError::CaptureFailed { exit_code: Some(1) }.exit_code(),
         ];
-        let mut sorted: Vec<i32> = codes.to_vec();
-        sorted.sort_unstable();
-        sorted.dedup();
-        assert_eq!(sorted.len(), codes.len(), "exit codes must be unique");
+        // HashSet invariant: dedup() only collapses adjacent equals, which
+        // would silently pass for a non-adjacent collision if the sort step
+        // were ever removed. HashSet captures the real intent: every code is
+        // distinct from every other.
+        let unique: std::collections::HashSet<i32> = codes.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            codes.len(),
+            "exit codes must be unique: {codes:?}"
+        );
     }
 
     /// Pin the exact numeric exit codes — shell users branch on these values,
@@ -95,11 +101,19 @@ mod tests {
 
     #[test]
     fn capture_failed_message_mentions_screen_recording() {
-        let msg = BotError::CaptureFailed { exit_code: Some(1) }.to_string();
-        assert!(
-            msg.contains("Screen Recording"),
-            "capture failure should hint at the most likely root cause: {msg}"
-        );
+        // Both Some(_) (non-zero exit) and None (spawn failed) variants should
+        // surface the same root-cause hint; the user's first debugging step is
+        // the same regardless of which path failed.
+        for err in [
+            BotError::CaptureFailed { exit_code: Some(1) },
+            BotError::CaptureFailed { exit_code: None },
+        ] {
+            let msg = err.to_string();
+            assert!(
+                msg.contains("Screen Recording"),
+                "capture failure should hint at the most likely root cause: {msg}"
+            );
+        }
     }
 
     #[test]

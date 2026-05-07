@@ -98,8 +98,7 @@ fn run() -> Result<()> {
     tracing::info!(
         target: "rok_bot",
         path = %capture_path.display(),
-        "captured RoK window — v0.1.1 hello-world step 1 of 4 done. \
-         Next: v0.1.2 template match against this PNG."
+        "captured RoK window"
     );
     Ok(())
 }
