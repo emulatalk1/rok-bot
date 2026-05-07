@@ -111,6 +111,77 @@ Not addressed in v0.1.1 because v0.2's capture-pipeline migration to `objc2-scre
 
 ---
 
+## P2: v0.2 — FFT-based NCC for continuous-loop matching (deferred from /plan-eng-review 2026-05-07)
+
+**Source:** /plan-eng-review for v0.1.2 (CMT-7 + TODO-A) — Codex outside-voice flagged that v0.2's continuous loop will need order-of-magnitude faster matching than v0.1.2's parallel sliding-window.
+**Effort:** human ~2 hours / CC ~30 min
+**Depends on:** v0.2 capture-pipeline migration to `objc2-screen-capture-kit`
+
+v0.1.2 ships with `imageproc::template_matching::match_template_parallel` — rayon-parallel naive NCC. ~500ms-1s per match on a 2102×1640 Retina haystack with ~80×40 needle. Fine for one-shot v0.1.x demos; blocker for v0.2's per-tick capture loop where we want ≥1Hz match cadence.
+
+**Approach for v0.2:**
+- Frequency-domain NCC: FFT both haystack and needle (zero-padded to a common power-of-two size), multiply in frequency domain, inverse FFT to recover the correlation map. O(N log N) instead of O(N²). For our shape, ~50ms instead of ~1s.
+- Crate options: `rustfft` (pure Rust, well-maintained) for the FFT primitive; FFT-NCC layer would be hand-rolled (~50 LOC). Or pull in `corrmatch` if its pyramid search reaches maturity.
+- Same Match API surface (`Result<Option<Match>>`); v0.1.3+ callers don't change.
+- Test against the existing match_in fixtures — score values should be within float-eps of the parallel sliding window's output.
+
+---
+
+## P3: v0.1.3+ — multi-match disambiguation (deferred from /plan-eng-review 2026-05-07)
+
+**Source:** /plan-eng-review for v0.1.2 (TODO-C) — Codex flagged imageproc's lex-smallest tie-break for duplicate-max scores.
+**Effort:** human ~30 min / CC ~10 min
+**Depends on:** v0.1.3 click synthesis (the policy decision only matters when the bot acts on the match)
+
+`imageproc::template_matching::find_extremes` resolves duplicate maximum scores by returning the lexicographically smallest (x, y). If RoK ever has two identical UI elements visible at once (two city slots, two duplicate buttons), v0.1.2's matcher silently picks the top-left one without any signal that the choice was ambiguous. v0.1.3's click would then act on the top-left without knowing the right was equally good — wrong choice, no diagnostic.
+
+**Approach:**
+- Extend `Match` (or add a sibling type) to carry a `runner_up_score: Option<f32>` field. If the second-best score is within ε of the best, surface that to the caller.
+- Caller policy: in v0.1.3 click logic, if matches are ambiguous, decide based on context (game state, previous click history). Explicit policy call beats silent lex-tie.
+- Test: plant the same needle at three positions in the haystack; assert all three are reported (or that the runner_up_score field signals the tie).
+
+---
+
+## P3: v0.1+ — asset rot detection (deferred from /plan-eng-review 2026-05-07)
+
+**Source:** /plan-eng-review for v0.1.2 (TODO-B) — committed needle is a pixel-exact crop of today's RoK build; UI updates rot the asset silently.
+**Effort:** human ~1 hour / CC ~20 min
+**Depends on:** real run data (need v0.1.3+'s loop to produce a stream of best_score values)
+
+Our committed `assets/targets/<name>.png` is a pixel-exact crop of today's RoK rendering. If RoK ships:
+- A UI redesign (button art changes)
+- A DPI/scale change (renderer at different logical resolution)
+- An OS theme/blur change that affects how the window is composited
+
+...the asset rots. The bot will start returning `Ok(None)` with low best_score values. Today the operator sees only "target not found" — no signal that the issue is asset rot vs. target legitimately not on screen vs. matcher bug.
+
+**Approach:**
+- Track `best_score` over recent runs in a small ring buffer (e.g., last 100 invocations). Persist to `~/.rok-bot/match-history.jsonl` or similar.
+- On each run, compare current best_score against the rolling distribution. If sustained drops below the historic floor, log a `warn!(target: "rok_bot", "asset rot suspected")`.
+- Could also add a `cargo xtask refresh-assets` workflow that re-crops fixtures from a fresh capture.
+- Threshold tuning: empirical, needs real run data to set. Skip until v0.1.3's loop produces enough samples.
+
+---
+
+## P3: v0.1+ — masked NCC for transparent target assets (deferred from /plan-eng-review 2026-05-07)
+
+**Source:** /plan-eng-review for v0.1.2 (TODO-D / Codex open-question) — `to_luma8` discards alpha.
+**Effort:** human ~1 day / CC ~2 hours
+**Depends on:** a v0.1.x+ target asset that legitimately has transparency (none today)
+
+v0.1.2's matcher converts RGBA8 → Luma8 via `image::DynamicImage::to_luma8()` (ITU-R BT.601 weights). Alpha is silently discarded. v0.1.x's policy: target assets MUST be opaque rectangular crops (documented in `matcher.rs` rustdoc).
+
+If a future target needs transparency — e.g., a button with anti-aliased edges that appears against varying backgrounds — plain NCC scores poorly because the masked-out pixels still contribute to the correlation. Masked NCC is the correct primitive: only correlate pixels where the alpha channel says "this is part of the target."
+
+**Approach options for the future:**
+- Pull in `opencv-rust`: cv::matchTemplate with TM_CCOEFF_NORMED + a mask argument. Heavy dep (system OpenCV install) — see existing P2 lessons from v0.1.0.
+- Hand-rolled masked NCC over imageproc: read alpha channel into a `mask: GrayImage`, modify the NCC sum to ignore zero-mask pixels. ~50 LOC of math; needs careful float handling.
+- Defer until a real use case shows up.
+
+For now: the v0.1.x rustdoc on matcher.rs documents the opaque-only requirement. Future authors who want masked support find this TODO.
+
+---
+
 ## P3: v0.1+ — area-majority window classification (deferred from /review 76f9d41)
 
 **Source:** /review Codex adversarial #6
