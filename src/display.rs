@@ -32,9 +32,14 @@ use crate::window::Window;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
-    /// Window center is on the primary (built-in) display.
+    /// Window center is on the **built-in** display (Retina panel).
+    /// We test by `CGDisplayIsBuiltin`, NOT `CGDisplay::main` — the
+    /// menu-bar display is configurable in System Settings, so "main"
+    /// can be on an external monitor while the user's intent is
+    /// "the laptop's screen." Mode 1 specifically means "visible on
+    /// the laptop display." (Codex finding #3.)
     Visible,
-    /// Window center is on a non-primary display (BetterDisplay virtual,
+    /// Window center is on a non-built-in display (BetterDisplay virtual,
     /// Sidecar, HDMI dummy plug, real second monitor — any of them).
     Virtual,
 }
@@ -46,7 +51,12 @@ pub enum Mode {
 #[derive(Debug, Clone, Copy)]
 pub struct DisplayInfo {
     pub bounds: CGRect,
-    pub is_main: bool,
+    /// True if `CGDisplayIsBuiltin(id)` returns true. The built-in
+    /// display is the laptop's Retina panel; iMacs and Studio Displays
+    /// also report true. External monitors and BD virtual displays
+    /// report false. Distinct from `CGMainDisplayID` (the menu-bar
+    /// display) which the user can move around.
+    pub is_builtin: bool,
 }
 
 /// Pure classifier — given a point and an arrangement, return the Mode.
@@ -62,7 +72,7 @@ pub struct DisplayInfo {
 pub fn classify(center: CGPoint, displays: &[DisplayInfo]) -> Result<Mode> {
     for d in displays {
         if rect_contains(d.bounds, center) {
-            return Ok(if d.is_main {
+            return Ok(if d.is_builtin {
                 Mode::Visible
             } else {
                 Mode::Virtual
@@ -95,15 +105,39 @@ pub fn detect_mode(window: &Window) -> Result<Mode> {
     classify(window.center(), &displays)
 }
 
+/// Pure: map a detected `Mode` to the v0.1 contract:
+///     `Mode::Visible` → `Ok(())` (Mode 1 happy path)
+///     `Mode::Virtual` → `Err(BotError::RokNotOnPrimary)` (Mode 2 deferred to v0.2)
+///
+/// Extracted from `main::run` so both arms are unit-testable. A future
+/// refactor that flipped the arms or returned `Ok` for `Virtual` would
+/// fail [`mode_visible_maps_to_ok`] / [`mode_virtual_maps_to_rok_not_on_primary`].
+pub const fn mode_to_result(mode: Mode) -> Result<()> {
+    match mode {
+        Mode::Visible => Ok(()),
+        Mode::Virtual => Err(BotError::RokNotOnPrimary),
+    }
+}
+
 fn enumerate_displays() -> Vec<DisplayInfo> {
-    let main_id = CGDisplay::main().id;
-    let Ok(ids) = CGDisplay::active_displays() else {
-        return Vec::new();
+    let ids = match CGDisplay::active_displays() {
+        Ok(ids) => ids,
+        Err(err) => {
+            tracing::warn!(
+                target: "rok_bot",
+                "CGDisplay::active_displays failed (CG error code {err:?}); \
+                 detect_mode will return WindowScreenUnresolved",
+            );
+            return Vec::new();
+        }
     };
     ids.into_iter()
-        .map(|id| DisplayInfo {
-            bounds: CGDisplay::new(id).bounds(),
-            is_main: id == main_id,
+        .map(|id| {
+            let display = CGDisplay::new(id);
+            DisplayInfo {
+                bounds: display.bounds(),
+                is_builtin: display.is_builtin(),
+            }
         })
         .collect()
 }
@@ -121,17 +155,19 @@ mod tests {
         CGPoint::new(x, y)
     }
 
+    /// Test helper — built-in display (laptop panel). Test names use
+    /// "primary" semantically; underlying field is `is_builtin`.
     fn primary(bounds: CGRect) -> DisplayInfo {
         DisplayInfo {
             bounds,
-            is_main: true,
+            is_builtin: true,
         }
     }
 
     fn secondary(bounds: CGRect) -> DisplayInfo {
         DisplayInfo {
             bounds,
-            is_main: false,
+            is_builtin: false,
         }
     }
 
@@ -225,6 +261,21 @@ mod tests {
         );
     }
 
+    // ---- Gap between displays (BD reconfiguration transient) ----
+
+    #[test]
+    fn point_in_gap_between_displays_is_unresolved() {
+        // Two displays with a gap (1920..3000 in X). A window center landing
+        // in the gap (most likely during a BD reconnect transient) returns
+        // WindowScreenUnresolved, not a wrong Mode.
+        let displays = [
+            primary(rect(0.0, 0.0, 1920.0, 1080.0)),
+            secondary(rect(3000.0, 0.0, 1920.0, 1080.0)),
+        ];
+        let err = classify(pt(2500.0, 540.0), &displays).unwrap_err();
+        assert_eq!(err, BotError::WindowScreenUnresolved);
+    }
+
     // ---- Boundary semantics ----
 
     #[test]
@@ -261,5 +312,20 @@ mod tests {
         let b = a; // Copy
         assert_eq!(a, b);
         assert_ne!(Mode::Visible, Mode::Virtual);
+    }
+
+    // ---- mode_to_result contract (Testing T1) ----
+
+    #[test]
+    fn mode_visible_maps_to_ok() {
+        assert!(mode_to_result(Mode::Visible).is_ok());
+    }
+
+    #[test]
+    fn mode_virtual_maps_to_rok_not_on_primary() {
+        assert_eq!(
+            mode_to_result(Mode::Virtual).unwrap_err(),
+            BotError::RokNotOnPrimary
+        );
     }
 }

@@ -33,6 +33,17 @@ use crate::error::{BotError, Result};
 pub const ROK_OWNER: &str = "RiseOfKingdoms";
 pub const ROK_TITLE: &str = "RiseOfKingdoms";
 
+/// Bundle-ID prefix that legitimate RoK installs share. Verified on
+/// `/Applications/RiseOfKingdoms.app` (Vietnam region: `com.rok.ios.vn`).
+/// The `.vn` / `.kr` / `.us` suffix varies by region but the prefix is
+/// stable across all official releases. Used as a spoof check: any
+/// process can set `kCGWindowOwnerName == "RiseOfKingdoms"` and
+/// `kCGWindowName == "RiseOfKingdoms"`, but only the real game has a
+/// bundle ID under `com.rok.ios.`. Without this gate, once v0.1+ adds
+/// synthetic input or screen capture, a spoof could redirect the bot
+/// onto an attacker-controlled window.
+pub const ROK_BUNDLE_PREFIX: &str = "com.rok.ios.";
+
 #[derive(Debug, Clone, Copy)]
 pub struct Window {
     pub id: u32,
@@ -76,7 +87,11 @@ fn select_rok_window(record: &WindowRecord) -> Option<Window> {
 }
 
 /// Walk the live `CGWindowListCopyWindowInfo` array and return the first
-/// window matching the RoK main-window predicate.
+/// window matching the RoK main-window predicate AND backed by a process
+/// whose bundle ID starts with `ROK_BUNDLE_PREFIX` (anti-spoof check).
+/// Spoofs are skipped with a `tracing::warn!` so they're visible in logs
+/// without halting the search — the real RoK window may be later in the
+/// list.
 pub fn find_rok_window() -> Result<Window> {
     let Some(info_list) = copy_window_info(kCGWindowListOptionOnScreenOnly, kCGNullWindowID) else {
         return Err(BotError::WindowNotFound);
@@ -88,18 +103,49 @@ pub fn find_rok_window() -> Result<Window> {
         if raw_ptr.is_null() {
             continue;
         }
-        // SAFETY: CGWindowList items are documented to be CFDictionary
-        // instances. We use `wrap_under_get_rule` (no retain count change).
+        // SAFETY: CGWindowList vends each array slot as an unretained
+        // CFDictionaryRef ("Get rule"). `wrap_under_get_rule` is the
+        // canonical lift: it CFRetains internally so the resulting `cf`
+        // owns its retain. The null guard above prevents the upstream
+        // assertion in `wrap_under_get_rule(reference: CFTypeRef)`.
         let cf = unsafe { CFType::wrap_under_get_rule(raw_ptr.cast()) };
         let Some(dict) = cf.downcast::<CFDictionary>() else {
             continue;
         };
         let record = parse_record(&dict);
         if let Some(window) = select_rok_window(&record) {
-            return Ok(window);
+            if bundle_id_for_pid(window.pid)
+                .as_deref()
+                .is_some_and(matches_rok_bundle_id)
+            {
+                return Ok(window);
+            }
+            tracing::warn!(
+                target: "rok_bot",
+                pid = window.pid,
+                window_id = window.id,
+                expected_prefix = ROK_BUNDLE_PREFIX,
+                actual = bundle_id_for_pid(window.pid).as_deref().unwrap_or("<unknown>"),
+                "skipping window with owner=title=\"{ROK_OWNER}\" — bundle ID mismatch (possible spoof or stale window)",
+            );
         }
     }
     Err(BotError::WindowNotFound)
+}
+
+/// Pure: does this bundle ID belong to a legitimate RoK install?
+fn matches_rok_bundle_id(bundle_id: &str) -> bool {
+    bundle_id.starts_with(ROK_BUNDLE_PREFIX)
+}
+
+/// Live wrapper: ask AppKit for the bundle ID of the process owning `pid`.
+/// Returns `None` if the process has no bundle (rare for GUI apps),
+/// no longer exists, or AppKit can't enumerate it. Both objc2 calls
+/// here are declared safe by the binding (no `unsafe` block needed).
+fn bundle_id_for_pid(pid: i32) -> Option<String> {
+    let app = objc2_app_kit::NSRunningApplication::runningApplicationWithProcessIdentifier(pid)?;
+    let ns_id = app.bundleIdentifier()?;
+    Some(ns_id.to_string())
 }
 
 fn parse_record(dict: &CFDictionary) -> WindowRecord {
@@ -134,14 +180,20 @@ fn dict_get<T: ConcreteCFType>(dict: &CFDictionary, key: *const c_void) -> Optio
     if value_ptr.is_null() {
         return None;
     }
-    // SAFETY: CGWindowList values are CF objects vended by Core Graphics;
-    // wrapping by-get-rule does not adjust their retain count.
+    // SAFETY: dict.find returns a borrowed slot pointer ("Get rule" —
+    // unretained). `wrap_under_get_rule` CFRetains internally so `cf`
+    // holds its own ownership. The null guard above prevents the
+    // upstream null-assertion in `wrap_under_get_rule(reference: CFTypeRef)`.
     let cf = unsafe { CFType::wrap_under_get_rule(value_ptr.cast()) };
     cf.downcast::<T>()
 }
 
 /// Convert the `kCGWindowBounds` dict (with X/Y/Width/Height keys) into a
-/// `CGRect` using Core Graphics's official converter.
+/// `CGRect` using Core Graphics's official converter. Rejects rects whose
+/// fields aren't finite or whose size is non-positive — `CGRectMake...`
+/// itself will accept NaN/Inf and zero-size dicts; downstream code (window
+/// center arithmetic + `rect_contains`) silently produces wrong results
+/// when fed those, so guard at the boundary.
 fn rect_from_dict(dict: &CFDictionary) -> Option<CGRect> {
     let mut rect = CGRect {
         origin: CGPoint::new(0.0, 0.0),
@@ -153,7 +205,19 @@ fn rect_from_dict(dict: &CFDictionary) -> Option<CGRect> {
     let ok = unsafe {
         CGRectMakeWithDictionaryRepresentation(dict.as_concrete_TypeRef().cast(), &raw mut rect)
     };
-    if ok { Some(rect) } else { None }
+    if !ok {
+        return None;
+    }
+    if !rect.origin.x.is_finite()
+        || !rect.origin.y.is_finite()
+        || !rect.size.width.is_finite()
+        || !rect.size.height.is_finite()
+        || rect.size.width <= 0.0
+        || rect.size.height <= 0.0
+    {
+        return None;
+    }
+    Some(rect)
 }
 
 #[link(name = "CoreGraphics", kind = "framework")]
@@ -222,6 +286,18 @@ mod tests {
     }
 
     #[test]
+    fn select_skips_record_with_missing_owner() {
+        let record = WindowRecord {
+            owner: None,
+            title: Some(ROK_TITLE.to_owned()),
+            id: Some(1),
+            pid: Some(2),
+            bounds: Some(rect(0.0, 0.0, 1.0, 1.0)),
+        };
+        assert!(select_rok_window(&record).is_none());
+    }
+
+    #[test]
     fn select_skips_other_apps() {
         let record = WindowRecord {
             owner: Some("Finder".to_owned()),
@@ -266,6 +342,51 @@ mod tests {
         let c = w.center();
         assert!((c.x - 740.0).abs() < f64::EPSILON);
         assert!((c.y - 560.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn window_center_zero_size_frame_returns_origin() {
+        // Degenerate but real during window-resize transitions.
+        let w = Window {
+            id: 1,
+            pid: 2,
+            frame: rect(50.0, 60.0, 0.0, 0.0),
+        };
+        let c = w.center();
+        assert!((c.x - 50.0).abs() < f64::EPSILON);
+        assert!((c.y - 60.0).abs() < f64::EPSILON);
+    }
+
+    // ---- Bundle ID validation (Codex #2 + Claude A4) ----
+
+    #[test]
+    fn matches_rok_bundle_id_accepts_vn() {
+        assert!(matches_rok_bundle_id("com.rok.ios.vn"));
+    }
+
+    #[test]
+    fn matches_rok_bundle_id_accepts_other_regions() {
+        assert!(matches_rok_bundle_id("com.rok.ios.kr"));
+        assert!(matches_rok_bundle_id("com.rok.ios.us"));
+        assert!(matches_rok_bundle_id("com.rok.ios.eu"));
+    }
+
+    #[test]
+    fn matches_rok_bundle_id_rejects_spoofs() {
+        // Pretend-RoK from a launcher or impersonator.
+        assert!(!matches_rok_bundle_id("com.example.fake-rok"));
+        assert!(!matches_rok_bundle_id("RiseOfKingdoms"));
+        assert!(!matches_rok_bundle_id("org.rok.ios.vn")); // wrong TLD
+        assert!(!matches_rok_bundle_id(""));
+        assert!(!matches_rok_bundle_id("com.finder.app"));
+    }
+
+    #[test]
+    fn matches_rok_bundle_id_rejects_prefix_only() {
+        // Exact prefix without a region suffix is suspicious — but allowed
+        // as a forward-compat call, since a future "com.rok.ios.global"
+        // would also be valid. Document that any com.rok.ios.* is trusted.
+        assert!(matches_rok_bundle_id("com.rok.ios."));
     }
 
     #[test]

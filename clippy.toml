@@ -39,6 +39,9 @@ doc-valid-idents = [
     "MacOS",
     "macOS",
     "iOS",
+    "AppKit",
+    "NSRunningApplication",
+    "BetterDisplay",
     "..",
 ]
 

@@ -21,6 +21,17 @@ Make sure RoK is on your built-in display, run the bot. That's it. Useful for fi
 cargo run
 ```
 
+## Optional — install pre-commit hooks (contributors)
+
+The repo ships `.pre-commit-config.yaml` with `cargo fmt --check` (pre-commit), `cargo clippy --locked -- -D warnings` (pre-push), and `cargo test --locked` (pre-push). The hooks are dead config until installed:
+
+```sh
+brew install pre-commit       # one-time, if not already installed
+pre-commit install --install-hooks --hook-type pre-commit --hook-type pre-push
+```
+
+After that, every commit runs fmt-check and every push runs clippy + tests. Skip if you'd rather rely on local manual `cargo` invocations.
+
 ---
 
 ## Mode 2 — one-time setup

@@ -16,6 +16,11 @@ use core_graphics::access::ScreenCaptureAccess;
 
 use crate::error::{BotError, Result};
 
+/// Canonical label for the Screen Recording permission. Single source of truth
+/// so the error variant, log lines, and tests can reference one constant
+/// instead of literal "Screen Recording" strings scattered across files.
+pub const SCREEN_RECORDING: &str = "Screen Recording";
+
 /// Pure: turn a granted/denied bool into the preflight result. Lets us
 /// unit-test both branches without needing two Macs with different TCC state.
 const fn check_inner(granted: bool) -> Result<()> {
@@ -23,16 +28,31 @@ const fn check_inner(granted: bool) -> Result<()> {
         Ok(())
     } else {
         Err(BotError::PermissionsMissing {
-            which: "Screen Recording",
+            which: SCREEN_RECORDING,
         })
     }
 }
 
-/// Live wrapper. Calls Apple's `CGPreflightScreenCaptureAccess` via the safe
-/// `core-graphics` wrapper (no `unsafe` in our code) and returns the result.
-/// Does NOT trigger the system permission prompt — purely a check.
+/// Live wrapper with first-run fallback.
+///
+/// Flow:
+///   1. `preflight()` — purely checks current grant state, no prompt.
+///   2. If denied AND we're a fresh install (terminal app not yet in
+///      System Settings → Privacy → Screen Recording), `request()` shows
+///      the system prompt and registers the app there. Without this
+///      step, a brand-new Mac hits a permanent `exit 13` loop with no UI
+///      affordance to grant from. (Codex finding #1.)
+///   3. `request()` returns the post-prompt state, so its boolean is
+///      authoritative — we don't need a third preflight.
 pub fn check_screen_recording() -> Result<()> {
-    check_inner(ScreenCaptureAccess.preflight())
+    let access = ScreenCaptureAccess;
+    if access.preflight() {
+        return Ok(());
+    }
+    if access.request() {
+        return Ok(());
+    }
+    check_inner(false)
 }
 
 #[cfg(test)]
@@ -50,7 +70,7 @@ mod tests {
         assert_eq!(
             err,
             BotError::PermissionsMissing {
-                which: "Screen Recording"
+                which: SCREEN_RECORDING
             }
         );
     }

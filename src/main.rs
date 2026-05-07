@@ -22,7 +22,7 @@ mod window;
 
 use tracing_subscriber::EnvFilter;
 
-use crate::display::{Mode, detect_mode};
+use crate::display::{Mode, detect_mode, mode_to_result};
 use crate::error::{BotError, Result};
 use crate::permissions::check_screen_recording;
 use crate::window::find_rok_window;
@@ -32,11 +32,22 @@ fn main() {
     let exit_code = match run() {
         Ok(()) => 0,
         Err(err) => {
-            tracing::error!(target: "rok_bot", "{err}");
-            err.exit_code()
+            let kind = error_kind(&err);
+            let code = err.exit_code();
+            tracing::error!(target: "rok_bot", error_kind = kind, exit_code = code, "{err}");
+            code
         }
     };
     std::process::exit(exit_code);
+}
+
+const fn error_kind(err: &BotError) -> &'static str {
+    match err {
+        BotError::WindowNotFound => "WindowNotFound",
+        BotError::WindowScreenUnresolved => "WindowScreenUnresolved",
+        BotError::RokNotOnPrimary => "RokNotOnPrimary",
+        BotError::PermissionsMissing { .. } => "PermissionsMissing",
+    }
 }
 
 fn run() -> Result<()> {
@@ -48,7 +59,7 @@ fn run() -> Result<()> {
     let window = find_rok_window()?;
     tracing::info!(
         target: "rok_bot",
-        "found RoK window id={} pid={} frame=({:.0},{:.0} {:.0}x{:.0})",
+        "found RoK window id={} pid={} frame=({:.2},{:.2} {:.2}x{:.2})",
         window.id,
         window.pid,
         window.frame.origin.x,
@@ -58,17 +69,18 @@ fn run() -> Result<()> {
     );
 
     let mode = detect_mode(&window)?;
-    match mode {
-        Mode::Visible => {
-            tracing::info!(
-                target: "rok_bot",
-                "Mode 1 (visible) — RoK is on the primary display. \
-                 v0.1 hello-world will go here in the next milestone."
-            );
-            Ok(())
-        }
-        Mode::Virtual => Err(BotError::RokNotOnPrimary),
-    }
+    mode_to_result(mode)?;
+    debug_assert_eq!(
+        mode,
+        Mode::Visible,
+        "mode_to_result returned Ok only for Visible"
+    );
+    tracing::info!(
+        target: "rok_bot",
+        "Mode 1 (visible) — RoK is on the built-in display. \
+         v0.1 hello-world will go here in the next milestone."
+    );
+    Ok(())
 }
 
 fn init_tracing() {

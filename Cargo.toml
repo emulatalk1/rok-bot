@@ -14,6 +14,11 @@ panic = "unwind"
 [dependencies]
 core-graphics      = "0.25"
 core-foundation    = "0.10"
+# objc2-app-kit + objc2-foundation: NSRunningApplication for bundle-ID
+# spoof check on the RoK window owner. Trimmed to just the
+# NSRunningApplication feature to keep the dependency surface small.
+objc2-app-kit      = { version = "0.3", default-features = false, features = ["NSRunningApplication", "libc"] }
+objc2-foundation   = { version = "0.3", default-features = false, features = ["NSString"] }
 thiserror          = "2"
 anyhow             = "1"
 tracing            = "0.1"

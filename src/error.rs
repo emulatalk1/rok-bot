@@ -61,6 +61,34 @@ mod tests {
         assert_eq!(sorted.len(), codes.len(), "exit codes must be unique");
     }
 
+    /// Pin the exact numeric exit codes — shell users branch on these values,
+    /// so renumbering a variant is a contract break and must fail this test.
+    #[test]
+    fn exit_codes_have_specific_stable_values() {
+        assert_eq!(BotError::WindowNotFound.exit_code(), 10);
+        assert_eq!(BotError::WindowScreenUnresolved.exit_code(), 11);
+        assert_eq!(BotError::RokNotOnPrimary.exit_code(), 12);
+        assert_eq!(
+            BotError::PermissionsMissing {
+                which: "Screen Recording"
+            }
+            .exit_code(),
+            13
+        );
+    }
+
+    #[test]
+    fn window_not_found_message_hints_at_running_game() {
+        let msg = BotError::WindowNotFound.to_string();
+        assert!(msg.contains("game running"), "msg: {msg}");
+    }
+
+    #[test]
+    fn window_screen_unresolved_message_mentions_display() {
+        let msg = BotError::WindowScreenUnresolved.to_string();
+        assert!(msg.to_lowercase().contains("display"), "msg: {msg}");
+    }
+
     #[test]
     fn permissions_missing_message_includes_which() {
         let err = BotError::PermissionsMissing {
