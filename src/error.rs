@@ -65,6 +65,53 @@ pub enum BotError {
         needle: (u32, u32),
         haystack: (u32, u32),
     },
+
+    /// CGEvent construction failed prior to posting. **Creation-time only**:
+    /// either `CGEventSource::new(HIDSystemState)` returned `Err` or
+    /// `CGEvent::new_mouse_event(...)` returned `Err`. Post-time failures are
+    /// not detectable — `CGEvent::post` returns `()`, not a `Result`, so once
+    /// construction succeeds there is no Quartz-level signal that the event
+    /// was dropped, filtered, or ignored. Verifying the click landed is
+    /// v0.1.4's job (after-state capture diff), not this variant's.
+    ///
+    /// `reason` distinguishes which creation step failed
+    /// (`"source_creation_failed"`, `"down_event_creation_failed"`,
+    /// `"up_event_creation_failed"`) so the operator's first debugging
+    /// instinct lands on the right call site without having to cross-ref the
+    /// preceding warn log.
+    #[error(
+        "synthetic click could not be constructed (reason: {reason}). \
+         No event was posted to the HID tap. This typically means the system \
+         denied CGEventSource creation or CGEvent::new_mouse_event rejected \
+         the inputs; check the preceding warn log for the underlying Quartz \
+         error."
+    )]
+    ClickFailed { reason: &'static str },
+
+    /// The RoK window's state changed between discovery (top of `run()`) and
+    /// the click site, in a way that would let a synthetic AX-privileged
+    /// click land on the wrong window. v0.1.3 closes the TOCTOU between
+    /// `find_rok_window()` and `click_at()` by re-validating immediately
+    /// before the click; this variant is the typed exit when re-validation
+    /// fails.
+    ///
+    /// `reason` distinguishes which check failed:
+    /// - `"window_id_gone"` — the original WID is no longer in
+    ///   `CGWindowListCopyWindowInfo` (RoK closed, crashed, or its window
+    ///   was rebuilt and got a new WID).
+    /// - `"frame_moved"` — the WID exists but its frame origin or size
+    ///   shifted by more than the per-axis tolerance since discovery.
+    /// - `"not_topmost_at_click"` — the WID exists with the expected
+    ///   frame, but another window now sits on top of the click point
+    ///   (overlay, dialog, notification banner, focus grab from another
+    ///   app). Posting the click here would deliver privileged input to
+    ///   that other window.
+    #[error(
+        "RoK window state changed between discovery and click (reason: {reason}). \
+         Aborted before posting the click to avoid sending privileged synthetic \
+         input to the wrong window. Re-run when RoK is foreground and stable."
+    )]
+    WindowChanged { reason: &'static str },
 }
 
 impl BotError {
@@ -79,6 +126,8 @@ impl BotError {
             Self::TargetNotFound => 15,
             Self::ImageLoadFailed { .. } => 16,
             Self::TargetTooLarge { .. } => 17,
+            Self::ClickFailed { .. } => 18,
+            Self::WindowChanged { .. } => 19,
         }
     }
 }
@@ -88,6 +137,7 @@ pub type Result<T> = std::result::Result<T, BotError>;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::click::{REASON_DOWN, REASON_SOURCE, REASON_UP};
 
     #[test]
     fn exit_codes_are_stable_and_unique() {
@@ -105,6 +155,14 @@ mod tests {
             BotError::TargetTooLarge {
                 needle: (50, 50),
                 haystack: (40, 40),
+            }
+            .exit_code(),
+            BotError::ClickFailed {
+                reason: REASON_SOURCE,
+            }
+            .exit_code(),
+            BotError::WindowChanged {
+                reason: "window_id_gone",
             }
             .exit_code(),
         ];
@@ -160,6 +218,37 @@ mod tests {
             .exit_code(),
             17
         );
+        // Pin all three documented `reason` values to 18 — reason is a string
+        // tag for the operator-facing log, not part of the exit-code contract,
+        // but exercising each variant ensures a future PartialEq-on-reason
+        // refactor can't accidentally fork the exit code per-reason. Using
+        // the click.rs constants (vs literal strings) keeps the test in sync
+        // with any future rename of the reason tags.
+        assert_eq!(
+            BotError::ClickFailed {
+                reason: REASON_SOURCE
+            }
+            .exit_code(),
+            18
+        );
+        assert_eq!(
+            BotError::ClickFailed {
+                reason: REASON_DOWN
+            }
+            .exit_code(),
+            18
+        );
+        assert_eq!(BotError::ClickFailed { reason: REASON_UP }.exit_code(), 18);
+        // WindowChanged variants share exit 19. Pin all 3 documented
+        // reasons even though reason isn't part of the exit-code contract
+        // — same rationale as ClickFailed.
+        for reason in ["window_id_gone", "frame_moved", "not_topmost_at_click"] {
+            assert_eq!(
+                BotError::WindowChanged { reason }.exit_code(),
+                19,
+                "WindowChanged({reason}) must map to exit 19"
+            );
+        }
     }
 
     #[test]
@@ -246,5 +335,30 @@ mod tests {
     fn rok_not_on_primary_mentions_v0_2() {
         let msg = BotError::RokNotOnPrimary.to_string();
         assert!(msg.contains("v0.2"), "msg should reference v0.2: {msg}");
+    }
+
+    #[test]
+    fn click_failed_message_includes_reason_and_no_post_promise() {
+        // The `reason` tag must surface so the operator's first-look log
+        // line points at the right call site. The "no event was posted"
+        // phrasing pins the contract that ClickFailed is a creation-time
+        // error — no synthetic event ever left the process — so debugging
+        // doesn't need to consider partial-click scenarios. (Earlier draft
+        // also said "the cursor was not moved" but design A4 means the
+        // cursor is never moved on the success path either, so that
+        // phrasing was misleading.)
+        let err = BotError::ClickFailed {
+            reason: REASON_DOWN,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains(REASON_DOWN),
+            "ClickFailed Display must include the reason tag: {msg}"
+        );
+        let lower = msg.to_lowercase();
+        assert!(
+            lower.contains("no event was posted"),
+            "ClickFailed Display must promise no event was posted: {msg}"
+        );
     }
 }

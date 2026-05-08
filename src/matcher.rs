@@ -42,10 +42,26 @@
 use std::path::Path;
 use std::time::Instant;
 
+use core_graphics::display::CGRect;
 use image::{GrayImage, ImageReader, Limits};
 use imageproc::template_matching::{MatchTemplateMethod, match_template_parallel};
 
 use crate::error::{BotError, Result};
+
+/// Threshold for "axis scales agree" in [`screen_point`]. A divergence of
+/// more than this fraction between x-axis and y-axis scale factors is
+/// logged at warn level — typically signals mixed-DPI multi-monitor setups
+/// or a non-square pixel ratio in the capture (rare but possible). The
+/// click still proceeds with per-axis scaling (`x_scale` on x, `y_scale`
+/// on y), so the warn is informational rather than corrective: the per-axis
+/// math hits the right relative offset within the window even when scales
+/// disagree, but the disagreement itself is worth surfacing in case it
+/// signals a deeper capture-pipeline misconfiguration.
+///
+/// `0.01` (1%) is the starting empirical guess from /plan-eng-review CMT-5.
+/// Tune from real captures: tighten if false positives bite, relax if
+/// false negatives bite.
+const SCALE_DIVERGENCE_WARN_THRESHOLD: f64 = 0.01;
 
 /// Maximum haystack dimension (in pixels) accepted by `find_target`. Decoder-
 /// enforced via `image::Limits`, so a malformed PNG with an oversized IHDR
@@ -88,16 +104,29 @@ pub const TARGET_BYTES: &[u8] = include_bytes!("../assets/targets/city-button.pn
 ///
 /// Coordinates are in the **capture's** pixel space (Retina-doubled,
 /// 2102×1640 for our current screencapture output). The capture-to-screen
-/// coord conversion lives in v0.1.3 alongside `CGEvent.post`.
+/// coord conversion is `matcher::screen_point` (v0.1.3), which combines a
+/// `Match` with the live window `CGRect` to produce CG global-screen
+/// coordinates suitable for `CGEventPost`.
 ///
 /// `score` is in `[0, 1]` for non-negative grayscale (see module docs for
 /// why this isn't `[-1, 1]`). Only scores `>= MATCH_THRESHOLD` ever surface
 /// in `Some(Match)` — below-threshold returns `Ok(None)` from the matcher.
+///
+/// `capture_dims` and `needle_dims` are carried alongside the position so
+/// downstream coordinate math doesn't have to re-decode either image.
+/// `find_target` already decodes both during matching; throwing the
+/// dimensions away here would force `screen_point` to either re-decode the
+/// haystack (silent O(N) trap on every click) or accept dims as separate
+/// arguments (silent contract bug if caller and source diverge). Storing
+/// them on `Match` makes the contract self-describing. Both are
+/// `(width, height)` in pixels.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Match {
     pub x: u32,
     pub y: u32,
     pub score: f32,
+    pub capture_dims: (u32, u32),
+    pub needle_dims: (u32, u32),
 }
 
 /// Open a haystack PNG with decoder-enforced dimension limits, decode, and
@@ -194,6 +223,130 @@ pub fn find_target(haystack_path: &Path) -> Result<Option<Match>> {
         );
     }
     Ok(outcome)
+}
+
+/// Pure: validate that a `Match` carries non-zero `capture_dims` and
+/// `needle_dims` before downstream coordinate math runs against it.
+///
+/// Design A16 zero-dim hard-fail: `screen_point` is infallible, but a
+/// `Match` with any zero dim would feed it a zero divisor and produce
+/// NaN/Inf coordinates. Catching that at the `Match` boundary maps the
+/// failure to a typed exit (`ImageLoadFailed { which: "haystack" | "needle" }`,
+/// exit 16) and surfaces the failure close to its source — a malformed
+/// haystack capture or a malformed embedded needle decoded with garbage
+/// dimensions.
+///
+/// Lives here (alongside `Match` and `screen_point`) rather than in
+/// `main.rs::run` so the four edge cases (capture w=0, capture h=0,
+/// needle w=0, needle h=0) are unit-testable without a live pipeline.
+pub fn validate_match_dims(m: &Match) -> Result<()> {
+    if m.capture_dims.0 == 0 || m.capture_dims.1 == 0 {
+        tracing::warn!(
+            target: "rok_bot",
+            capture_dims = ?m.capture_dims,
+            "matcher returned Match with zero capture dims — capture file likely malformed"
+        );
+        return Err(BotError::ImageLoadFailed { which: "haystack" });
+    }
+    if m.needle_dims.0 == 0 || m.needle_dims.1 == 0 {
+        tracing::warn!(
+            target: "rok_bot",
+            needle_dims = ?m.needle_dims,
+            "matcher returned Match with zero needle dims — embedded asset likely malformed"
+        );
+        return Err(BotError::ImageLoadFailed { which: "needle" });
+    }
+    Ok(())
+}
+
+/// Pure: convert a capture-pixel-space match into a CG global-screen point
+/// suitable for `CGEventPost`.
+///
+/// The mapping is:
+///
+/// 1. Compute `(needle_center_x, needle_center_y)` in capture pixels — that's
+///    the click anchor (design A6: click at needle CENTER, not top-left).
+/// 2. Derive scale factors `x_scale = window.width / capture_width` and
+///    `y_scale = window.height / capture_height`. On a single-display
+///    Retina capture these are typically `0.5` (capture is 2× window in
+///    points). They should agree to within ~1% on a sane setup.
+/// 3. Translate by the window origin: `screen = window.origin + center * scale`.
+///
+/// **Design A15 — scale consistency:** in debug builds, asserts the two
+/// scales agree to within `1e-6` (a float-precision tolerance — on a sane
+/// single-display screencapture both scales come from the same display's
+/// backing factor, so they should be bit-equal). In release, logs a
+/// `tracing::warn!` if they diverge by more than
+/// [`SCALE_DIVERGENCE_WARN_THRESHOLD`] (1%). **Both axes are scaled
+/// independently** — `screen_x` uses `x_scale`, `screen_y` uses `y_scale`.
+/// On a sane capture they're equal so this is identical to single-scale;
+/// on a divergent capture the per-axis math still maps within the window
+/// (the warn surfaces the divergence in case it signals a deeper capture
+/// misconfiguration, but does not change the math).
+///
+/// **Design A16 — zero-dim hard-fail:** this function is **infallible**
+/// once given a `Match`. Validation that `capture_dims > 0` and
+/// `needle_dims > 0` happens at the boundary in `main.rs::run` (mapping
+/// to `BotError::ImageLoadFailed { which: "haystack" }` exit 16). Inside
+/// `screen_point`, zero dims would only produce NaN/Inf coordinates;
+/// catching that here would hide the real failure (a malformed capture
+/// arrived at the matcher).
+///
+/// Returned tuple is `(x, y)` in CG global-screen coordinates (top-left
+/// origin, points). Negative values are valid — RoK on a virtual display
+/// at e.g. `(-1051, 103)` produces negative click x-coordinates, and
+/// `CGEventPost` accepts them.
+#[must_use]
+pub fn screen_point(m: &Match, window: &CGRect) -> (f64, f64) {
+    let (capture_w, capture_h) = m.capture_dims;
+    let (needle_w, needle_h) = m.needle_dims;
+
+    let needle_center_x = f64::from(m.x) + f64::from(needle_w) / 2.0;
+    let needle_center_y = f64::from(m.y) + f64::from(needle_h) / 2.0;
+
+    let x_scale = window.size.width / f64::from(capture_w);
+    let y_scale = window.size.height / f64::from(capture_h);
+
+    debug_assert!(
+        (x_scale - y_scale).abs() < 1e-6,
+        "screen_point: x-scale {x_scale} and y-scale {y_scale} should agree on a normal capture; \
+         diverged by {} (capture {}x{}, window {}x{})",
+        (x_scale - y_scale).abs(),
+        capture_w,
+        capture_h,
+        window.size.width,
+        window.size.height,
+    );
+
+    if !cfg!(debug_assertions) {
+        // Use the larger scale as the divergence denominator so a near-zero
+        // smaller scale doesn't inflate the relative-difference percentage
+        // into an always-fires warning. Pick `max` over `min` for the same
+        // reason.
+        let denom = x_scale.abs().max(y_scale.abs());
+        if denom > 0.0 {
+            let divergence = (x_scale - y_scale).abs() / denom;
+            if divergence > SCALE_DIVERGENCE_WARN_THRESHOLD {
+                tracing::warn!(
+                    target: "rok_bot",
+                    x_scale,
+                    y_scale,
+                    divergence_fraction = divergence,
+                    threshold = SCALE_DIVERGENCE_WARN_THRESHOLD,
+                    capture_w,
+                    capture_h,
+                    window_w = window.size.width,
+                    window_h = window.size.height,
+                    "capture-to-window scale factors disagree beyond threshold; click \
+                     may miss on mixed-DPI multi-monitor setups",
+                );
+            }
+        }
+    }
+
+    let screen_x = window.origin.x + needle_center_x * x_scale;
+    let screen_y = window.origin.y + needle_center_y * y_scale;
+    (screen_x, screen_y)
 }
 
 /// Pure: compute the best-match NCC score and location over in-memory
@@ -294,13 +447,37 @@ fn match_in(haystack: &GrayImage, needle: &GrayImage) -> Result<Option<Match>> {
         return Ok(None);
     }
 
-    Ok(Some(Match { x, y, score }))
+    Ok(Some(Match {
+        x,
+        y,
+        score,
+        capture_dims: (haystack.width(), haystack.height()),
+        needle_dims: (needle.width(), needle.height()),
+    }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core_graphics::display::{CGPoint, CGSize};
     use image::Luma;
+
+    fn rect(x: f64, y: f64, w: f64, h: f64) -> CGRect {
+        CGRect::new(&CGPoint::new(x, y), &CGSize::new(w, h))
+    }
+
+    fn make_match(x: u32, y: u32, capture: (u32, u32), needle: (u32, u32)) -> Match {
+        // Score is irrelevant for screen_point math — pin to a clearly-above-
+        // threshold value so a future Match invariant ("score must be >=
+        // MATCH_THRESHOLD") doesn't silently invalidate these fixtures.
+        Match {
+            x,
+            y,
+            score: 0.99,
+            capture_dims: capture,
+            needle_dims: needle,
+        }
+    }
 
     /// Deterministic pseudo-noise. We avoid pulling in `rand` for tests —
     /// a tiny xorshift gives us reproducible distinct-looking pixel values
@@ -383,6 +560,23 @@ mod tests {
             "exact-match NCC should be ~1.0, got {}",
             m.score
         );
+    }
+
+    #[test]
+    fn match_in_populates_capture_and_needle_dims() {
+        // Pin the v0.1.3 contract: Match carries both image dimensions so
+        // screen_point can compute the capture→screen scale factors without
+        // re-decoding either image. A regression here would be silent —
+        // screen_point would still compile but produce zero-scale clicks.
+        let needle = noise_image(11, 7, 0xCAFE_BABE);
+        let mut haystack = noise_image(80, 50, 0xBEEF_0001);
+        plant_needle_at(&mut haystack, &needle, 5, 5);
+
+        let m = match_in(&haystack, &needle)
+            .expect("size guard")
+            .expect("planted needle");
+        assert_eq!(m.capture_dims, (80, 50), "capture dims must equal haystack");
+        assert_eq!(m.needle_dims, (11, 7), "needle dims must equal needle");
     }
 
     #[test]
@@ -659,6 +853,210 @@ mod tests {
             }
             other => panic!("expected TargetTooLarge, got {other:?}"),
         }
+    }
+
+    // ---------- validate_match_dims (v0.1.3) ----------
+
+    #[test]
+    fn validate_match_dims_accepts_non_zero_dims() {
+        let m = make_match(0, 0, (100, 80), (10, 10));
+        assert!(validate_match_dims(&m).is_ok());
+    }
+
+    #[test]
+    fn validate_match_dims_rejects_zero_capture_width() {
+        let m = make_match(0, 0, (0, 80), (10, 10));
+        match validate_match_dims(&m) {
+            Err(BotError::ImageLoadFailed { which }) => {
+                assert_eq!(which, "haystack", "zero capture width must tag haystack");
+            }
+            other => panic!("expected ImageLoadFailed{{haystack}}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_match_dims_rejects_zero_capture_height() {
+        let m = make_match(0, 0, (100, 0), (10, 10));
+        match validate_match_dims(&m) {
+            Err(BotError::ImageLoadFailed { which }) => {
+                assert_eq!(which, "haystack", "zero capture height must tag haystack");
+            }
+            other => panic!("expected ImageLoadFailed{{haystack}}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_match_dims_rejects_zero_needle_width() {
+        let m = make_match(0, 0, (100, 80), (0, 10));
+        match validate_match_dims(&m) {
+            Err(BotError::ImageLoadFailed { which }) => {
+                assert_eq!(which, "needle", "zero needle width must tag needle");
+            }
+            other => panic!("expected ImageLoadFailed{{needle}}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_match_dims_rejects_zero_needle_height() {
+        let m = make_match(0, 0, (100, 80), (10, 0));
+        match validate_match_dims(&m) {
+            Err(BotError::ImageLoadFailed { which }) => {
+                assert_eq!(which, "needle", "zero needle height must tag needle");
+            }
+            other => panic!("expected ImageLoadFailed{{needle}}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_match_dims_capture_zero_takes_precedence_over_needle_zero() {
+        // Both capture and needle dims zero — capture check fires first
+        // (it's the primary boundary failure). Pin the order so a refactor
+        // can't silently flip which `which` tag operators see.
+        let m = make_match(0, 0, (0, 0), (0, 0));
+        match validate_match_dims(&m) {
+            Err(BotError::ImageLoadFailed { which }) => {
+                assert_eq!(
+                    which, "haystack",
+                    "capture-zero wins precedence over needle-zero"
+                );
+            }
+            other => panic!("expected ImageLoadFailed{{haystack}}, got {other:?}"),
+        }
+    }
+
+    // ---------- screen_point (v0.1.3) ----------
+
+    #[test]
+    fn screen_point_retina_2x_known_position() {
+        // Retina case (the common one): capture is 2× the window in both
+        // axes. Window at (100, 200) with size 1280×720 in points; capture
+        // is 2560×1440 in pixels. A needle whose top-left lands at
+        // capture-pixel (1000, 600) and whose dims are (40, 60) has its
+        // center at capture-pixel (1020, 630). Scale factors are both 0.5.
+        // Expected screen point: (100 + 1020*0.5, 200 + 630*0.5) =
+        // (610, 515).
+        let m = make_match(1000, 600, (2560, 1440), (40, 60));
+        let window = rect(100.0, 200.0, 1280.0, 720.0);
+        let (sx, sy) = screen_point(&m, &window);
+        assert!((sx - 610.0).abs() < 1e-9, "screen_x: {sx}");
+        assert!((sy - 515.0).abs() < 1e-9, "screen_y: {sy}");
+    }
+
+    #[test]
+    fn screen_point_non_retina_1x_known_position() {
+        // External 1× display: capture pixels equal window points 1:1.
+        // Window at (0, 0) with size 1024×768; capture 1024×768. A needle
+        // top-left at (200, 300) with dims (20, 10) centers at (210, 305);
+        // scale 1.0 → screen (210, 305).
+        let m = make_match(200, 300, (1024, 768), (20, 10));
+        let window = rect(0.0, 0.0, 1024.0, 768.0);
+        let (sx, sy) = screen_point(&m, &window);
+        assert!((sx - 210.0).abs() < 1e-9, "screen_x: {sx}");
+        assert!((sy - 305.0).abs() < 1e-9, "screen_y: {sy}");
+    }
+
+    #[test]
+    fn screen_point_negative_origin_virtual_display() {
+        // P3 spike's actual setup: RoK on BetterDisplay virtual screen at
+        // CG origin (-1051, 103) size 1051×820. Capture from screencapture
+        // is typically 2× → 2102×1640 (Retina BD). A needle landing at
+        // capture-pixel (1000, 800) with dims (52, 24) centers at
+        // (1026, 812). Scale 0.5 → screen (-1051 + 513, 103 + 406) =
+        // (-538, 509). Negative screen-x is valid for virtual displays
+        // and CGEventPost accepts it (verified by the spike).
+        let m = make_match(1000, 800, (2102, 1640), (52, 24));
+        let window = rect(-1051.0, 103.0, 1051.0, 820.0);
+        let (sx, sy) = screen_point(&m, &window);
+        assert!((sx - (-538.0)).abs() < 1e-9, "screen_x: {sx}");
+        assert!((sy - 509.0).abs() < 1e-9, "screen_y: {sy}");
+    }
+
+    #[test]
+    fn screen_point_clicks_at_needle_center_not_top_left() {
+        // Design A6: clicks must land at the geometric center of the
+        // matched needle, not the top-left anchor returned by the
+        // imageproc heatmap. This pin protects against a refactor that
+        // accidentally drops the half-needle offset.
+        let m = make_match(100, 100, (1000, 1000), (40, 60));
+        let window = rect(0.0, 0.0, 1000.0, 1000.0);
+        let (sx, sy) = screen_point(&m, &window);
+        // Top-left would be (100, 100); center is (100 + 20, 100 + 30)
+        // = (120, 130). Pin the center value AND assert it differs from
+        // the top-left to make the contract violation obvious in the
+        // failure message.
+        assert!((sx - 120.0).abs() < 1e-9, "screen_x at center: {sx}");
+        assert!((sy - 130.0).abs() < 1e-9, "screen_y at center: {sy}");
+        assert!(
+            (sx - 100.0).abs() > 1.0 && (sy - 100.0).abs() > 1.0,
+            "screen_point must NOT return needle top-left, got ({sx}, {sy})"
+        );
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "should agree on a normal capture")]
+    fn screen_point_debug_asserts_on_axis_scale_divergence() {
+        // Design A15: in debug builds, a divergence between x-scale and
+        // y-scale beyond 1e-6 triggers a debug_assert. This pins the
+        // assertion text so future refactors can't silently weaken the
+        // check (e.g., switching to debug_assert_eq! and losing the
+        // descriptive message).
+        //
+        // Capture 100×100, window 50×100 → x-scale 0.5, y-scale 1.0:
+        // a 0.5 absolute divergence, far over 1e-6.
+        let m = make_match(10, 10, (100, 100), (10, 10));
+        let window = rect(0.0, 0.0, 50.0, 100.0);
+        let _ = screen_point(&m, &window);
+    }
+
+    #[test]
+    fn scale_divergence_warn_threshold_is_one_percent() {
+        // Pin the SCALE_DIVERGENCE_WARN_THRESHOLD value to its v0.1.3
+        // contract. The warn-trigger is operator-facing tuning; changing
+        // the threshold is a deliberate decision, not an incidental
+        // refactor. Bit-equality side-steps the `float_cmp_const` lint.
+        let pinned = SCALE_DIVERGENCE_WARN_THRESHOLD.to_bits() == 0.01_f64.to_bits();
+        assert!(
+            pinned,
+            "SCALE_DIVERGENCE_WARN_THRESHOLD drifted from 0.01: {SCALE_DIVERGENCE_WARN_THRESHOLD}"
+        );
+    }
+
+    #[test]
+    #[cfg(not(debug_assertions))]
+    fn screen_point_zero_capture_dims_returns_non_finite_in_release() {
+        // Documented A16 contract: screen_point is infallible — zero dims
+        // would only produce NaN/Inf, which the boundary check in
+        // main.rs::run catches. Pin that screen_point itself does NOT
+        // silently return (0.0, 0.0) or some other plausible-looking
+        // coord, which would let a zero-dim Match slip past the boundary
+        // and post a click at the window origin.
+        let m = make_match(0, 0, (0, 0), (0, 0));
+        let window = rect(100.0, 200.0, 1280.0, 720.0);
+        let (sx, sy) = screen_point(&m, &window);
+        assert!(
+            !sx.is_finite() || !sy.is_finite(),
+            "screen_point with zero capture_dims should produce non-finite coords \
+             so the boundary check fires; got ({sx}, {sy})"
+        );
+    }
+
+    #[test]
+    #[cfg(not(debug_assertions))]
+    fn screen_point_release_mode_tolerates_axis_scale_divergence() {
+        // Design A15 release-mode side: the same input that panics in
+        // debug must NOT panic in release — it just logs a warn. The
+        // returned coord uses the x-axis scale for both axes (intentional;
+        // see screen_point doc). Pin both that no panic occurs and that
+        // the x-axis scale is the one applied.
+        let m = make_match(10, 10, (100, 100), (10, 10));
+        let window = rect(0.0, 0.0, 50.0, 100.0);
+        let (sx, sy) = screen_point(&m, &window);
+        // x-scale = 0.5, y-scale = 1.0. Each axis uses its own scale per
+        // the implementation, so center (15, 15) → (15*0.5, 15*1.0) =
+        // (7.5, 15.0). Pin that to keep the contract observable in release.
+        assert!((sx - 7.5).abs() < 1e-9, "release screen_x: {sx}");
+        assert!((sy - 15.0).abs() < 1e-9, "release screen_y: {sy}");
     }
 
     #[test]

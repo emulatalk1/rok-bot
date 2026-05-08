@@ -1,17 +1,45 @@
 //! macOS TCC permission preflight.
 //!
-//! Without Screen Recording granted to the terminal app, `CGWindowListCopyWindowInfo`
-//! still returns RoK's windows but with `kCGWindowName` stripped to nil. Our
-//! owner+title filter would then silently miss the main window and return
-//! `WindowNotFound`, leaving the user staring at a misleading "is the game
-//! running?" error while the game is visibly running. The preflight catches
-//! this up front and returns `PermissionsMissing { which: "Screen Recording" }`
-//! instead.
+//! Two surfaces:
 //!
-//! v0.1 checks **Screen Recording only.** Accessibility (required for
-//! `CGEvent.post` synthetic input) lands when the hello-world click milestone
-//! adds the first synthetic event — see TODOS.md.
+//! - **Screen Recording** — without it, `CGWindowListCopyWindowInfo` still
+//!   returns RoK's windows but with `kCGWindowName` stripped to nil. Our
+//!   owner+title filter would then silently miss the main window and return
+//!   `WindowNotFound`, leaving the user staring at a misleading "is the game
+//!   running?" error while the game is visibly running. The preflight catches
+//!   this up front. Backed by `core-graphics`' `ScreenCaptureAccess` wrapper.
+//!
+//! - **Accessibility** — required for `CGEventPost` to deliver synthetic
+//!   input. Without it, the post call silently no-ops (`CGEventPost` returns
+//!   `()` and provides no error signal — the `BotError::ClickFailed`
+//!   creation-time variant only catches `CGEvent::new_mouse_event` /
+//!   `CGEventSource::new` failures, not delivery failures). The Accessibility
+//!   FFI is hand-rolled here because `core-graphics` does not bind it and no
+//!   maintained Rust crate exists as of 2026-05.
+//!
+//! Two-stage AX preflight pattern (design A11):
+//!
+//! - At boot, `peek_accessibility()` reports the current trusted state
+//!   without prompting. If denied, `main.rs::run` logs a warn and proceeds —
+//!   the bot may still produce useful capture+match output even without click.
+//! - At click site, `check_accessibility()` *prompts* if denied (returns a
+//!   typed `PermissionsMissing` error → exit 13). The prompt is asynchronous,
+//!   so first-run UX is "prompt fires, exit 13, user grants in System
+//!   Settings, user re-runs and it works" — NOT analogous to
+//!   `ScreenCaptureAccess::request()` which blocks. This was Codex review
+//!   CMT-2 correction during /plan-eng-review.
 
+#![allow(
+    unsafe_code,
+    reason = "Accessibility FFI to ApplicationServices is unbound by core-graphics \
+              and no maintained Rust crate covers it; the unsafe surface is contained \
+              in this module."
+)]
+
+use core_foundation::base::TCFType;
+use core_foundation::boolean::CFBoolean;
+use core_foundation::dictionary::{CFDictionary, CFDictionaryRef};
+use core_foundation::string::{CFString, CFStringRef};
 use core_graphics::access::ScreenCaptureAccess;
 
 use crate::error::{BotError, Result};
@@ -21,6 +49,31 @@ use crate::error::{BotError, Result};
 /// instead of literal "Screen Recording" strings scattered across files.
 pub const SCREEN_RECORDING: &str = "Screen Recording";
 
+/// Canonical label for the Accessibility permission. Same role as
+/// `SCREEN_RECORDING` but for the AX surface. Used as the `which` tag in
+/// `BotError::PermissionsMissing` (exit 13) when the click-site hard check
+/// finds AX denied.
+pub const ACCESSIBILITY: &str = "Accessibility";
+
+// Hand-rolled FFI to the Accessibility check.
+//
+// `AXIsProcessTrustedWithOptions` is a process-scoped check: macOS evaluates
+// the calling process's code signature + bundle ID against the
+// `com.apple.accessibility` TCC table. The `prompt` option (true/false)
+// controls whether macOS shows a system dialog when not yet trusted; the
+// dialog is asynchronous — the function returns immediately with the
+// current trusted state regardless of user action.
+//
+// Returns macOS `Boolean` (= `unsigned char` = `u8`: 0 = denied, 1 = trusted).
+// `kAXTrustedCheckOptionPrompt` is a `CFStringRef` constant exported by
+// ApplicationServices; pairing it with `CFBoolean::true_value()` in the
+// options dict toggles the prompt on.
+#[link(name = "ApplicationServices", kind = "framework")]
+unsafe extern "C" {
+    fn AXIsProcessTrustedWithOptions(options: CFDictionaryRef) -> u8;
+    static kAXTrustedCheckOptionPrompt: CFStringRef;
+}
+
 /// Pure: turn a granted/denied bool into the preflight result. Lets us
 /// unit-test both branches without needing two Macs with different TCC state.
 const fn check_inner(granted: bool) -> Result<()> {
@@ -29,6 +82,19 @@ const fn check_inner(granted: bool) -> Result<()> {
     } else {
         Err(BotError::PermissionsMissing {
             which: SCREEN_RECORDING,
+        })
+    }
+}
+
+/// Pure: turn a trusted/denied bool into the AX hard-check result.
+/// Exists for the same testability reason as `check_inner`: the live FFI is
+/// not parameterizable, but the boolean → typed-error mapping is.
+const fn check_accessibility_inner(trusted: bool) -> Result<()> {
+    if trusted {
+        Ok(())
+    } else {
+        Err(BotError::PermissionsMissing {
+            which: ACCESSIBILITY,
         })
     }
 }
@@ -53,6 +119,65 @@ pub fn check_screen_recording() -> Result<()> {
         return Ok(());
     }
     check_inner(false)
+}
+
+/// Build the options dictionary `{ kAXTrustedCheckOptionPrompt: <prompt> }`.
+/// Factored out so `peek_accessibility` (prompt=false) and
+/// `check_accessibility` (prompt=true) share construction without diverging.
+fn ax_options(prompt: bool) -> CFDictionary<CFString, CFBoolean> {
+    // SAFETY: `kAXTrustedCheckOptionPrompt` is a CFStringRef constant exported
+    // statically by ApplicationServices. `wrap_under_get_rule` follows the
+    // CoreFoundation "Get rule" — it CFRetains internally so the resulting
+    // CFString owns its retain. The constant pointer is non-null and stable
+    // for the process lifetime.
+    let prompt_key = unsafe { CFString::wrap_under_get_rule(kAXTrustedCheckOptionPrompt) };
+    let prompt_val = if prompt {
+        CFBoolean::true_value()
+    } else {
+        CFBoolean::false_value()
+    };
+    CFDictionary::from_CFType_pairs(&[(prompt_key, prompt_val)])
+}
+
+/// Live AX trust check, no prompt. Returns `true` if the calling process
+/// is currently trusted for Accessibility, `false` otherwise. Never side-
+/// effects the system (no dialog, no TCC mutation).
+///
+/// Intended for the boot-time peek per design A11: log a warn if denied,
+/// continue execution — the bot can still produce capture + match output
+/// without click, and the click-site hard check fires when needed.
+pub fn peek_accessibility() -> bool {
+    let opts = ax_options(false);
+    // SAFETY: `AXIsProcessTrustedWithOptions` accepts a `CFDictionaryRef` and
+    // returns a `Boolean`. The dictionary outlives this call; the framework
+    // does not retain past return. Returning `u8` (0 or 1) is per Apple's
+    // documented signature.
+    let trusted = unsafe { AXIsProcessTrustedWithOptions(opts.as_concrete_TypeRef()) };
+    trusted != 0
+}
+
+/// Live AX trust check, **prompts** if denied. Returns `Ok(())` if trusted,
+/// `Err(PermissionsMissing { which: "Accessibility" })` (exit 13) if denied.
+///
+/// Critical UX detail: the prompt is **asynchronous** — macOS shows the
+/// dialog and `AXIsProcessTrustedWithOptions` returns immediately with the
+/// current (still denied) trusted state. There is no analogue to
+/// `ScreenCaptureAccess::request()`'s blocking behavior. First-run flow is:
+///
+///   1. Bot reaches click site, calls this fn.
+///   2. macOS shows AX prompt (async); fn returns false.
+///   3. Bot exits with code 13 + user-facing log instructing "grant in
+///      System Settings, then re-run."
+///   4. User grants Accessibility for the binary.
+///   5. User re-runs; this fn returns Ok on the second invocation.
+///
+/// This is intentional: a blocking prompt would require pumping the AppKit
+/// event loop, which would balloon the dependency surface for marginal UX.
+pub fn check_accessibility() -> Result<()> {
+    let opts = ax_options(true);
+    // SAFETY: same contract as `peek_accessibility` — see that comment.
+    let trusted = unsafe { AXIsProcessTrustedWithOptions(opts.as_concrete_TypeRef()) };
+    check_accessibility_inner(trusted != 0)
 }
 
 #[cfg(test)]
@@ -90,5 +215,54 @@ mod tests {
     fn denied_uses_permissions_missing_exit_code() {
         let err = check_inner(false).unwrap_err();
         assert_eq!(err.exit_code(), 13, "PermissionsMissing exit code is 13");
+    }
+
+    // ---------- Accessibility (v0.1.3) ----------
+
+    #[test]
+    fn ax_granted_returns_ok() {
+        assert!(check_accessibility_inner(true).is_ok());
+    }
+
+    #[test]
+    fn ax_denied_returns_permissions_missing_with_accessibility_label() {
+        let err = check_accessibility_inner(false).unwrap_err();
+        assert_eq!(
+            err,
+            BotError::PermissionsMissing {
+                which: ACCESSIBILITY,
+            }
+        );
+    }
+
+    #[test]
+    fn ax_denied_uses_permissions_missing_exit_code() {
+        // Same exit code as Screen Recording denial — both are
+        // PermissionsMissing variants. Operator branches on the `which`
+        // tag in the log line, not on a per-permission exit code.
+        let err = check_accessibility_inner(false).unwrap_err();
+        assert_eq!(err.exit_code(), 13);
+    }
+
+    #[test]
+    fn ax_denied_message_points_at_system_settings() {
+        let err = check_accessibility_inner(false).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Accessibility"), "msg: {msg}");
+        assert!(
+            msg.contains("System Settings"),
+            "user-facing msg should name the macOS settings panel: {msg}"
+        );
+    }
+
+    #[test]
+    fn permission_label_constants_match_expected_strings() {
+        // Pin the exact label strings — they appear in the operator-facing
+        // log lines, the `which` tag of `PermissionsMissing`, and (for
+        // `Accessibility`) the System Settings panel name. A typo here
+        // would silently break the operator's pattern-matching against
+        // their muscle memory.
+        assert_eq!(SCREEN_RECORDING, "Screen Recording");
+        assert_eq!(ACCESSIBILITY, "Accessibility");
     }
 }
