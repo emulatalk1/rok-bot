@@ -6,7 +6,7 @@
 
 | Mode | RoK is on... | Bot behavior | Your machine while bot runs | Status |
 |---|---|---|---|---|
-| **Mode 1 — Visible** | Built-in display (laptop Retina panel; `CGDisplayIsBuiltin` test, NOT the menu-bar display) | Detect window + classify display; v0.1 stops here, future milestones add capture/click | Bot is idle in v0.1 today; once gameplay automation lands, you'll watch it work | **v0.1 ✅ shipped** |
+| **Mode 1 — Visible** | Built-in display (laptop Retina panel; `CGDisplayIsBuiltin` test, NOT the menu-bar display) | Detect window, capture to PNG, template-match a known target, log coords + score; v0.1.3 adds the click | Bot is observable today (capture written, match logged); once click synthesis lands, you'll watch it interact | **v0.1.2 ✅ shipped** |
 | **Mode 2 — Background** | A non-built-in display (a BetterDisplay virtual display, an HDMI dummy plug, an iPad via Sidecar, or a real second monitor) | Bot runs invisibly on that display via BD virtual-display lifecycle management | You keep using the Mac normally | **v0.2 — planned, not yet shipped** |
 
 The bot auto-detects which mode to use by reading where RoK's window is. No CLI flag, no config file. Drag RoK between displays to switch.
@@ -27,15 +27,31 @@ Boot sequence (logged to stderr via `tracing`):
 1. **Screen Recording preflight.** First run on a fresh Mac triggers macOS's permission prompt and registers your terminal in System Settings → Privacy & Security → Screen Recording. Subsequent runs are silent. If you deny, exit code 13 (`PermissionsMissing`).
 2. **Find the RoK main window.** Filtered by `kCGWindowOwnerName == kCGWindowName == "RiseOfKingdoms"` AND backed by a process whose bundle ID starts with `com.rok.ios.` (anti-spoof gate against any local process that names itself "RiseOfKingdoms"). Exit 10 (`WindowNotFound`) if no match.
 3. **Classify display.** `CGDisplayIsBuiltin` test — built-in (laptop Retina panel) → `Mode::Visible`, anything else → `Mode::Virtual`. Exit 12 (`RokNotOnPrimary`) on Virtual in v0.1.
-4. **Mode::Visible:** capture the RoK window to `./rok-capture.png` via `/usr/sbin/screencapture -l <window_id> -x -o` (silent, no shadow). Exit 14 (`CaptureFailed`) if `screencapture` returns non-zero. Otherwise log success and exit 0. v0.1.1 stops here. Future sub-milestones add target-image matching (v0.1.2), click synthesis (v0.1.3), and after-state verification (v0.1.4).
+4. **Mode::Visible:** capture the RoK window to `./rok-capture.png` via `/usr/sbin/screencapture -l <window_id> -x -o` (silent, no shadow). Exit 14 (`CaptureFailed`) if `screencapture` returns non-zero.
+5. **Template-match the target inside the capture.** Decode the haystack PNG via `image::ImageReader` with `Limits` (`max_image_width`/`max_image_height` = 8192) so a malformed or oversized PNG fails fast as `ImageLoadFailed` (exit 16) instead of OOM-ing the process. Decode the embedded needle (`assets/targets/city-button.png`), run `imageproc::match_template_parallel` with `CrossCorrelationNormalized`, find the highest-scoring position, and compare against `MATCH_THRESHOLD = 0.85`. Exit 0 with an info log (`x`, `y`, `score`, `elapsed_ms`) on match; exit 15 (`TargetNotFound`) on no match; exit 17 (`TargetTooLarge`) if the needle is strictly larger than the haystack in either dimension. v0.1.2 stops here. Future sub-milestones add click synthesis (v0.1.3) and after-state verification (v0.1.4).
 
 Exit codes for shell users:
-- `0` = Mode 1 happy path (capture written)
+- `0` = Mode 1 happy path (capture written, target located)
 - `10` = `WindowNotFound`
 - `11` = `WindowScreenUnresolved`
 - `12` = `RokNotOnPrimary` (drag RoK to your built-in display, re-run)
 - `13` = `PermissionsMissing` (grant Screen Recording, re-run)
 - `14` = `CaptureFailed` (rare; usually means Screen Recording was revoked between preflight and capture)
+- `15` = `TargetNotFound` (capture decoded fine, but best NCC score below `MATCH_THRESHOLD` — the most likely cause is the placeholder embedded asset; see [the v0.1.2 placeholder note](#v012-target-asset-placeholder) below)
+- `16` = `ImageLoadFailed` (haystack PNG missing, malformed, or larger than 8192×8192; or embedded needle decode fails — defensive arm for a corrupt asset commit)
+- `17` = `TargetTooLarge` (needle dims strictly greater than haystack dims; rare in practice)
+
+### v0.1.2 target asset placeholder
+
+The committed `assets/targets/city-button.png` is a 80×40 synthetic placeholder, not the real RoK city/world toggle button. **The bot will exit 15 (`TargetNotFound`) on a real RoK capture** until you replace the asset with a real crop. Workflow once you have a fresh `rok-capture.png`:
+
+1. Open `rok-capture.png` in Preview.
+2. Crop the bottom-right city/world toggle button (~80×40 pixels — exact dims aren't critical).
+3. Save as `assets/targets/city-button.png` (overwrite the placeholder).
+4. `cargo build --release` to re-embed the new bytes via `include_bytes!`.
+5. `cargo run --release` and confirm exit 0 with a high-confidence score (`> 0.95` for an exact crop).
+
+The matcher's logic is identical regardless of which bytes are embedded; the placeholder exists only so the build compiles before the first live capture is taken.
 
 ## Optional — install pre-commit hooks (contributors)
 

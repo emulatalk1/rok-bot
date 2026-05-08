@@ -2,17 +2,18 @@
 
 Rust-based macOS automation experiment for **Rise of Kingdoms** on Apple Silicon. Personal/learning project. Public so others can read the design choices, not because it's polished or supported.
 
-## Status: v0.1 — Mode 1 (visible) + window capture
+## Status: v0.1 — Mode 1 (visible) + capture + template matching
 
-What works today (v0.1.1):
+What works today (v0.1.2):
 - Find the RoK main window via `CGWindowListCopyWindowInfo` (filtered by `owner == title == "RiseOfKingdoms"` plus a bundle-ID anti-spoof check against `com.rok.ios.*`).
 - Classify which display it's on via `CGDisplayIsBuiltin` (the laptop's Retina panel specifically — NOT the menu-bar display, which the user can move).
 - Screen Recording TCC preflight with first-install `request()` fallback so brand-new Macs aren't trapped in a permission dead-end.
 - **Capture the RoK window to `rok-capture.png`** (Mode 1 only) via Apple's `screencapture -l <wid> -x -o` CLI — silent, no shadow, ~50-100ms per call.
-- Structured exit codes (10–14) for shell consumers; tracing logs to stderr with `error_kind` + `exit_code` fields.
+- **Template-match a known UI element inside the capture** via `imageproc::match_template_parallel` (rayon-parallel NCC sliding window). Embedded needle, configurable `MATCH_THRESHOLD` (default `0.85`). Sub-second on M-series for the standard 2102×1640 Retina haystack.
+- Decompression-bomb guard on haystack decode (`image::ImageReader` with `Limits { max_image_width: 8192, max_image_height: 8192 }`).
+- Structured exit codes (10–17) for shell consumers; tracing logs to stderr with `error_kind` + `exit_code` fields.
 
-The hello-world milestone splits into 4 sub-steps. v0.1.1 (capture) is shipped. Coming next:
-- **v0.1.2** template-match a known target image inside the capture (`image` + `imageproc`).
+The hello-world milestone splits into 4 sub-steps. v0.1.1 (capture) and v0.1.2 (match) are shipped. Coming next:
 - **v0.1.3** synthesize the first click via `CGEvent.post`; add Accessibility TCC preflight.
 - **v0.1.4** after-state capture + verification that the click had the intended effect.
 
@@ -31,18 +32,22 @@ cargo run --release
 ```
 
 Expected outputs:
-- RoK on built-in display → `[INFO] Mode 1 (visible) ... captured RoK window` exit 0, `rok-capture.png` written to cwd
+- RoK on built-in display, target visible → `[INFO] Mode 1 (visible) ... captured RoK window ... found target x=… y=… score=…` exit 0, `rok-capture.png` written to cwd
 - RoK on virtual / external display → `[ERROR] RoK is not on the primary display. v0.1 supports Mode 1 (visible) only.` exit 12
 - RoK not running → `[ERROR] RoK window not found — is the game running?` exit 10
 - Screen Recording denied → `[ERROR] Missing macOS permission: Screen Recording.` exit 13
 - `screencapture` failed (rare) → `[ERROR] screencapture failed (exit code: ...)` exit 14
+- Target absent (or below `MATCH_THRESHOLD`) → `[ERROR] target not found in capture (best match below confidence threshold)` exit 15
+- Haystack PNG missing or oversized → `[ERROR] failed to load haystack image …` exit 16
+- Needle strictly larger than haystack in either dim → `[ERROR] target image is too large …` exit 17
 
 Full setup walkthrough: [docs/setup.md](docs/setup.md). Pre-commit hook install instructions are in there too.
 
 ## Repo layout
 
 ```
-src/                     v0.1 Rust source (5 modules, 35 unit tests)
+src/                     v0.1 Rust source (6 modules, 67 unit + integration tests)
+assets/targets/          embedded matcher needles (placeholder until first real RoK crop)
 docs/setup.md            user-facing setup guide
 docs/rok_rust_bot_research.md   pre-implementation architecture research
 docs/cargo_dependency_audit.md  pre-implementation dep pin audit
@@ -55,7 +60,7 @@ CLAUDE.md                project instructions for Claude Code agent sessions
 
 ```sh
 cargo build --release --locked
-cargo test --locked                                                  # 35 passing
+cargo test --locked                                                  # 67 passing
 cargo clippy --all-targets --all-features --locked -- -D warnings    # mbrain-style strict
 cargo fmt --all -- --check
 ```
