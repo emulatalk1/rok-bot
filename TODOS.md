@@ -243,3 +243,54 @@ Future RoK automation (map panning, troop movement, context menus, multi-action 
 **Approach when needed:** extend `click.rs` with `right_click_at(point)`, `double_click_at(point)`, `drag(start, end)`. Keep the same live/pure split (build_*_events as pure builders, *_at as live shims). Add tests pinning event types + button + click-state fields.
 
 **Why deferred:** v0.1.3 hello-world is a left tap, nothing more. Adding click variants without a caller is YAGNI.
+
+---
+
+## P2: v0.1.3+ — Mode 1 terminal/IDE occlusion blocks click (observed during smoke test 2026-05-08)
+
+**Source:** v0.1.3 smoke test post-commit. The TOCTOU re-validation (`window.rs::validate_at_click_site`) correctly refused to click 4/4 runs because iTerm2's window frame contained the click point on the user's primary display, even when the operator believed they had moved/hidden it.
+**Effort:** human ~5 min docs / CC ~30 min for `--activate-rok` flag implementation
+**Depends on:** v0.1.3 landed; first real bot deployment where the operator hits the issue.
+
+v0.1 Mode 1 means RoK is on the primary display, where the operator is actively working. Their terminal, IDE, browser, and other windows naturally overlap RoK's UI. When the bot's matched needle resolves to a screen point that's inside any non-RoK window's frame, `validate_at_click_site` returns `WindowChanged{not_topmost_at_click}` exit 19. The defense is correct (without it, a privileged synthetic click would land on the wrong window), but it makes the bot impractical for normal multi-window operator workflows.
+
+**Two complementary fixes:**
+
+1. **Docs (cheap, immediate):** Add a "Mode 1 operating notes" section to `docs/setup.md` explaining: the bot will refuse to click whenever any non-RoK window covers the matched UI element's screen position. Position your terminal/IDE/etc. so they don't overlap the regions of RoK you're targeting. Easiest: drag RoK to fill the screen, or move other windows to a different Space.
+
+2. **Code (`--activate-rok` flag, gated):** Before `click_at`, call `NSRunningApplication.activateIgnoringOtherApps()` for the matched window's PID. This raises RoK to topmost across all regions. Conflicts with design A4 ("bot stays invisible") because the activation is visible to the operator (focus changes, app menu bar swaps), so it must be opt-in via flag — not default-on. Flag name draft: `--activate-rok` or `--steal-focus`. Test coverage: integration test that asserts the activation call happens before click_at, and that without the flag activation does NOT happen.
+
+**Why deferred:** v0.1.3 ships the safety primitive (TOCTOU close) which is the load-bearing thing. The ergonomic fix (raise RoK or document the workaround) is a separate concern that needs v0.2's continuous-loop context to design properly — in continuous mode you'd want to raise RoK once at startup, not before every click.
+
+---
+
+## P3: v0.1.3+ — SIGINT during click_at strands mouseDown (no mouseUp posted)
+
+**Source:** `/review` adversarial subagent finding (confidence 6/10, INFORMATIONAL) and Codex adversarial pass (Medium severity).
+**Effort:** human ~10 min / CC ~30 min
+**Depends on:** v0.1.3 landed; the rare path actually being hit (or v0.2 continuous-loop where the exposure is N×).
+
+`click::click_at` posts `LeftMouseDown`, sleeps 80 ms (`CLICK_GAP_MS`), then posts `LeftMouseUp`. If the process receives SIGINT (operator Ctrl-C) or crashes between the two posts, the down event is delivered to RoK but the up event is not. RoK then sees a long-press / drag-start / pressed-button-held condition with no recovery path until another up event arrives from a real human click or another bot run.
+
+**Approach:**
+- Implement a `ClickGuard` struct that holds a fallback "post-up-on-drop" closure. Its `Drop` impl posts `LeftMouseUp` if the normal up post didn't happen. This catches both SIGINT (when std panics into Drop) and panic paths.
+- Or: install a SIGINT handler at boot that posts `LeftMouseUp` for the active source before exiting. Heavier, requires global state.
+- The Drop guard is preferred because it's local to click_at, type-safe, and covers panic + signal in one mechanism. v0.1.3 doesn't enable `panic = "abort"` (Cargo.toml has `panic = "unwind"` for v0.2 Drop guards), so Drop guards run on panic.
+
+**Why deferred:** the exposure window is 80 ms per click. v0.1 single-shot bot fires one click per run; SIGINT in that 80 ms window is a ~80/3000 = 2.6% chance assuming uniform random termination. v0.2 continuous loop turns the exposure cumulative (N clicks × 80 ms), which is when this needs to land.
+
+---
+
+## P3: v0.1.3+ — 80ms thread::sleep gap can drift under scheduler pressure
+
+**Source:** `/review` adversarial subagent finding (confidence 7/10) and Codex adversarial pass (Medium severity).
+**Effort:** human ~10 min / CC ~30 min
+**Depends on:** observation of actual drift in real bot runs (v0.2 continuous loop is when this becomes detectable).
+
+`click::click_at` uses `std::thread::sleep(Duration::from_millis(CLICK_GAP_MS))` (80 ms) between down and up events. Under macOS scheduler pressure (App Nap, OS backgrounding, system load, the process being demoted by the kernel), `thread::sleep` can drift to 200 ms+. RoK's anti-bot heuristics may flag both "too fast" and "too slow" synthetic clicks.
+
+**Approach:**
+- Replace `thread::sleep` with `mach_wait_until` (Darwin-native, deadline-based via `mach_absolute_time + ns_to_ticks`). Sub-millisecond precision; doesn't drift under load. FFI shape is well-documented.
+- Cheaper alternative: keep `thread::sleep` but log a `tracing::warn!` when actual elapsed time exceeds 2× requested (160 ms). Operator-visible diagnostic without changing timing primitive.
+
+**Why deferred:** the spike's verification at 80 ms succeeded against live RoK (3.05M / 5.51M byte diffs in two runs). RoK's anti-bot detection didn't flag the synthetic clicks under spike conditions. This becomes worth fixing when (a) drift is observed in real runs, or (b) v0.2 continuous loop creates enough click volume that even rare drift events accumulate into detectable signal.
