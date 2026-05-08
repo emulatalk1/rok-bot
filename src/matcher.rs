@@ -42,16 +42,29 @@
 use std::path::Path;
 use std::time::Instant;
 
-use image::GrayImage;
+use image::{GrayImage, ImageReader, Limits};
 use imageproc::template_matching::{MatchTemplateMethod, match_template_parallel};
 
 use crate::error::{BotError, Result};
 
-/// Confidence floor for accepting a best-match. Empirical — NCC scores are in
-/// `[-1, 1]`, with `1.0` for an exact match, `0` for uncorrelated, `-1` for
-/// inverted contrast. `0.85` is forgiving enough for minor render variation
-/// (anti-alias jitter, sub-pixel layout drift) but tight enough that random
-/// correlation against a non-matching capture stays well below it.
+/// Maximum haystack dimension (in pixels) accepted by `find_target`. Decoder-
+/// enforced via `image::Limits`, so a malformed PNG with an oversized IHDR
+/// header is rejected before the matcher allocates anything.
+///
+/// `8192` covers reasonable Retina + 6K-external-monitor captures (RoK at
+/// our standard configuration is `2102×1640`, the largest external displays
+/// max out around `6016×3384`). Anything larger is either operator error
+/// (wrong source path) or a decompression bomb.
+const MAX_HAYSTACK_DIM: u32 = 8192;
+
+/// Confidence floor for accepting a best-match. Empirical. See module docs
+/// for why scores are in `[0, 1]` (not the textbook `[-1, 1]`) — imageproc's
+/// `CrossCorrelationNormalized` is not mean-centered, so for non-negative
+/// grayscale pixels the formula is bounded `[0, 1]` with `1.0` at exact
+/// match. `0.85` is forgiving enough for minor render variation (anti-alias
+/// jitter, sub-pixel layout drift) but tight enough to reject the typical
+/// `0.7-0.9` correlation seen between unrelated structured needles and
+/// random captures.
 ///
 /// Tuning: revisit after v0.1.3+ produces a stream of real-world scores.
 /// If false-negatives bite, lower; if false-positives slip in, raise. The
@@ -61,7 +74,10 @@ pub const MATCH_THRESHOLD: f32 = 0.85;
 
 /// Compile-time-embedded target needle. Lives under `assets/targets/` for PR
 /// visibility but doesn't get read from disk at runtime — embedding side-steps
-/// "asset missing at runtime" failure modes entirely.
+/// the "asset missing at runtime" failure mode. The bytes can still be a
+/// malformed PNG (cargo build doesn't validate PNG structure), which the
+/// needle-decode arm in `find_target` catches as `ImageLoadFailed`. The
+/// `embedded_needle_decodes` test pins decode-validity at `cargo test` time.
 ///
 /// The committed bytes are a synthetic placeholder until the first live RoK
 /// crop replaces them. Any valid PNG works; the matcher's correctness is
@@ -74,14 +90,61 @@ pub const TARGET_BYTES: &[u8] = include_bytes!("../assets/targets/city-button.pn
 /// 2102×1640 for our current screencapture output). The capture-to-screen
 /// coord conversion lives in v0.1.3 alongside `CGEvent.post`.
 ///
-/// `score` is in `[-1, 1]` (NCC range). Only scores `>= MATCH_THRESHOLD` ever
-/// surface in `Some(Match)` — below-threshold returns `Ok(None)` from the
-/// matcher.
+/// `score` is in `[0, 1]` for non-negative grayscale (see module docs for
+/// why this isn't `[-1, 1]`). Only scores `>= MATCH_THRESHOLD` ever surface
+/// in `Some(Match)` — below-threshold returns `Ok(None)` from the matcher.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Match {
     pub x: u32,
     pub y: u32,
     pub score: f32,
+}
+
+/// Open a haystack PNG with decoder-enforced dimension limits, decode, and
+/// convert to grayscale. Returns `BotError::ImageLoadFailed { which: "haystack" }`
+/// for any failure (open, format-detection, decode, or dimensions exceeding
+/// `MAX_HAYSTACK_DIM`). Each failure step logs the underlying error at warn
+/// level before mapping, mirroring `capture_with_bin`'s `io::Error` handling.
+///
+/// Why pre-decode limits matter: PNG IDAT decompression bombs (huge IHDR-
+/// declared dimensions in a small compressed payload) would otherwise OOM
+/// the process before any matcher logic runs. The `image::Limits` check
+/// fires inside `.decode()` based on the reader's IHDR, so we never
+/// allocate the pixel buffer for an oversized image.
+fn load_haystack(path: &Path) -> Result<GrayImage> {
+    let mut reader = ImageReader::open(path).map_err(|err| {
+        tracing::warn!(
+            target: "rok_bot",
+            path = %path.display(),
+            error = %err,
+            "failed to open haystack image"
+        );
+        BotError::ImageLoadFailed { which: "haystack" }
+    })?;
+    let mut limits = Limits::default();
+    limits.max_image_width = Some(MAX_HAYSTACK_DIM);
+    limits.max_image_height = Some(MAX_HAYSTACK_DIM);
+    reader.limits(limits);
+    let reader = reader.with_guessed_format().map_err(|err| {
+        tracing::warn!(
+            target: "rok_bot",
+            path = %path.display(),
+            error = %err,
+            "failed to detect haystack image format"
+        );
+        BotError::ImageLoadFailed { which: "haystack" }
+    })?;
+    let dynamic = reader.decode().map_err(|err| {
+        tracing::warn!(
+            target: "rok_bot",
+            path = %path.display(),
+            error = %err,
+            max_dim = MAX_HAYSTACK_DIM,
+            "failed to decode haystack (PNG error or dimensions exceeded MAX_HAYSTACK_DIM)"
+        );
+        BotError::ImageLoadFailed { which: "haystack" }
+    })?;
+    Ok(dynamic.to_luma8())
 }
 
 /// Live entry: load the haystack PNG from disk, decode the embedded needle,
@@ -94,25 +157,14 @@ pub struct Match {
 ///   pathological input). The matcher already logged the diagnostic numbers
 ///   at `warn!` before returning. Caller (`main.rs::run`) translates this to
 ///   `BotError::TargetNotFound` (exit 15).
-/// * `Err(...)`    — real failure path: PNG decode/open, oversized needle.
-///   Each maps to a typed `BotError` variant with structured exit code.
+/// * `Err(...)`    — real failure path: haystack open/decode/oversize,
+///   needle decode, or oversized needle. Each maps to a typed `BotError`
+///   variant with structured exit code (16 for image load, 17 for needle
+///   too large vs. haystack).
 pub fn find_target(haystack_path: &Path) -> Result<Option<Match>> {
     let started = Instant::now();
 
-    let haystack = image::open(haystack_path)
-        .map_err(|err| {
-            // Log image::ImageError before mapping so the operator sees the
-            // underlying cause (corrupt PNG / file missing / wrong magic).
-            // Mirrors capture_with_bin's io::Error handling pattern.
-            tracing::warn!(
-                target: "rok_bot",
-                path = %haystack_path.display(),
-                error = %err,
-                "failed to open or decode haystack image"
-            );
-            BotError::ImageLoadFailed { which: "haystack" }
-        })?
-        .to_luma8();
+    let haystack = load_haystack(haystack_path)?;
 
     // Needle decode is technically fallible (include_bytes! embeds bytes but
     // doesn't validate they parse as PNG — the file could be corrupt at
@@ -150,10 +202,13 @@ pub fn find_target(haystack_path: &Path) -> Result<Option<Match>> {
 /// needle holds today.
 ///
 /// Behavior:
-/// * Errors `TargetTooLarge` if `needle.width() >= haystack.width() ||
-///   needle.height() >= haystack.height()`. Guard fires **before**
+/// * Errors `TargetTooLarge` if `needle.width() > haystack.width() ||
+///   needle.height() > haystack.height()`. Guard fires **before**
 ///   `match_template_parallel` because imageproc panics when needle dims
-///   aren't strictly less than haystack dims (per its docstring).
+///   are strictly greater than haystack dims. (Equal dims are accepted
+///   and produce a 1-wide or 1-tall heatmap; that's degenerate but
+///   well-defined — empirically verified against imageproc 0.26.2's
+///   `CrossCorrelationNormalized`.)
 /// * Walks the resulting heatmap once, skipping NaN scores (zero-variance
 ///   inputs can produce NaN in normalized cross-correlation). For tied
 ///   maxima, the lexicographically-smallest position wins (first encountered
@@ -161,7 +216,7 @@ pub fn find_target(haystack_path: &Path) -> Result<Option<Match>> {
 /// * Returns `Ok(None)` when the best score is below `MATCH_THRESHOLD` (or
 ///   when every score is NaN). Logs `warn!` with the diagnostic numbers.
 fn match_in(haystack: &GrayImage, needle: &GrayImage) -> Result<Option<Match>> {
-    if needle.width() >= haystack.width() || needle.height() >= haystack.height() {
+    if needle.width() > haystack.width() || needle.height() > haystack.height() {
         return Err(BotError::TargetTooLarge {
             needle: (needle.width(), needle.height()),
             haystack: (haystack.width(), haystack.height()),
@@ -210,12 +265,19 @@ fn match_in(haystack: &GrayImage, needle: &GrayImage) -> Result<Option<Match>> {
     }
 
     let Some((x, y, score)) = best else {
-        // Pathological case — every heatmap pixel is NaN. Treat as no match
-        // and surface the diagnostic so the operator can spot uniform-input
-        // bugs without staring at a "TargetNotFound" with no context.
+        // Defense-in-depth: every heatmap pixel is NaN. With imageproc 0.26.2's
+        // `CrossCorrelationNormalized` this is unreachable in practice — the
+        // formula `sum(i*t)/sqrt(sum(i²)*sum(t²))` yields finite values for
+        // all non-negative grayscale, and the upstream `score / norm` path
+        // returns the unnormalized `score` when `norm == 0` rather than NaN.
+        // The zero-variance-needle guard above further short-circuits the
+        // most obvious NaN-producing input. Branch retained because (1) it
+        // costs nothing at runtime and (2) we'd rather log "all NaN" than
+        // surface garbage if a future imageproc release changes its
+        // zero-norm semantics.
         tracing::warn!(
             target: "rok_bot",
-            "match heatmap was entirely NaN — uniform-variance input likely (target or capture is a flat color)"
+            "match heatmap was entirely NaN — defense-in-depth path; check imageproc version semantics if this fires"
         );
         return Ok(None);
     };
@@ -245,7 +307,13 @@ mod tests {
     /// without a third-party dep. The output isn't statistically random,
     /// just non-uniform enough that NCC against an unrelated needle scores
     /// well below 0.85.
+    ///
+    /// xorshift32 has a degenerate state at `seed == 0` (stays 0 forever,
+    /// producing a uniform-zero "noise" image which would surprisingly
+    /// trigger the matcher's variance guard). The `debug_assert` catches
+    /// accidental zero seeds in test code.
     fn xorshift_byte(seed: &mut u32) -> u8 {
+        debug_assert!(*seed != 0, "xorshift32 has a degenerate state at seed=0");
         let mut x = *seed;
         x ^= x << 13;
         x ^= x >> 17;
@@ -376,23 +444,44 @@ mod tests {
     }
 
     #[test]
-    fn match_in_returns_target_too_large_when_needle_equals_haystack() {
-        // imageproc panics when needle dims aren't strictly less than haystack
-        // dims (per its public docstring). Equal-size triggers the same panic
-        // path on most methods, so our guard rejects equal-size to convert
-        // that into a typed exit instead of an in-process panic.
-        let haystack = noise_image(20, 20, 1);
-        let needle = noise_image(20, 20, 2);
-        match match_in(&haystack, &needle) {
-            Err(BotError::TargetTooLarge {
-                needle: n,
-                haystack: h,
-            }) => {
-                assert_eq!(n, (20, 20));
-                assert_eq!(h, (20, 20));
-            }
-            other => panic!("expected TargetTooLarge, got {other:?}"),
-        }
+    fn match_in_handles_equal_size_needle_haystack() {
+        // Empirical finding from /review investigation: imageproc 0.26.2's
+        // CrossCorrelationNormalized DOES NOT panic at equal dims (despite
+        // its docstring). It returns a 1×1 heatmap. So our guard at
+        // match_in is `>` not `>=`, and equal-size flows through to a
+        // valid (degenerate) match.
+        //
+        // Two unrelated noise patterns at the same dims won't clear
+        // MATCH_THRESHOLD (correlation lands well below 0.85 by chance).
+        // Pin the no-error contract here; the identity-match case
+        // (`match_in_handles_equal_size_self_match`) covers the
+        // non-degenerate score path.
+        let haystack = noise_image(20, 20, 0xAAAA_BBBB);
+        let needle = noise_image(20, 20, 0xCCCC_DDDD);
+        let outcome = match_in(&haystack, &needle)
+            .expect("size guard must NOT fire on equal-size — imageproc handles it");
+        assert!(
+            outcome.is_none(),
+            "two unrelated noise patterns shouldn't clear threshold; got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn match_in_handles_equal_size_self_match() {
+        // Identity case at equal dims: same pattern on both sides. NCC
+        // produces 1.0 at the only position (0, 0). This pins that the
+        // `>=` → `>` guard change doesn't accidentally break the legitimate
+        // (if degenerate) identity-match path.
+        let img = noise_image(20, 20, 0xEEEE_FFFF);
+        let outcome = match_in(&img, &img)
+            .expect("size guard must not fire")
+            .expect("identity match should clear threshold");
+        assert_eq!((outcome.x, outcome.y), (0, 0));
+        assert!(
+            outcome.score > 0.99,
+            "identity NCC should be ~1.0, got {}",
+            outcome.score
+        );
     }
 
     #[test]
@@ -515,8 +604,12 @@ mod tests {
 
     #[test]
     fn find_target_returns_image_load_failed_when_haystack_corrupt() {
-        // Garbage bytes at a .png path. image::open inspects magic bytes and
-        // fails before any allocation work, which keeps this test cheap.
+        // Garbage bytes at a .png path. image::ImageReader inspects magic
+        // bytes during with_guessed_format() and fails before allocating
+        // pixel buffers, which keeps this test cheap. The wrapper variant
+        // pin (`which == "haystack"`) is the only invariant the matcher
+        // promises here — the underlying `image::ImageError` class is an
+        // implementation detail of the upstream crate.
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("corrupt.png");
         std::fs::write(&path, b"not a real PNG, just garbage").expect("seed corrupt file");
@@ -526,5 +619,62 @@ mod tests {
             }
             other => panic!("expected ImageLoadFailed on garbage bytes, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn find_target_returns_none_when_no_match() {
+        // Operationally the most common path: capture is fine, target isn't
+        // visible. find_target returns Ok(None); main.rs translates to exit
+        // 15. This exercises the full file-IO + RGBA→Luma + NCC + threshold
+        // pipeline for the no-match case (the unit `match_in` test below
+        // covers the pure-fn path; this pins the wrapper).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("no-match.png");
+        // Plain noise haystack — nothing planted from the embedded needle.
+        let haystack = noise_image(320, 200, 0xABCD_1234);
+        write_luma_as_rgba_png(&haystack, &path);
+        let outcome = find_target(&path).expect("haystack must decode");
+        assert!(
+            outcome.is_none(),
+            "noise haystack should not match the structured embedded needle; got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn find_target_returns_target_too_large_for_tiny_haystack() {
+        // Haystack smaller than the embedded needle in both dimensions.
+        // Pins propagation of TargetTooLarge through the file-IO entry
+        // point (the unit-level `match_in` tests cover the guard against
+        // direct GrayImage inputs).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("tiny.png");
+        let tiny = noise_image(40, 20, 0x4242_2424);
+        write_luma_as_rgba_png(&tiny, &path);
+        match find_target(&path) {
+            Err(BotError::TargetTooLarge {
+                needle: _,
+                haystack: (hw, hh),
+            }) => {
+                assert_eq!((hw, hh), (40, 20));
+            }
+            other => panic!("expected TargetTooLarge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn embedded_needle_decodes() {
+        // Compile-time validation that `assets/targets/city-button.png` is a
+        // valid PNG. `cargo build` only checks the file exists; this test
+        // catches a malformed commit before it reaches a live run where the
+        // needle-decode arm of find_target would fire (exit 16 with which:
+        // "needle"). Cheap insurance against an asset PR landing broken.
+        let needle = image::load_from_memory(TARGET_BYTES)
+            .expect("embedded TARGET_BYTES must decode as a valid image");
+        assert!(
+            needle.width() > 0 && needle.height() > 0,
+            "embedded needle has zero dimensions: {}x{}",
+            needle.width(),
+            needle.height()
+        );
     }
 }

@@ -48,14 +48,17 @@ pub enum BotError {
     #[error("failed to load {which} image — see prior warn log for the underlying error")]
     ImageLoadFailed { which: &'static str },
 
-    /// Needle dimensions are not strictly less than haystack dimensions.
+    /// Needle is strictly larger than haystack in at least one dimension.
     /// `imageproc::template_matching::match_template_parallel` panics when
-    /// `template.{w,h} >= image.{w,h}`; this guard converts that panic into
-    /// a typed exit. `>=`, not `>` — equal-size also panics per imageproc's
-    /// docstring. Tuple order: `(width, height)`.
+    /// `template.{w,h} > image.{w,h}`; this guard converts that panic into a
+    /// typed exit. Equal dims are accepted (verified empirically against
+    /// imageproc 0.26.2's `CrossCorrelationNormalized` — they produce a
+    /// degenerate 1-wide or 1-tall heatmap rather than panicking, contrary
+    /// to imageproc's docstring claim of "strictly less than"). Tuple
+    /// order: `(width, height)`.
     #[error(
-        "target image is too large: needle {}x{} >= haystack {}x{} \
-         (needle dims must be strictly smaller)",
+        "target image is too large: needle {}x{} larger than haystack {}x{} \
+         in at least one dimension (needle dims must be <= haystack dims)",
         needle.0, needle.1, haystack.0, haystack.1
     )]
     TargetTooLarge {
@@ -139,6 +142,14 @@ mod tests {
         assert_eq!(BotError::TargetNotFound.exit_code(), 15);
         assert_eq!(
             BotError::ImageLoadFailed { which: "haystack" }.exit_code(),
+            16
+        );
+        // The `which: "needle"` tag is also a documented contract path
+        // (matcher.rs's defensive arm for malformed embedded asset). Pin it
+        // to 16 explicitly so a future PartialEq-on-which derive change
+        // can't silently break the contract.
+        assert_eq!(
+            BotError::ImageLoadFailed { which: "needle" }.exit_code(),
             16
         );
         assert_eq!(
