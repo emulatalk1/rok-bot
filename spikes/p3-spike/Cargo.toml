@@ -1,0 +1,19 @@
+[package]
+name = "p3-spike"
+version = "0.0.1"
+edition = "2024"
+publish = false
+description = "v0.1.3 Phase 0 spike — verify Rust core-graphics CGEvent + CGEventPost path against RoK"
+
+# Detach from the parent rok-bot Cargo project. The spike is a standalone,
+# throwaway binary with its own Cargo.lock and dep tree — it does not
+# contribute to the main crate's build, tests, or clippy run.
+[workspace]
+
+[dependencies]
+core-graphics   = "0.25"
+core-foundation = "0.10"
+
+[[bin]]
+name = "p3-spike"
+path = "src/main.rs"

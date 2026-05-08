@@ -10,6 +10,7 @@
 
 # Rust
 /target
+spikes/*/target
 **/*.rs.bk
 # Cargo.lock IS committed (binary crate — reproducible builds)
 
