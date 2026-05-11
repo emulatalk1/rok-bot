@@ -33,11 +33,11 @@
 //! is why `match_in` rejects zero-variance needles before invoking imageproc.
 //!
 //! Asset: the needle is `include_bytes!`-embedded at compile time from
-//! `assets/targets/city-button.png`. The committed asset is a placeholder
-//! pattern until the first live RoK crop replaces it; all the matcher logic
-//! and tests remain valid regardless of which bytes are embedded, since the
-//! tests use synthetic in-memory fixtures and the round-trip integration
-//! test plants the embedded bytes back into a generated haystack.
+//! `assets/targets/city-button.png`. As of v0.1.5 the committed bytes are a
+//! 180×180 crop of the bottom-left castle medallion (city ↔ world toggle).
+//! A `needle_has_placeholder_sentinel` safety brake remains in `find_target`
+//! as defense-in-depth against accidental re-introduction of the v0.1.4-era
+//! synthetic placeholder pattern.
 
 use std::path::Path;
 use std::time::Instant;
@@ -95,14 +95,13 @@ pub const MATCH_THRESHOLD: f32 = 0.85;
 /// needle-decode arm in `find_target` catches as `ImageLoadFailed`. The
 /// `embedded_needle_decodes` test pins decode-validity at `cargo test` time.
 ///
-/// The committed bytes are a synthetic placeholder until the first live RoK
-/// crop replaces them. The placeholder embeds an explicit sentinel pattern
-/// (see `PLACEHOLDER_SENTINEL_LUMA`) so `find_target` can refuse to match
-/// it; without that gate, the matcher's NCC quirk (non-mean-centered
-/// correlation, see module docs) would let the placeholder false-match
-/// against real RoK pixels at score 0.9+, which /qa caught in live smoke
-/// 2026-05-11. When a real RoK crop replaces the placeholder, the sentinel
-/// is gone and the matcher runs normally.
+/// As of v0.1.5 the committed bytes are a 180×180 crop of the bottom-left
+/// castle medallion (city ↔ world toggle). v0.1.4 shipped with a synthetic
+/// placeholder carrying `PLACEHOLDER_SENTINEL_LUMA` so `find_target` could
+/// refuse false-matches via the safety brake; with the real crop, the
+/// sentinel is absent and the brake is dormant defense-in-depth against
+/// accidental re-introduction of the placeholder (see /qa live-smoke
+/// 2026-05-11 for the original false-match incident).
 pub const TARGET_BYTES: &[u8] = include_bytes!("../assets/targets/city-button.png");
 
 /// Sentinel pattern in the placeholder needle's top-left 4 pixels (Luma8).
@@ -259,14 +258,13 @@ pub fn find_target(haystack_path: &Path) -> Result<Option<Match>> {
         })?
         .to_luma8();
 
-    // Placeholder sentinel gate. Refuse to NCC-match against the synthetic
-    // safety-brake needle even though it would otherwise produce a numerical
-    // best-match (the matcher's non-mean-centered NCC scores low-entropy
-    // needles at 0.9+ against arbitrary haystacks). /qa caught this in live
-    // smoke 2026-05-11; without this gate, the bot was 5ms from posting a
-    // synthetic click at a false-match coordinate inside real RoK pixels.
-    // Once a real RoK crop replaces the placeholder, the sentinel is gone
-    // and this branch becomes dead code.
+    // Placeholder sentinel gate. v0.1.5 re-cropped the needle to a real RoK
+    // button, so this branch is dormant defense-in-depth: it fires only if
+    // someone accidentally reintroduces the v0.1.4-era synthetic placeholder
+    // (which carries the sentinel pattern by construction). Without this
+    // gate, the matcher's non-mean-centered NCC scores low-entropy needles
+    // at 0.9+ against arbitrary haystacks — /qa caught a false-match 5ms
+    // from posting a synthetic click in live smoke 2026-05-11.
     if needle_has_placeholder_sentinel(&needle) {
         tracing::warn!(
             target: "rok_bot",
@@ -821,34 +819,42 @@ mod tests {
     }
 
     #[test]
-    fn find_target_refuses_planted_sentinel_even_when_planted_in_haystack() {
-        // Pre-/qa-fix this test was the integration-level happy path:
-        // plant the embedded needle bytes into a noise haystack, expect
-        // find_target to locate them at score ~1.0. After /qa caught the
-        // placeholder false-match (2026-05-11), find_target now refuses
-        // to match the sentinel-bearing placeholder before NCC runs.
-        // Test reframed: assert the sentinel gate fires even when the
-        // placeholder is visually present in the haystack — the gate is
-        // STRUCTURAL (detects placeholder by content), not score-based.
+    fn find_target_round_trip_with_real_haystack() {
+        // Integration happy path: plant the real embedded needle into a noise
+        // haystack at a known position, write the haystack as RGBA PNG, then
+        // call find_target on the file. Asserts the full pipeline (file IO +
+        // decode + Luma + NCC + threshold + Match construction) lands at the
+        // planted coords with a near-1.0 score.
         //
-        // When `assets/targets/city-button.png` is replaced with a real
-        // RoK crop, the sentinel is gone; this test will then need
-        // updating to assert the planted-needle path produces a real
-        // match again. The `embedded_placeholder_carries_sentinel` test
-        // will catch that transition first.
+        // Pre-v0.1.4 this test was the same shape but blocked by the
+        // sentinel-placeholder safety brake (find_target refused to match
+        // any needle carrying the placeholder pattern). With the v0.1.5
+        // re-crop of `assets/targets/city-button.png` to a real RoK button,
+        // the sentinel pattern is gone and find_target produces a real match.
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("haystack.png");
 
         let needle = embedded_needle_luma();
-        let mut haystack = noise_image(320, 200, 0xF00D);
+        // Haystack must be larger than the needle in both dimensions plus the
+        // plant offset. v0.1.5 needle is 180x180 logical; pick 400x320 to
+        // leave ~100 px of background context on the right/bottom for NCC's
+        // sliding window to confirm uniqueness of the planted position.
+        let mut haystack = noise_image(400, 320, 0xF00D);
         plant_needle_at(&mut haystack, &needle, 100, 60);
         write_luma_as_rgba_png(&haystack, &path);
 
-        let outcome = find_target(&path).expect("size guard / decode");
+        let outcome = find_target(&path)
+            .expect("find_target should succeed: needle fits, decode is valid")
+            .expect("planted needle at exact pixels must clear MATCH_THRESHOLD");
+        assert_eq!(
+            (outcome.x, outcome.y),
+            (100, 60),
+            "planted location must win NCC tie-break (highest score is exact-match)"
+        );
         assert!(
-            outcome.is_none(),
-            "find_target must refuse the sentinel placeholder even when planted \
-             in haystack (sentinel gate is structural, not score-based); got {outcome:?}"
+            outcome.score >= MATCH_THRESHOLD,
+            "planted needle should score >= MATCH_THRESHOLD = {MATCH_THRESHOLD}; got {}",
+            outcome.score
         );
     }
 
@@ -905,33 +911,38 @@ mod tests {
     }
 
     #[test]
-    fn find_target_sentinel_gate_fires_before_target_too_large_check() {
-        // Pre-/qa-fix this test pinned TargetTooLarge propagation through
-        // find_target's file-IO entry point. After /qa added the sentinel
-        // gate (2026-05-11), the placeholder needle is intercepted BEFORE
-        // match_in runs, so TargetTooLarge can't fire while the placeholder
-        // is committed. Test reframed: assert the sentinel gate's ordering
-        // — when given a haystack smaller than the placeholder needle, we
-        // see Ok(None) from the sentinel gate, NOT Err(TargetTooLarge)
-        // from match_in's size guard. Pinning the ordering matters because
-        // if a future refactor moved the size guard before the sentinel
-        // check, the gate's safety claim would break (a tiny-haystack
-        // run with the placeholder would surface TargetTooLarge instead
-        // of the operator-meaningful "placeholder in use" warn).
+    fn find_target_returns_target_too_large_for_tiny_haystack() {
+        // Integration pin for the size-guard at find_target's file-IO entry
+        // point. When the haystack is smaller than the embedded needle in
+        // either dimension, match_in's size guard fires and propagates
+        // BotError::TargetTooLarge through find_target (exit 17). The
+        // pure-fn equivalent is `match_in_returns_target_too_large_when
+        // _needle_oversized`; this test pins the same path through the
+        // file-IO wrapper.
         //
-        // The size-guard itself is exercised at the pure-fn level by
-        // `match_in_returns_target_too_large_when_needle_oversized` and at
-        // file-IO level once the placeholder is replaced with a real RoK
-        // crop (this test will need updating then).
+        // Pre-v0.1.5 (sentinel placeholder era) this test couldn't fire
+        // because the sentinel gate intercepted the placeholder before
+        // match_in's size guard ran. With the real RoK crop, the sentinel
+        // gate is a no-op and the size guard becomes the operative check.
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("tiny.png");
+        // 40x20 << 180x180 needle. Any haystack smaller than the needle in
+        // either dimension trips the size guard.
         let tiny = noise_image(40, 20, 0x4242_2424);
         write_luma_as_rgba_png(&tiny, &path);
-        let outcome = find_target(&path).expect("haystack decodes fine");
-        assert!(
-            outcome.is_none(),
-            "sentinel gate must fire before TargetTooLarge check; got {outcome:?}"
-        );
+        match find_target(&path) {
+            Err(BotError::TargetTooLarge { needle, haystack }) => {
+                assert_eq!(haystack, (40, 20));
+                assert!(
+                    needle.0 > haystack.0 || needle.1 > haystack.1,
+                    "TargetTooLarge needle dims must exceed haystack in at least one axis; \
+                     got needle={needle:?} haystack={haystack:?}"
+                );
+            }
+            other => panic!(
+                "expected TargetTooLarge on 40x20 haystack vs embedded needle, got {other:?}"
+            ),
+        }
     }
 
     // ---------- validate_match_dims (v0.1.3) ----------
@@ -1217,38 +1228,23 @@ mod tests {
     }
 
     #[test]
-    fn embedded_placeholder_carries_sentinel() {
-        // The committed placeholder MUST carry the sentinel. If this fails,
-        // either: (a) the placeholder was replaced with a real RoK crop —
-        // delete this test, or (b) the placeholder was regenerated without
-        // the sentinel — regenerate it again with the sentinel in place.
+    fn embedded_needle_carries_no_sentinel() {
+        // Inverse of the deleted `embedded_placeholder_carries_sentinel`
+        // test. The v0.1.5 re-crop replaced the placeholder with a real
+        // RoK button crop; the sentinel pattern must NOT be present, or
+        // the safety brake in find_target would block all matches.
+        // Guards against accidental re-introduction of the sentinel
+        // pattern (e.g., if someone regenerates the asset using the
+        // placeholder script by mistake).
         let needle = image::load_from_memory(TARGET_BYTES)
             .expect("embedded needle must decode")
             .to_luma8();
         assert!(
-            needle_has_placeholder_sentinel(&needle),
-            "committed placeholder must carry the sentinel pattern \
-             [255, 0, 255, 0] in top-left luma. /qa relies on this for the \
-             safety-brake gate in find_target."
-        );
-    }
-
-    #[test]
-    fn find_target_returns_none_for_sentinel_needle() {
-        // Integration test: with the placeholder in place, find_target
-        // must return Ok(None) — exit 15 TargetNotFound on the boundary —
-        // even against a haystack that would otherwise produce a high NCC
-        // score. We use a noise haystack here; the contract is that the
-        // sentinel gate fires BEFORE match_in runs, so haystack content
-        // doesn't matter.
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("haystack.png");
-        let haystack = noise_image(320, 200, 0xABCD_1234);
-        write_luma_as_rgba_png(&haystack, &path);
-        let outcome = find_target(&path).expect("haystack must decode");
-        assert!(
-            outcome.is_none(),
-            "find_target must refuse to match the sentinel placeholder; got {outcome:?}"
+            !needle_has_placeholder_sentinel(&needle),
+            "committed needle must NOT carry the placeholder sentinel \
+             pattern [255, 0, 255, 0]. If this fires, the asset was \
+             accidentally regenerated with the placeholder script — \
+             restore the real RoK crop."
         );
     }
 
