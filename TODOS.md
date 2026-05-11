@@ -278,21 +278,14 @@ Future RoK automation (map panning, troop movement, context menus, multi-action 
 
 ---
 
-## P2: v0.1.3+ — Mode 1 terminal/IDE occlusion blocks click (observed during smoke test 2026-05-08)
+## ✅ DONE — v0.1.3+ Mode 1 terminal/IDE occlusion blocks click (resolved by v0.1.5 AX switch)
 
-**Source:** v0.1.3 smoke test post-commit. The TOCTOU re-validation (`window.rs::validate_at_click_site`) correctly refused to click 4/4 runs because iTerm2's window frame contained the click point on the user's primary display, even when the operator believed they had moved/hidden it.
-**Effort:** human ~5 min docs / CC ~30 min for `--activate-rok` flag implementation
-**Depends on:** v0.1.3 landed; first real bot deployment where the operator hits the issue.
+**Source:** v0.1.3 smoke test post-commit. `validate_at_click_site` refused to click 4/4 runs because iTerm2's window frame contained the click point.
+**Resolved by:** v0.1.5 commits 611bc8a (AX press) + e4b0f68 (drop topmost walk).
 
-v0.1 Mode 1 means RoK is on the primary display, where the operator is actively working. Their terminal, IDE, browser, and other windows naturally overlap RoK's UI. When the bot's matched needle resolves to a screen point that's inside any non-RoK window's frame, `validate_at_click_site` returns `WindowChanged{not_topmost_at_click}` exit 19. The defense is correct (without it, a privileged synthetic click would land on the wrong window), but it makes the bot impractical for normal multi-window operator workflows.
+p5-spike empirically proved AX press delivers to Catalyst Bridge apps (RoK) even when another window is z-order topmost at the click point — see `learnings/ax-press-works-catalyst`. The v0.1.3 `REASON_NOT_TOPMOST` exit existed to protect against a privileged HID-tap click landing on the wrong window; with AX press scoped to the target PID's accessibility tree, z-order overlap is no longer load-bearing for safety. v0.1.5 deletes the topmost walk from `validate_inner` and adds the explicit `point_outside_frame` bounds check to preserve the accidental bounds invariant.
 
-**Two complementary fixes:**
-
-1. **Docs (cheap, immediate):** Add a "Mode 1 operating notes" section to `docs/setup.md` explaining: the bot will refuse to click whenever any non-RoK window covers the matched UI element's screen position. Position your terminal/IDE/etc. so they don't overlap the regions of RoK you're targeting. Easiest: drag RoK to fill the screen, or move other windows to a different Space.
-
-2. **Code (`--activate-rok` flag, gated):** Before `click_at`, call `NSRunningApplication.activateIgnoringOtherApps()` for the matched window's PID. This raises RoK to topmost across all regions. Conflicts with design A4 ("bot stays invisible") because the activation is visible to the operator (focus changes, app menu bar swaps), so it must be opt-in via flag — not default-on. Flag name draft: `--activate-rok` or `--steal-focus`. Test coverage: integration test that asserts the activation call happens before click_at, and that without the flag activation does NOT happen.
-
-**Why deferred:** v0.1.3 ships the safety primitive (TOCTOU close) which is the load-bearing thing. The ergonomic fix (raise RoK or document the workaround) is a separate concern that needs v0.2's continuous-loop context to design properly — in continuous mode you'd want to raise RoK once at startup, not before every click.
+The `--activate-rok` flag and "Mode 1 operating notes" docs paragraph are no longer needed — overlapping terminals/IDEs are now a non-issue for Mode 1.
 
 ---
 
@@ -402,3 +395,54 @@ v0.1.4 saves `rok-capture-pre.png` + `rok-capture-post.png` at project root; ope
 - Test: add an integration test that writes synthetic pre+post fixtures with known diff regions, asserts the diff image contains the expected highlight pattern.
 
 **Why deferred:** YAGNI for v0.1.4 hello-world. Operator can still manually diff pre+post in Preview. Build when first real failure pattern observed and the manual-diff workflow proves friction.
+
+---
+
+## P2: v0.2 prerequisite — verify AX press tolerates negative-origin CG coords
+
+**Source:** v0.1.5 ship checkpoint. The v0.1.5 unit tests prove `validate_inner` handles negative-origin CG coords (BetterDisplay virtual displays land at `x = -1051` per P3 spike); the AX press path was only smoke-tested on positive coords during p5-spike (RoK on the built-in display).
+**Effort:** human ~10 min / CC ~5 min spike rebuild
+**Depends on:** v0.1.5 landed; BetterDisplay virtual display attached and RoK migrated to it (v0.2 setup work — currently exits 12).
+
+`AXUIElementCopyElementAtPosition` takes `float x, float y` and the AX framework's coordinate system is documented as "top-left relative screen coordinates." Whether that means *global* CG screen space (which spans negative coords across virtual displays) or *the displayed Space's own origin-anchored coords* is not explicit in Apple's docs. p5-spike validated positive coords on the built-in display only. Before v0.2 enables Mode 2, smoke-test:
+
+1. Attach a BetterDisplay virtual display in `System Settings → Displays`.
+2. Drag RoK to the virtual display.
+3. Run `cargo run --release -- spike-mode-2-stub` (or hand-call `ax::press_at` from a tiny binary with the virtual-display window coords). Expected: press lands.
+4. If it doesn't land: AX coord space is per-Space, and v0.2 needs to translate global CG → Space-local before passing to AX.
+
+**Why deferred:** v0.1.5 explicitly fails at `Mode::Virtual` with exit 12. Until v0.2 is in progress, the negative-coord scenario can't actually reach the AX path. Spike now would be hypothetical; spike during v0.2 is real-cost-vs-real-value.
+
+---
+
+## P2: v0.2 blocker — 23-second NCC match latency on Retina 2102×1640 captures
+
+**Source:** /plan-eng-review for v0.1.5 (2026-05-11). Observed during v0.1.4 smoke test: `imageproc::match_template_parallel` with `CrossCorrelationNormalized` takes ~23s wall on M-series for the standard Retina haystack against the 56,900-byte city-button needle.
+**Effort:** human ~1 hour audit / CC ~4-6 hours for FFT-NCC swap
+**Depends on:** v0.2 continuous-loop scope (P2: FFT-based NCC for continuous-loop matching, line ~146) — same root cause.
+
+v0.1 single-shot tolerates 23s per run (operator waits, sees verify success/failure). v0.2 continuous loop fires every few seconds; 23s per match is fatal — the bot spends 90%+ of wall time inside the matcher, can't catch UI state changes that resolve faster than the match window, and CPU pegs at ~80% sustained.
+
+**Approach:**
+- Empirical first: profile the current match to confirm 23s is NCC, not capture/decode. `cargo flamegraph --release -- <args>` against a known-input run.
+- Then either: (a) shrink the haystack region (only NCC against the expected bottom-right corner where city-button lives — see P3 "v0.1.3+ multi-match disambiguation" for related cropping work), OR (b) switch to FFT-based NCC (`opencv-rust` cv::matchTemplate with TM_CCOEFF_NORMED via FFT; heavy dep but production-proven), OR (c) custom SIMD path via `wide` / `pulp`.
+- Pick after profiling tells us where the time goes.
+
+**Why deferred:** v0.1.5 ships single-shot; 23s is annoying but tolerable. The fix work overlaps significantly with v0.2's continuous-loop matcher rewrite, and doing it twice would be wasted motion.
+
+---
+
+## P3: v0.1.5+ — AX messaging timeout calibration
+
+**Source:** v0.1.5 C4 implementation (`src/ax.rs::AX_MESSAGING_TIMEOUT_SECONDS = 2.0`). The 2.0s value came from /plan-eng-review codex outside-voice recommendation, not empirical RoK measurement.
+**Effort:** human ~10 min / CC ~10 min
+**Depends on:** v0.1.5 landed; ≥20 real runs where the operator observed AX response latency under variable RoK state (idle, mid-animation, mid-loading-screen, server-bound action).
+
+Too tight: a busy-but-not-hung RoK (mid-loading-screen, server-bound click) would false-fail with `ax_timeout` exit 18 even though the press would have eventually succeeded. Too loose: a truly hung target wedges the bot for the full timeout window per click. 2.0s is a conservative initial guess covering "RoK is responsive" without making "RoK is wedged" too patient.
+
+**Approach:**
+- v0.1.5's tracing logs already emit AX call timings (the per-step `AXUIElementCopyElementAtPosition failed` / `...PerformAction failed` warn lines, plus the `AX press dispatched` info on success). Add explicit start/end timestamps if needed.
+- Collect ~20 runs across scenarios. Compute p50/p95/p99 of (a) successful press call duration, (b) any `ax_timeout` failure duration.
+- Set `AX_MESSAGING_TIMEOUT_SECONDS = max(p99 success, 1.5) + 0.5s slack` rounded to one decimal. Update the in-range pin test (`ax_messaging_timeout_is_in_practical_range`) range if needed.
+
+**Why deferred:** no observed timeouts yet (v0.1.5 only smoke-tested without AX-side latency stress). Calibration without real data would be motion.
