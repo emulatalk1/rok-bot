@@ -231,7 +231,10 @@ pub type Result<T> = std::result::Result<T, BotError>;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::click::{REASON_DOWN, REASON_SOURCE, REASON_UP};
+    use crate::ax::{
+        REASON_AX_APP_RESOLVE_FAILED, REASON_AX_ELEMENT_RESOLVE_FAILED, REASON_AX_PRESS_FAILED,
+        REASON_AX_TIMEOUT,
+    };
     use crate::verify::{REASON_DIM_MISMATCH, REASON_SCREEN_UNCHANGED};
 
     #[test]
@@ -253,7 +256,7 @@ mod tests {
             }
             .exit_code(),
             BotError::ClickFailed {
-                reason: REASON_SOURCE,
+                reason: REASON_AX_PRESS_FAILED,
             }
             .exit_code(),
             BotError::WindowChanged {
@@ -317,27 +320,26 @@ mod tests {
             .exit_code(),
             17
         );
-        // Pin all three documented `reason` values to 18 — reason is a string
+        // Pin all four v0.1.5 AX `reason` values to 18 — reason is a string
         // tag for the operator-facing log, not part of the exit-code contract,
         // but exercising each variant ensures a future PartialEq-on-reason
         // refactor can't accidentally fork the exit code per-reason. Using
-        // the click.rs constants (vs literal strings) keeps the test in sync
-        // with any future rename of the reason tags.
-        assert_eq!(
-            BotError::ClickFailed {
-                reason: REASON_SOURCE
-            }
-            .exit_code(),
-            18
-        );
-        assert_eq!(
-            BotError::ClickFailed {
-                reason: REASON_DOWN
-            }
-            .exit_code(),
-            18
-        );
-        assert_eq!(BotError::ClickFailed { reason: REASON_UP }.exit_code(), 18);
+        // the ax.rs constants (vs literal strings) keeps the test in sync
+        // with any future rename of the reason tags. The v0.1.3-4 Quartz
+        // reasons (REASON_SOURCE/DOWN/UP) were deleted in C4 when click.rs
+        // switched to AX delivery.
+        for reason in [
+            REASON_AX_APP_RESOLVE_FAILED,
+            REASON_AX_ELEMENT_RESOLVE_FAILED,
+            REASON_AX_PRESS_FAILED,
+            REASON_AX_TIMEOUT,
+        ] {
+            assert_eq!(
+                BotError::ClickFailed { reason }.exit_code(),
+                18,
+                "ClickFailed({reason}) must map to exit 18"
+            );
+        }
         // WindowChanged variants share exit 19. Pin all 4 documented
         // v0.1.5 reasons even though reason isn't part of the exit-code
         // contract — same rationale as ClickFailed. The v0.1.3 reason
@@ -498,11 +500,11 @@ mod tests {
         // reached the target window — debugging doesn't need to consider
         // partial-delivery scenarios.
         let err = BotError::ClickFailed {
-            reason: REASON_DOWN,
+            reason: REASON_AX_PRESS_FAILED,
         };
         let msg = err.to_string();
         assert!(
-            msg.contains(REASON_DOWN),
+            msg.contains(REASON_AX_PRESS_FAILED),
             "ClickFailed Display must include the reason tag: {msg}"
         );
         let lower = msg.to_lowercase();

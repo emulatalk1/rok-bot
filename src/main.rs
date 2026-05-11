@@ -28,6 +28,7 @@
 //! for why pixel-diff (not byte-diff) and why the originally-planned
 //! `match_stable` failure path was dropped during /plan-eng-review.
 
+mod ax;
 mod capture;
 mod click;
 mod display;
@@ -170,13 +171,6 @@ fn run() -> Result<()> {
     // matcher::validate_match_dims so each branch is unit-testable.
     validate_match_dims(&m)?;
 
-    // Design A11 hard check: a match exists, so we are about to click. NOW
-    // demand Accessibility — the prompt (if denied) is async, so first-run
-    // UX is "exit 13, grant in Settings, re-run." See permissions.rs docs
-    // for why a blocking prompt is intentionally not implemented.
-    check_accessibility()?;
-    tracing::info!(target: "rok_bot", "Accessibility permission OK (hard check)");
-
     let (sx, sy) = screen_point(&m, &window.frame);
     tracing::info!(
         target: "rok_bot",
@@ -189,20 +183,32 @@ fn run() -> Result<()> {
     );
 
     // TOCTOU close: re-validate the RoK window's state immediately before
-    // posting the click. Three checks, each mapping to a distinct
-    // BotError::WindowChanged reason: WID still exists, frame within
-    // tolerance, RoK is topmost at the click coords. Closes the window
-    // between find_rok_window() (top of run) and click_at() — during
-    // capture (~50-100ms), find_target (could be seconds), and the AX
-    // check, RoK could move, resize, close, lose focus to a system
-    // overlay, or be occluded by a notification banner. Without this
-    // gate, a synthetic AX-privileged click could land on the wrong
-    // window. Both Claude and Codex adversarial reviews flagged this
-    // path as the top exploitable issue in v0.1.3.
+    // committing to a click. v0.1.5 runs FOUR checks, each mapping to a
+    // distinct BotError::WindowChanged reason (exit 19):
+    //   - REASON_WID_GONE        — (WID, PID) no longer in `all` list.
+    //   - REASON_NOT_VISIBLE     — RoK is hidden (Space switched, Dock,
+    //                              fullscreen-from-another-app). AX press
+    //                              would return kAXErrorFailure here.
+    //   - REASON_FRAME_MOVED     — window dragged/resized since discovery.
+    //   - REASON_POINT_OUTSIDE_FRAME — click point outside window bounds.
+    //
+    // Runs BEFORE check_accessibility (codex /plan-eng-review #8) so a
+    // hidden-Space exit-19 doesn't trigger the AX TCC prompt for a click
+    // that would have been refused anyway. The operator sees a clean
+    // error message instead of being asked to grant permission they
+    // don't need to spend.
     validate_at_click_site(&window, CGPoint::new(sx, sy))?;
-    tracing::info!(target: "rok_bot", "click-site re-validation OK; clicking");
+    tracing::info!(target: "rok_bot", "click-site re-validation OK");
 
-    click_at(sx, sy)?;
+    // Design A11 hard check: a match exists AND the window is reachable,
+    // so we are about to click. NOW demand Accessibility — the prompt
+    // (if denied) is async, so first-run UX is "exit 13, grant in
+    // Settings, re-run." See permissions.rs docs for why a blocking
+    // prompt is intentionally not implemented.
+    check_accessibility()?;
+    tracing::info!(target: "rok_bot", "Accessibility permission OK (hard check); clicking");
+
+    click_at(&window, CGPoint::new(sx, sy))?;
 
     // v0.1.4 after-state verify. Sleep long enough to let RoK render the
     // UI response, re-validate the window is still present (subset of
