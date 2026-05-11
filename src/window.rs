@@ -78,43 +78,64 @@ impl Window {
     }
 }
 
-#[derive(Debug, Default, Clone)]
-struct WindowRecord {
-    owner: Option<String>,
+/// One window's id/pid/frame plus optional owner+title strings, parsed
+/// from a single `CGWindowListCopyWindowInfo` dictionary entry. Used as
+/// pure data input by [`select_rok_window`], [`validate_inner`], and
+/// [`validate_present_inner`].
+///
+/// `id`, `pid`, and `frame` are required — `parse_snapshot` returns
+/// `None` if any are missing or invalid in the source dictionary. This
+/// matches the v0.1.4 invariant that downstream validators can rely on
+/// these three fields without re-checking, encoded in the type system.
+///
+/// `owner_name` and `title` are `Option<String>` because RoK auxiliary
+/// windows (splashes, popups) legitimately omit the title, and a few
+/// system windows have no owner-name. `select_rok_window` checks both
+/// before promoting a snapshot to a `Window`. v0.1.5 PID-anchored hidden-
+/// Space checks (C2) also consult `owner_name` for operator-readable
+/// diagnostics.
+#[derive(Debug, Clone)]
+struct WindowSnapshot {
+    id: u32,
+    pid: i32,
+    frame: CGRect,
+    owner_name: Option<String>,
     title: Option<String>,
-    id: Option<u32>,
-    pid: Option<i32>,
-    bounds: Option<CGRect>,
 }
 
-/// Pure: turn a parsed record into a `Window` iff it matches the RoK main
-/// window AND every required field is present. Auxiliary RoK windows
-/// (splash, popups) share `owner` but have no title or a different title
-/// and return `None`.
-fn select_rok_window(record: &WindowRecord) -> Option<Window> {
-    let owner = record.owner.as_deref()?;
-    let title = record.title.as_deref()?;
+/// Pure: turn a parsed snapshot into a `Window` iff it matches the RoK
+/// main window. Auxiliary RoK windows (splash, popups) share `owner_name`
+/// but have no title or a different title and return `None`.
+fn select_rok_window(snap: &WindowSnapshot) -> Option<Window> {
+    let owner = snap.owner_name.as_deref()?;
+    let title = snap.title.as_deref()?;
     if owner != ROK_OWNER || title != ROK_TITLE {
         return None;
     }
     Some(Window {
-        id: record.id?,
-        pid: record.pid?,
-        frame: record.bounds?,
+        id: snap.id,
+        pid: snap.pid,
+        frame: snap.frame,
     })
 }
 
-/// Walk the live `CGWindowListCopyWindowInfo` array and return the first
-/// window matching the RoK main-window predicate AND backed by a process
-/// whose bundle ID starts with `ROK_BUNDLE_PREFIX` (anti-spoof check).
-/// Spoofs are skipped with a `tracing::warn!` so they're visible in logs
-/// without halting the search — the real RoK window may be later in the
-/// list.
-pub fn find_rok_window() -> Result<Window> {
-    let Some(info_list) = copy_window_info(kCGWindowListOptionOnScreenOnly, kCGNullWindowID) else {
-        return Err(BotError::WindowNotFound);
-    };
-
+/// Walk `CGWindowListCopyWindowInfo` with the given option flag and return
+/// a vec of snapshots for every dict that has id+pid+frame. Dicts missing
+/// any of those three fields (rare — invalid/dead windows) are skipped.
+/// Returns `None` if `copy_window_info` itself fails (Screen Recording
+/// TCC revoked mid-session, `WindowServer` crash, etc.); each call site
+/// maps that to its own `BotError` (typically `WindowNotFound` for
+/// discovery or `WindowChanged { REASON_WID_GONE }` for mid-flow re-checks).
+///
+/// Pre-v0.1.5 the dict-walking loop was duplicated across `find_rok_window`,
+/// `validate_at_click_site`, and `validate_window_present`. Centralizing
+/// it here gives the v0.1.5 hidden-Space check a single seam to swap
+/// `kCGWindowListOptionOnScreenOnly` for `kCGWindowListOptionAll` (C2),
+/// and keeps `parse_snapshot` as the only place that touches CG private
+/// CFString constants.
+fn collect_window_snapshots(option: u32) -> Option<Vec<WindowSnapshot>> {
+    let info_list = copy_window_info(option, kCGNullWindowID)?;
+    let mut snapshots: Vec<WindowSnapshot> = Vec::with_capacity(64);
     for entry in info_list.iter() {
         // Each entry is a *const c_void pointing at a CFDictionaryRef.
         let raw_ptr: *const c_void = *entry;
@@ -130,8 +151,25 @@ pub fn find_rok_window() -> Result<Window> {
         let Some(dict) = cf.downcast::<CFDictionary>() else {
             continue;
         };
-        let record = parse_record(&dict);
-        if let Some(window) = select_rok_window(&record) {
+        if let Some(snap) = parse_snapshot(&dict) {
+            snapshots.push(snap);
+        }
+    }
+    Some(snapshots)
+}
+
+/// Walk the live `CGWindowListCopyWindowInfo` array and return the first
+/// window matching the RoK main-window predicate AND backed by a process
+/// whose bundle ID starts with `ROK_BUNDLE_PREFIX` (anti-spoof check).
+/// Spoofs are skipped with a `tracing::warn!` so they're visible in logs
+/// without halting the search — the real RoK window may be later in the
+/// list.
+pub fn find_rok_window() -> Result<Window> {
+    let snapshots = collect_window_snapshots(kCGWindowListOptionOnScreenOnly)
+        .ok_or(BotError::WindowNotFound)?;
+
+    for snap in &snapshots {
+        if let Some(window) = select_rok_window(snap) {
             if bundle_id_for_pid(window.pid)
                 .as_deref()
                 .is_some_and(matches_rok_bundle_id)
@@ -154,17 +192,6 @@ pub fn find_rok_window() -> Result<Window> {
 /// Pure: does this bundle ID belong to a legitimate RoK install?
 fn matches_rok_bundle_id(bundle_id: &str) -> bool {
     bundle_id.starts_with(ROK_BUNDLE_PREFIX)
-}
-
-/// Snapshot of one on-screen window's (id, frame), in z-order from the live
-/// `CGWindowListCopyWindowInfo` call. The on-screen list is already in
-/// front-to-back z-order, so the **first** entry whose `frame` contains the
-/// click point is the topmost window at that point. Used by
-/// [`validate_inner`] as a pure data input.
-#[derive(Debug, Clone, Copy)]
-struct WindowSnapshot {
-    id: u32,
-    frame: CGRect,
 }
 
 /// Pure: enforce the v0.1.3 TOCTOU invariants between window discovery and
@@ -298,31 +325,11 @@ fn validate_present_inner(
 /// variant (no topmost). See `validate_present_inner` docs for why the
 /// topmost invariant doesn't hold post-click.
 pub fn validate_window_present(expected: &Window) -> Result<()> {
-    let Some(info_list) = copy_window_info(kCGWindowListOptionOnScreenOnly, kCGNullWindowID) else {
-        return Err(BotError::WindowChanged {
+    let observed = collect_window_snapshots(kCGWindowListOptionOnScreenOnly).ok_or(
+        BotError::WindowChanged {
             reason: REASON_WID_GONE,
-        });
-    };
-
-    let mut observed: Vec<WindowSnapshot> = Vec::with_capacity(64);
-    for entry in info_list.iter() {
-        let raw_ptr: *const c_void = *entry;
-        if raw_ptr.is_null() {
-            continue;
-        }
-        // SAFETY: same Get-rule lift as `find_rok_window` /
-        // `validate_at_click_site` — each slot is an unretained
-        // CFDictionaryRef; `wrap_under_get_rule` CFRetains.
-        let cf = unsafe { CFType::wrap_under_get_rule(raw_ptr.cast()) };
-        let Some(dict) = cf.downcast::<CFDictionary>() else {
-            continue;
-        };
-        let record = parse_record(&dict);
-        let (Some(id), Some(frame)) = (record.id, record.bounds) else {
-            continue;
-        };
-        observed.push(WindowSnapshot { id, frame });
-    }
+        },
+    )?;
 
     validate_present_inner(
         expected.id,
@@ -360,34 +367,15 @@ fn rect_contains_point(rect: CGRect, p: CGPoint) -> bool {
 /// discovery, but here we keep ALL on-screen windows (any owner) because
 /// the topmost-at-point check needs to see overlays from other apps too.
 pub fn validate_at_click_site(expected: &Window, click_point: CGPoint) -> Result<()> {
-    let Some(info_list) = copy_window_info(kCGWindowListOptionOnScreenOnly, kCGNullWindowID) else {
-        // CGWindowList unavailable mid-run is itself a TOCTOU signal:
-        // something changed about the window-server's state. Treat as
-        // window-gone rather than a generic permission failure — Screen
-        // Recording has already been preflight-checked at boot.
-        return Err(BotError::WindowChanged {
+    // CGWindowList unavailable mid-run is itself a TOCTOU signal:
+    // something changed about the window-server's state. Treat as
+    // window-gone rather than a generic permission failure — Screen
+    // Recording has already been preflight-checked at boot.
+    let observed = collect_window_snapshots(kCGWindowListOptionOnScreenOnly).ok_or(
+        BotError::WindowChanged {
             reason: REASON_WID_GONE,
-        });
-    };
-
-    let mut observed: Vec<WindowSnapshot> = Vec::with_capacity(64);
-    for entry in info_list.iter() {
-        let raw_ptr: *const c_void = *entry;
-        if raw_ptr.is_null() {
-            continue;
-        }
-        // SAFETY: same Get-rule lift as `find_rok_window` — the slot is an
-        // unretained CFDictionaryRef; `wrap_under_get_rule` CFRetains.
-        let cf = unsafe { CFType::wrap_under_get_rule(raw_ptr.cast()) };
-        let Some(dict) = cf.downcast::<CFDictionary>() else {
-            continue;
-        };
-        let record = parse_record(&dict);
-        let (Some(id), Some(frame)) = (record.id, record.bounds) else {
-            continue;
-        };
-        observed.push(WindowSnapshot { id, frame });
-    }
+        },
+    )?;
 
     validate_inner(
         expected.id,
@@ -408,7 +396,13 @@ fn bundle_id_for_pid(pid: i32) -> Option<String> {
     Some(ns_id.to_string())
 }
 
-fn parse_record(dict: &CFDictionary) -> WindowRecord {
+/// Parse one `CGWindowListCopyWindowInfo` dictionary entry into a
+/// `WindowSnapshot`. Returns `None` if any of id/pid/frame is missing or
+/// fails its type/range check — those three fields are required so the
+/// downstream validators can rely on them. `owner_name` and `title` are
+/// optional (some auxiliary RoK windows omit title; rare system windows
+/// omit owner-name).
+fn parse_snapshot(dict: &CFDictionary) -> Option<WindowSnapshot> {
     // SAFETY: reading static CFStringRef constants vended by Core Graphics
     // (Rust 2024 requires `unsafe` for any extern static read).
     let (k_owner, k_title, k_id, k_pid, k_bounds) = unsafe {
@@ -420,17 +414,22 @@ fn parse_record(dict: &CFDictionary) -> WindowRecord {
             kCGWindowBounds.cast::<c_void>(),
         )
     };
-    WindowRecord {
-        owner: dict_get::<CFString>(dict, k_owner).map(|s| s.to_string()),
-        title: dict_get::<CFString>(dict, k_title).map(|s| s.to_string()),
-        id: dict_get::<CFNumber>(dict, k_id)
-            .and_then(|n| n.to_i64())
-            .and_then(|v| u32::try_from(v).ok()),
-        pid: dict_get::<CFNumber>(dict, k_pid)
-            .and_then(|n| n.to_i64())
-            .and_then(|v| i32::try_from(v).ok()),
-        bounds: dict_get::<CFDictionary>(dict, k_bounds).and_then(|d| rect_from_dict(&d)),
-    }
+    let id = dict_get::<CFNumber>(dict, k_id)
+        .and_then(|n| n.to_i64())
+        .and_then(|v| u32::try_from(v).ok())?;
+    let pid = dict_get::<CFNumber>(dict, k_pid)
+        .and_then(|n| n.to_i64())
+        .and_then(|v| i32::try_from(v).ok())?;
+    let frame = dict_get::<CFDictionary>(dict, k_bounds).and_then(|d| rect_from_dict(&d))?;
+    let owner_name = dict_get::<CFString>(dict, k_owner).map(|s| s.to_string());
+    let title = dict_get::<CFString>(dict, k_title).map(|s| s.to_string());
+    Some(WindowSnapshot {
+        id,
+        pid,
+        frame,
+        owner_name,
+        title,
+    })
 }
 
 /// Generic typed lookup against a default-typed CFDictionary.
@@ -506,16 +505,23 @@ mod tests {
         );
     }
 
+    /// Build a `WindowSnapshot` for `select_rok_window` unit tests. Carries
+    /// optional owner+title (most `select_*` tests vary these); id/pid/frame
+    /// are pinned to harmless defaults.
+    fn rok_snap(owner: Option<&str>, title: Option<&str>) -> WindowSnapshot {
+        WindowSnapshot {
+            id: 64793,
+            pid: 21916,
+            frame: rect(-525.0, 502.0, 1280.0, 720.0),
+            owner_name: owner.map(str::to_owned),
+            title: title.map(str::to_owned),
+        }
+    }
+
     #[test]
     fn select_main_window_full_match() {
-        let record = WindowRecord {
-            owner: Some(ROK_OWNER.to_owned()),
-            title: Some(ROK_TITLE.to_owned()),
-            id: Some(64793),
-            pid: Some(21916),
-            bounds: Some(rect(-525.0, 502.0, 1280.0, 720.0)),
-        };
-        let window = select_rok_window(&record).expect("should match");
+        let snap = rok_snap(Some(ROK_OWNER), Some(ROK_TITLE));
+        let window = select_rok_window(&snap).expect("should match");
         assert_eq!(window.id, 64793);
         assert_eq!(window.pid, 21916);
         assert_rect_eq(window.frame, rect(-525.0, 502.0, 1280.0, 720.0));
@@ -523,73 +529,26 @@ mod tests {
 
     #[test]
     fn select_skips_aux_window_with_no_title() {
-        let record = WindowRecord {
-            owner: Some(ROK_OWNER.to_owned()),
-            title: None,
-            id: Some(42),
-            pid: Some(21916),
-            bounds: Some(rect(0.0, 0.0, 100.0, 100.0)),
-        };
-        assert!(select_rok_window(&record).is_none());
+        let snap = rok_snap(Some(ROK_OWNER), None);
+        assert!(select_rok_window(&snap).is_none());
     }
 
     #[test]
     fn select_skips_aux_window_with_different_title() {
-        let record = WindowRecord {
-            owner: Some(ROK_OWNER.to_owned()),
-            title: Some("Splash".to_owned()),
-            id: Some(42),
-            pid: Some(21916),
-            bounds: Some(rect(0.0, 0.0, 100.0, 100.0)),
-        };
-        assert!(select_rok_window(&record).is_none());
+        let snap = rok_snap(Some(ROK_OWNER), Some("Splash"));
+        assert!(select_rok_window(&snap).is_none());
     }
 
     #[test]
     fn select_skips_record_with_missing_owner() {
-        let record = WindowRecord {
-            owner: None,
-            title: Some(ROK_TITLE.to_owned()),
-            id: Some(1),
-            pid: Some(2),
-            bounds: Some(rect(0.0, 0.0, 1.0, 1.0)),
-        };
-        assert!(select_rok_window(&record).is_none());
+        let snap = rok_snap(None, Some(ROK_TITLE));
+        assert!(select_rok_window(&snap).is_none());
     }
 
     #[test]
     fn select_skips_other_apps() {
-        let record = WindowRecord {
-            owner: Some("Finder".to_owned()),
-            title: Some(ROK_TITLE.to_owned()),
-            id: Some(42),
-            pid: Some(100),
-            bounds: Some(rect(0.0, 0.0, 100.0, 100.0)),
-        };
-        assert!(select_rok_window(&record).is_none());
-    }
-
-    #[test]
-    fn select_requires_all_required_fields() {
-        let base = WindowRecord {
-            owner: Some(ROK_OWNER.to_owned()),
-            title: Some(ROK_TITLE.to_owned()),
-            id: Some(1),
-            pid: Some(2),
-            bounds: Some(rect(0.0, 0.0, 1.0, 1.0)),
-        };
-        let mut r = base.clone();
-        r.id = None;
-        assert!(select_rok_window(&r).is_none(), "missing id should reject");
-        let mut r = base.clone();
-        r.pid = None;
-        assert!(select_rok_window(&r).is_none(), "missing pid should reject");
-        let mut r = base;
-        r.bounds = None;
-        assert!(
-            select_rok_window(&r).is_none(),
-            "missing bounds should reject"
-        );
+        let snap = rok_snap(Some("Finder"), Some(ROK_TITLE));
+        assert!(select_rok_window(&snap).is_none());
     }
 
     #[test]
@@ -651,10 +610,17 @@ mod tests {
 
     // ---------- validate_at_click_site (v0.1.3 TOCTOU close) ----------
 
+    /// Build a `WindowSnapshot` for the `validate_inner` / `validate_present_inner`
+    /// tests. PID isn't checked by these v0.1.3 validators (added in v0.1.5
+    /// C2), but the field is set to a non-zero stub so future readers don't
+    /// mistake the default for "PID = 0 means unset".
     fn snap(id: u32, x: f64, y: f64, w: f64, h: f64) -> WindowSnapshot {
         WindowSnapshot {
             id,
+            pid: 21916,
             frame: rect(x, y, w, h),
+            owner_name: None,
+            title: None,
         }
     }
 
