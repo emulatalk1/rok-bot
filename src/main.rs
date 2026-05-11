@@ -20,9 +20,13 @@
 //!          `Mode::Virtual` → exit `BotError::RokNotOnPrimary` (Mode 2 lives in v0.2).
 //!     7. Any error → log + exit with the variant's exit code.
 //!
-//! v0.1.3 (this milestone) adds the click step. Verified end-to-end via
-//! the P3 spike (`spikes/p3-spike/`) before integration. Next:
-//! v0.1.4 after-state verification (capture diff to confirm click landed).
+//! v0.1.4 (this milestone) adds the post-click after-state verification
+//! via pixel-space diff between pre-click and post-click captures. The
+//! verify gate exits 20 `ClickNotVerified { reason: "screen_unchanged" }`
+//! when the post capture differs from the pre by fewer than
+//! `verify::PIXEL_DIFF_REJECT_THRESHOLD` pixels. See `verify` module docs
+//! for why pixel-diff (not byte-diff) and why the originally-planned
+//! `match_stable` failure path was dropped during /plan-eng-review.
 
 mod capture;
 mod click;
@@ -30,6 +34,7 @@ mod display;
 mod error;
 mod matcher;
 mod permissions;
+mod verify;
 mod window;
 
 use std::path::PathBuf;
@@ -46,15 +51,26 @@ use crate::permissions::{
 };
 use core_graphics::display::CGPoint;
 
-use crate::window::{find_rok_window, validate_at_click_site};
+use crate::window::{find_rok_window, validate_at_click_site, validate_window_present};
 
-/// Where the window capture is written. Relative to the cwd —
-/// `cargo run` from the repo root puts it at `./rok-capture.png`.
-/// `.gitignore` excludes it. `capture_window` always overwrites, so
-/// each run sees a fresh capture (no stale-state risk between runs).
-/// v0.2+ may move this under a proper user cache dir once we capture
-/// more than once per run.
-const CAPTURE_OUTPUT_PATH: &str = "rok-capture.png";
+/// Pre-click capture path. Written before `find_target` + `click_at`; the
+/// matcher reads it back to locate the target needle. Relative to cwd —
+/// `cargo run` from the repo root puts it at `./rok-capture-pre.png`.
+/// `.gitignore` excludes the `rok-capture-*.png` wildcard.
+///
+/// `capture_window` always overwrites, so each run sees a fresh capture
+/// (no stale-state risk between runs).
+///
+/// v0.1.3 used a single `rok-capture.png`; v0.1.4 splits into pre/post
+/// because the verify gate needs both captures simultaneously for the
+/// pixel-diff.
+const CAPTURE_PRE_PATH: &str = "rok-capture-pre.png";
+
+/// Post-click capture path. Written after the verify-delay sleep and
+/// post-click TOCTOU re-check, then compared against the pre-click
+/// capture by `verify::after_state`. Sibling of [`CAPTURE_PRE_PATH`];
+/// both excluded by the `rok-capture-*.png` `.gitignore` wildcard.
+const CAPTURE_POST_PATH: &str = "rok-capture-post.png";
 
 fn main() {
     init_tracing();
@@ -82,6 +98,7 @@ const fn error_kind(err: &BotError) -> &'static str {
         BotError::TargetTooLarge { .. } => "TargetTooLarge",
         BotError::ClickFailed { .. } => "ClickFailed",
         BotError::WindowChanged { .. } => "WindowChanged",
+        BotError::ClickNotVerified { .. } => "ClickNotVerified",
     }
 }
 
@@ -132,12 +149,12 @@ fn run() -> Result<()> {
         "Mode 1 (visible) — RoK is on the built-in display."
     );
 
-    let capture_path = PathBuf::from(CAPTURE_OUTPUT_PATH);
-    capture_window(window.id, &capture_path)?;
+    let pre_capture_path = PathBuf::from(CAPTURE_PRE_PATH);
+    capture_window(window.id, &pre_capture_path)?;
     tracing::info!(
         target: "rok_bot",
-        path = %capture_path.display(),
-        "captured RoK window"
+        path = %pre_capture_path.display(),
+        "captured RoK window (pre-click)"
     );
 
     // Locate the embedded target needle inside the capture. None here means
@@ -146,7 +163,7 @@ fn run() -> Result<()> {
     // typed BotError so the exit-code contract stays uniform — shell users
     // distinguish "target absent" (15) from "image broken" (16) from
     // "needle too big" (17) without parsing log lines.
-    let m = find_target(&capture_path)?.ok_or(BotError::TargetNotFound)?;
+    let m = find_target(&pre_capture_path)?.ok_or(BotError::TargetNotFound)?;
 
     // Design A16 zero-dim hard-fail: catch malformed Match at the boundary
     // before screen_point produces NaN/Inf coords. The check lives in
@@ -186,6 +203,35 @@ fn run() -> Result<()> {
     tracing::info!(target: "rok_bot", "click-site re-validation OK; clicking");
 
     click_at(sx, sy)?;
+
+    // v0.1.4 after-state verify. Sleep long enough to let RoK render the
+    // UI response, re-validate the window is still present (subset of
+    // the pre-click TOCTOU check — drops the topmost invariant because
+    // a successful click may legitimately spawn a modal/popup that's
+    // now topmost; see window.rs::validate_present_inner for the
+    // rationale), capture again, and diff against the pre capture.
+    //
+    // Exit codes added by this block:
+    //   19 WindowChanged{window_id_gone|frame_moved} — RoK closed or
+    //      moved between click and post-capture.
+    //   14 CaptureFailed — screencapture itself failed (re-uses the
+    //      existing capture-pipeline gates: 0-byte output, nonzero
+    //      exit, symlink refuse).
+    //   20 ClickNotVerified{screen_unchanged} — pre/post pixel-diff
+    //      below threshold; the click landed but RoK did not visibly
+    //      react in pixel space. See error.rs::ClickNotVerified docs
+    //      for the operator's diagnostic checklist.
+    verify::sleep_verify_delay();
+    validate_window_present(&window)?;
+    let post_capture_path = PathBuf::from(CAPTURE_POST_PATH);
+    capture_window(window.id, &post_capture_path)?;
+    tracing::info!(
+        target: "rok_bot",
+        path = %post_capture_path.display(),
+        "captured RoK window (post-click)"
+    );
+    verify::after_state(&pre_capture_path, &post_capture_path, &m)?;
+    tracing::info!(target: "rok_bot", "after-state verify passed; click confirmed");
     Ok(())
 }
 

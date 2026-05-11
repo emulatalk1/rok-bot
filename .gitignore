@@ -14,6 +14,7 @@ spikes/*/target
 **/*.rs.bk
 # Cargo.lock IS committed (binary crate — reproducible builds)
 
-# Runtime artifacts (v0.1.1+ capture output, future per-run state)
-/rok-capture.png
+# Runtime artifacts. v0.1.4 captures pre + post per run as
+# rok-capture-pre.png and rok-capture-post.png; the wildcard covers
+# both plus any future runtime capture variants.
 /rok-capture-*.png

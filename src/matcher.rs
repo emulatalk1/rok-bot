@@ -140,7 +140,13 @@ pub struct Match {
 /// the process before any matcher logic runs. The `image::Limits` check
 /// fires inside `.decode()` based on the reader's IHDR, so we never
 /// allocate the pixel buffer for an oversized image.
-fn load_haystack(path: &Path) -> Result<GrayImage> {
+///
+/// `pub(crate)` because v0.1.4's `verify::after_state` reuses the same
+/// dimension-limited Luma8 decode for the pre/post pixel-diff path.
+/// Keeping a single source of truth means the haystack limits apply
+/// uniformly across the matcher and the verify primitive — a future
+/// `MAX_HAYSTACK_DIM` change tightens both paths together.
+pub fn load_haystack(path: &Path) -> Result<GrayImage> {
     let mut reader = ImageReader::open(path).map_err(|err| {
         tracing::warn!(
             target: "rok_bot",

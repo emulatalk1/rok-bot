@@ -238,6 +238,100 @@ fn validate_inner(
     Ok(())
 }
 
+/// Pure: enforce the v0.1.4 post-capture TOCTOU subset — the WID still
+/// exists and its frame is within tolerance, but **does not** check
+/// topmost-at-click.
+///
+/// /plan-eng-review Outside Voice F4 caught that re-running the full
+/// 3-check at post-capture time false-fails on legitimate state changes:
+/// after a successful click, RoK may have spawned a modal/popup (same
+/// pid, different WID) that's now topmost. The expected RoK WID is no
+/// longer the front-most window at the click point, but the click DID
+/// land correctly and we still want to capture the resulting state. The
+/// 2-check sibling preserves the diagnostic value of `WindowChanged`
+/// (WID gone / frame moved both still produce precise exit-19 messages)
+/// while dropping the invariant that doesn't hold post-click.
+///
+/// Two checks, in order, first-failure-wins:
+///
+/// 1. **`REASON_WID_GONE`** — same as `validate_inner`. RoK closed,
+///    crashed, or rebuilt its main window between click and post-capture.
+///    Posting `screencapture -l <stale_wid>` would either fail (good —
+///    `capture_with_bin`'s 0-byte gate catches it) or capture a different
+///    window (bad — would corrupt the verify pixel-diff).
+///
+/// 2. **`REASON_FRAME_MOVED`** — same as `validate_inner`. RoK got
+///    dragged/resized between click and post-capture; the post-capture
+///    would be misaligned relative to the pre-capture, and pixel-diff
+///    would false-positive everywhere.
+///
+/// Returns `Ok(())` when both pass. The dropped third check
+/// (`REASON_NOT_TOPMOST`) is **not** an invariant post-click and is
+/// not enforced here.
+fn validate_present_inner(
+    expected_wid: u32,
+    expected_frame: CGRect,
+    observed: &[WindowSnapshot],
+    tolerance: f64,
+) -> Result<()> {
+    let Some(found) = observed.iter().find(|w| w.id == expected_wid) else {
+        return Err(BotError::WindowChanged {
+            reason: REASON_WID_GONE,
+        });
+    };
+
+    if !frames_within_tolerance(found.frame, expected_frame, tolerance) {
+        return Err(BotError::WindowChanged {
+            reason: REASON_FRAME_MOVED,
+        });
+    }
+
+    Ok(())
+}
+
+/// Live wrapper: re-call `CGWindowListCopyWindowInfo` and pass the result
+/// to [`validate_present_inner`]. Called from `main.rs::run` between
+/// `click::click_at` returning and the post-click `capture_window` to
+/// close the TOCTOU between click delivery and post-capture.
+///
+/// Structurally similar to `validate_at_click_site` but uses the 2-check
+/// variant (no topmost). See `validate_present_inner` docs for why the
+/// topmost invariant doesn't hold post-click.
+pub fn validate_window_present(expected: &Window) -> Result<()> {
+    let Some(info_list) = copy_window_info(kCGWindowListOptionOnScreenOnly, kCGNullWindowID) else {
+        return Err(BotError::WindowChanged {
+            reason: REASON_WID_GONE,
+        });
+    };
+
+    let mut observed: Vec<WindowSnapshot> = Vec::with_capacity(64);
+    for entry in info_list.iter() {
+        let raw_ptr: *const c_void = *entry;
+        if raw_ptr.is_null() {
+            continue;
+        }
+        // SAFETY: same Get-rule lift as `find_rok_window` /
+        // `validate_at_click_site` — each slot is an unretained
+        // CFDictionaryRef; `wrap_under_get_rule` CFRetains.
+        let cf = unsafe { CFType::wrap_under_get_rule(raw_ptr.cast()) };
+        let Some(dict) = cf.downcast::<CFDictionary>() else {
+            continue;
+        };
+        let record = parse_record(&dict);
+        let (Some(id), Some(frame)) = (record.id, record.bounds) else {
+            continue;
+        };
+        observed.push(WindowSnapshot { id, frame });
+    }
+
+    validate_present_inner(
+        expected.id,
+        expected.frame,
+        &observed,
+        FRAME_TOLERANCE_POINTS,
+    )
+}
+
 /// Pure: are two `CGRect`s equal within per-coordinate tolerance?
 fn frames_within_tolerance(a: CGRect, b: CGRect, tolerance: f64) -> bool {
     (a.origin.x - b.origin.x).abs() <= tolerance
@@ -761,6 +855,87 @@ mod tests {
             }
             other => panic!("expected WindowChanged{{wid_gone}}, got {other:?}"),
         }
+    }
+
+    // ---------- validate_present_inner (v0.1.4 post-capture TOCTOU subset) ----------
+
+    #[test]
+    fn validate_present_inner_passes_when_wid_present_and_frame_within_tolerance() {
+        // Happy path: same WID, frame jitter under tolerance. The
+        // 2-check sibling deliberately does NOT consider topmost-at-
+        // click, so we don't pass a click point — the function signature
+        // makes the dropped invariant unrepresentable.
+        let observed = [snap(42, 100.0, 200.0, 1280.0, 720.0)];
+        let result = validate_present_inner(42, rect(100.0, 200.0, 1280.0, 720.0), &observed, TOL);
+        assert!(result.is_ok(), "happy path must succeed: {result:?}");
+    }
+
+    #[test]
+    fn validate_present_inner_wid_gone() {
+        // RoK closed/crashed between click and post-capture.
+        let observed = [snap(99, 0.0, 0.0, 1920.0, 1080.0)];
+        match validate_present_inner(42, rect(100.0, 200.0, 1280.0, 720.0), &observed, TOL) {
+            Err(BotError::WindowChanged { reason }) => {
+                assert_eq!(reason, REASON_WID_GONE);
+            }
+            other => panic!("expected WindowChanged{{wid_gone}}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_present_inner_frame_moved_origin() {
+        // RoK still WID 42 but moved 100pt between click and post-capture.
+        // Post-capture would be misaligned vs pre — pixel-diff would
+        // false-positive on virtually every pixel.
+        let observed = [snap(42, 200.0, 200.0, 1280.0, 720.0)];
+        match validate_present_inner(42, rect(100.0, 200.0, 1280.0, 720.0), &observed, TOL) {
+            Err(BotError::WindowChanged { reason }) => {
+                assert_eq!(reason, REASON_FRAME_MOVED);
+            }
+            other => panic!("expected WindowChanged{{frame_moved}}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_present_inner_frame_moved_size() {
+        // Window resized by 50pt in width mid-flow; same WID, different
+        // frame.
+        let observed = [snap(42, 100.0, 200.0, 1330.0, 720.0)];
+        match validate_present_inner(42, rect(100.0, 200.0, 1280.0, 720.0), &observed, TOL) {
+            Err(BotError::WindowChanged { reason }) => {
+                assert_eq!(reason, REASON_FRAME_MOVED);
+            }
+            other => panic!("expected WindowChanged{{frame_moved}}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_present_inner_passes_with_overlay_on_top() {
+        // The structural difference from validate_inner: an overlay
+        // (WID 99, on top in z-order) covering the click point would
+        // fire REASON_NOT_TOPMOST in the 3-check variant. The 2-check
+        // sibling MUST pass this — it's the whole reason for the split
+        // (post-click overlays/modals are legitimate state changes).
+        let observed = [
+            snap(99, 700.0, 500.0, 200.0, 200.0), // overlay (e.g. modal spawned by click)
+            snap(42, 100.0, 200.0, 1280.0, 720.0), // RoK below
+        ];
+        let result = validate_present_inner(42, rect(100.0, 200.0, 1280.0, 720.0), &observed, TOL);
+        assert!(
+            result.is_ok(),
+            "overlay above RoK must NOT fire WindowChanged in the 2-check sibling: {result:?}"
+        );
+    }
+
+    #[test]
+    fn validate_present_inner_frame_within_tolerance_passes() {
+        // Sub-pixel jitter under the 1.0 tolerance must NOT fire frame_moved.
+        let observed = [snap(42, 100.5, 200.0, 1280.0, 720.5)];
+        let result = validate_present_inner(42, rect(100.0, 200.0, 1280.0, 720.0), &observed, TOL);
+        assert!(
+            result.is_ok(),
+            "0.5pt jitter must pass under 1.0pt tolerance: {result:?}"
+        );
     }
 
     #[test]
