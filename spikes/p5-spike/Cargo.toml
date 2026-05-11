@@ -1,0 +1,20 @@
+[package]
+name = "p5-spike"
+version = "0.0.1"
+edition = "2024"
+publish = false
+description = "v0.1.5 Phase 0 spike — verify macOS Accessibility AXUIElementPerformAction(kAXPressAction) delivers clicks to RoK (Catalyst Bridge) regardless of window z-order"
+
+# Detach from the parent rok-bot Cargo project, same as p3/p4 spikes. Throwaway
+# binary with its own Cargo.lock and dep tree.
+[workspace]
+
+[dependencies]
+# Needed for the HID control variant only (mirrors p4-spike --hid path so
+# the test matrix shares an apples-to-apples baseline).
+core-graphics   = { version = "0.25", features = ["elcapitan"] }
+core-foundation = "0.10"
+
+[[bin]]
+name = "p5-spike"
+path = "src/main.rs"
