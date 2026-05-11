@@ -88,28 +88,43 @@ pub enum BotError {
     )]
     ClickFailed { reason: &'static str },
 
-    /// The RoK window's state changed between discovery (top of `run()`) and
-    /// the click site, in a way that would let a synthetic AX-privileged
-    /// click land on the wrong window. v0.1.3 closes the TOCTOU between
-    /// `find_rok_window()` and `click_at()` by re-validating immediately
-    /// before the click; this variant is the typed exit when re-validation
-    /// fails.
+    /// The RoK window's state changed between discovery (top of `run()`)
+    /// and the click site, OR was already in an unreachable state at
+    /// boot, in a way that would let a synthetic AX-privileged click
+    /// land on the wrong window (or no window). v0.1.3 introduced the
+    /// pre-click TOCTOU close; v0.1.5 extends the same check to boot-time
+    /// discovery and post-click re-validation, and adds PID-anchored
+    /// lookups + hidden-Space detection.
     ///
-    /// `reason` distinguishes which check failed:
-    /// - `"window_id_gone"` — the original WID is no longer in
-    ///   `CGWindowListCopyWindowInfo` (RoK closed, crashed, or its window
-    ///   was rebuilt and got a new WID).
-    /// - `"frame_moved"` — the WID exists but its frame origin or size
-    ///   shifted by more than the per-axis tolerance since discovery.
-    /// - `"not_topmost_at_click"` — the WID exists with the expected
-    ///   frame, but another window now sits on top of the click point
-    ///   (overlay, dialog, notification banner, focus grab from another
-    ///   app). Posting the click here would deliver privileged input to
-    ///   that other window.
+    /// `reason` distinguishes which check failed (all map to exit 19):
+    /// - `"window_id_gone"` — the (WID, PID) pair from discovery is no
+    ///   longer in `kCGWindowListOptionAll`. RoK closed/crashed, OR the
+    ///   numeric WID was reused by an unrelated window (caught by the
+    ///   v0.1.5 PID anchor; v0.1.3 would have false-passed).
+    /// - `"not_visible"` — the (WID, PID) exists in `kCGWindowList
+    ///   OptionAll` but is missing from `kCGWindowListOptionOnScreenOnly`.
+    ///   RoK is alive but hidden: another app went macOS-native
+    ///   fullscreen and pushed RoK to a separate Space, or RoK is
+    ///   minimized to Dock, or the `WindowServer` is in a transient
+    ///   hide state. Distinct exit from `window_id_gone` so the operator
+    ///   knows to switch Spaces / unminimize, not restart RoK.
+    /// - `"frame_moved"` — the (WID, PID) is on screen but its frame
+    ///   origin or size shifted by more than the per-axis tolerance
+    ///   since discovery.
+    /// - `"point_outside_frame"` — pre-click only. The requested click
+    ///   point is not inside the discovered frame. Catches operator-
+    ///   side coord math bugs before the AX layer is engaged. Pre-v0.1.5
+    ///   this was caught accidentally by the topmost walk (deleted in
+    ///   v0.1.5 because `kAXPressAction` delivers through z-order overlap
+    ///   on Catalyst Bridge apps — see learnings/ax-press-works-catalyst).
     #[error(
-        "RoK window state changed between discovery and click (reason: {reason}). \
-         Aborted before posting the click to avoid sending privileged synthetic \
-         input to the wrong window. Re-run when RoK is foreground and stable."
+        "RoK window state changed or unreachable (reason: {reason}). \
+         Aborted before sending privileged synthetic input to avoid \
+         wrong-window delivery. For 'not_visible', switch to RoK's Space \
+         or unminimize. For 'window_id_gone', re-launch RoK. For \
+         'frame_moved', wait for RoK to stop moving and re-run. For \
+         'point_outside_frame', check that the matched target lands \
+         inside the discovered window frame."
     )]
     WindowChanged { reason: &'static str },
 
@@ -316,10 +331,19 @@ mod tests {
             18
         );
         assert_eq!(BotError::ClickFailed { reason: REASON_UP }.exit_code(), 18);
-        // WindowChanged variants share exit 19. Pin all 3 documented
-        // reasons even though reason isn't part of the exit-code contract
-        // — same rationale as ClickFailed.
-        for reason in ["window_id_gone", "frame_moved", "not_topmost_at_click"] {
+        // WindowChanged variants share exit 19. Pin all 4 documented
+        // v0.1.5 reasons even though reason isn't part of the exit-code
+        // contract — same rationale as ClickFailed. The v0.1.3 reason
+        // "not_topmost_at_click" was deleted in v0.1.5 (replaced by
+        // "not_visible" for the hidden-Space case and dropped for the
+        // click-time occluder case, since AX press delivers through
+        // z-order overlap on Catalyst Bridge apps).
+        for reason in [
+            "window_id_gone",
+            "frame_moved",
+            "not_visible",
+            "point_outside_frame",
+        ] {
             assert_eq!(
                 BotError::WindowChanged { reason }.exit_code(),
                 19,

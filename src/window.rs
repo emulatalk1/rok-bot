@@ -33,14 +33,42 @@ use crate::error::{BotError, Result};
 pub const ROK_OWNER: &str = "RiseOfKingdoms";
 pub const ROK_TITLE: &str = "RiseOfKingdoms";
 
-/// Reason tags surfaced via `BotError::WindowChanged { reason }`. The TOCTOU
-/// re-validation at click site (`validate_at_click_site`) checks three
-/// independent invariants and reports which one failed via these constants.
-/// Pinned as `&'static str` so the operator-facing log line is always one of
-/// these three values; tests assert against them directly.
+/// Reason tags surfaced via `BotError::WindowChanged { reason }`. Each
+/// check in the v0.1.5 validation pipeline maps to one of these constants;
+/// pinned as `&'static str` so the operator-facing log line is always
+/// one of these four values and tests assert against them directly.
+///
+/// **v0.1.5 changes vs v0.1.3:**
+/// - `REASON_NOT_TOPMOST` was deleted. The 3-site hidden-Space check
+///   subsumes most of its operator value (the click-time occluder case
+///   is now caught earlier as `REASON_NOT_VISIBLE`), and `kAXPressAction`
+///   on a Catalyst Bridge app like RoK delivers through z-order overlap
+///   anyway — see `learnings/ax-press-works-catalyst`.
+/// - `REASON_NOT_VISIBLE` is new: the WID+PID pair exists in
+///   `kCGWindowListOptionAll` but is missing from
+///   `kCGWindowListOptionOnScreenOnly`. Covers hidden Space (another
+///   app went fullscreen and pushed RoK to a separate Space), minimized
+///   to Dock, and transient `WindowServer` states that hide a window
+///   without destroying it. Distinct from `REASON_WID_GONE` so the
+///   operator knows whether to switch Spaces vs restart RoK.
+/// - `REASON_POINT_OUTSIDE_FRAME` is new: the click point computed
+///   from `screen_point(&match, &window.frame)` is not inside the
+///   discovered frame. Catches bad coord math (negative origin sign
+///   flip, off-by-one) and pure validation: under v0.1.3 the topmost
+///   walk accidentally enforced this; without explicit checking, the
+///   AX press could deliver at unintended desktop coords.
 pub const REASON_WID_GONE: &str = "window_id_gone";
 pub const REASON_FRAME_MOVED: &str = "frame_moved";
-pub const REASON_NOT_TOPMOST: &str = "not_topmost_at_click";
+pub const REASON_NOT_VISIBLE: &str = "not_visible";
+pub const REASON_POINT_OUTSIDE_FRAME: &str = "point_outside_frame";
+
+/// `kCGWindowListOptionAll` = 0. The `core-graphics` 0.x crate exposes only
+/// `kCGWindowListOptionOnScreenOnly`; the underlying CG enum uses 0 as the
+/// "no on-screen filter" value (every window the calling process is allowed
+/// to see, including those on hidden Spaces and minimized to the Dock).
+/// Declared locally to avoid waiting on a crate update. Verified against
+/// Apple's CGWindow.h: `enum { kCGWindowListOptionAll = 0, ... }`.
+const K_CG_WINDOW_LIST_OPTION_ALL: u32 = 0;
 
 /// Tolerance for per-coordinate frame drift in
 /// [`validate_at_click_site`]. macOS reports window bounds to fractional
@@ -164,17 +192,58 @@ fn collect_window_snapshots(option: u32) -> Option<Vec<WindowSnapshot>> {
 /// Spoofs are skipped with a `tracing::warn!` so they're visible in logs
 /// without halting the search — the real RoK window may be later in the
 /// list.
+///
+/// **v0.1.5 hidden-Space distinction.** Three outcomes:
+///
+/// 1. **`Ok(window)`** — RoK is on a visible Space. Happy path; matches
+///    against `kCGWindowListOptionOnScreenOnly`.
+/// 2. **`Err(WindowChanged { REASON_NOT_VISIBLE })`** — RoK process is
+///    running and has a window, but the window isn't on a currently-
+///    displayed Space (typical when another app went macOS-native
+///    fullscreen and pushed RoK behind it, or RoK was minimized to
+///    Dock). Detected by falling back to `kCGWindowListOptionAll`.
+///    Operator's fix is "switch to RoK's Space" or "unminimize",
+///    which is meaningfully different from "start RoK." See
+///    `learnings/ax-press-fails-hidden-space` for why Mode 1 cannot
+///    click through to a hidden-Space window even with AX, and the
+///    broader rationale for distinguishing this state.
+/// 3. **`Err(WindowNotFound)`** — RoK isn't running at all. Operator
+///    needs to launch it.
 pub fn find_rok_window() -> Result<Window> {
-    let snapshots = collect_window_snapshots(kCGWindowListOptionOnScreenOnly)
+    let onscreen = collect_window_snapshots(kCGWindowListOptionOnScreenOnly)
         .ok_or(BotError::WindowNotFound)?;
+    if let Some(window) = first_rok_window(&onscreen) {
+        return Ok(window);
+    }
+    // Not on a currently-displayed Space. Falling back to `Option=All`
+    // includes hidden Spaces, minimized, and transient WindowServer
+    // states. If RoK is found there, the process is alive but the
+    // window isn't reachable for capture/click — surface that
+    // distinctly from "not running."
+    let all =
+        collect_window_snapshots(K_CG_WINDOW_LIST_OPTION_ALL).ok_or(BotError::WindowNotFound)?;
+    if first_rok_window(&all).is_some() {
+        return Err(BotError::WindowChanged {
+            reason: REASON_NOT_VISIBLE,
+        });
+    }
+    Err(BotError::WindowNotFound)
+}
 
-    for snap in &snapshots {
+/// Pure-ish helper: return the first snapshot in `snapshots` that matches
+/// the RoK main-window predicate AND the bundle-ID anti-spoof gate. Spoof
+/// candidates are skipped with `tracing::warn!` so a stale or impersonator
+/// window earlier in the list doesn't block a legitimate match later.
+/// `bundle_id_for_pid` is a live AppKit call, hence "pure-ish"; mockable
+/// pure logic stays inside `select_rok_window` + `matches_rok_bundle_id`.
+fn first_rok_window(snapshots: &[WindowSnapshot]) -> Option<Window> {
+    for snap in snapshots {
         if let Some(window) = select_rok_window(snap) {
             if bundle_id_for_pid(window.pid)
                 .as_deref()
                 .is_some_and(matches_rok_bundle_id)
             {
-                return Ok(window);
+                return Some(window);
             }
             tracing::warn!(
                 target: "rok_bot",
@@ -186,7 +255,7 @@ pub fn find_rok_window() -> Result<Window> {
             );
         }
     }
-    Err(BotError::WindowNotFound)
+    None
 }
 
 /// Pure: does this bundle ID belong to a legitimate RoK install?
@@ -194,147 +263,193 @@ fn matches_rok_bundle_id(bundle_id: &str) -> bool {
     bundle_id.starts_with(ROK_BUNDLE_PREFIX)
 }
 
-/// Pure: enforce the v0.1.3 TOCTOU invariants between window discovery and
-/// click delivery, given a snapshot of currently on-screen windows in
-/// front-to-back z-order.
+/// Pure: enforce the v0.1.5 TOCTOU invariants between window discovery
+/// and click delivery, given paired snapshots of currently-displayed
+/// (`onscreen`) and all-known (`all`) windows.
 ///
-/// Three checks, in order, with first-failure-wins semantics:
+/// Four checks, in order, with first-failure-wins semantics so the
+/// operator sees the most diagnostic reason:
 ///
-/// 1. **`REASON_WID_GONE`** — the expected WID is not in `observed`. The
-///    RoK process closed, crashed, or rebuilt its main window between
-///    discovery and click. Posting at the stale screen coords would land
-///    on whatever window now sits there.
+/// 1. **`REASON_WID_GONE`** — the expected (WID, PID) pair is not in
+///    `all`. Either RoK closed/crashed, or the numeric WID was reused
+///    by an unrelated window after RoK's window was destroyed. PID-
+///    anchored lookup catches both. Without the PID anchor, a WID-reuse
+///    by another process would have masqueraded as "still alive,
+///    different state" and let downstream code AX-press into the wrong
+///    window.
 ///
-/// 2. **`REASON_FRAME_MOVED`** — the WID exists but its frame origin/size
-///    drifted beyond [`FRAME_TOLERANCE_POINTS`] in any of the four
-///    components. The user moved or resized RoK between discovery and
-///    click. The screen point computed from the stale frame doesn't
-///    correspond to the same UI element anymore.
+/// 2. **`REASON_NOT_VISIBLE`** — the (WID, PID) is in `all` but missing
+///    from `onscreen`. The window exists (process is alive, WID is
+///    valid) but isn't on a currently-displayed Space — typical when
+///    another app went macOS-native fullscreen and pushed RoK to a
+///    hidden Space, or RoK was minimized to Dock, or a transient
+///    `WindowServer` state hid the window. Distinct exit from `WID_GONE`
+///    because the operator's fix is different: switch Spaces / un-
+///    minimize, not "restart RoK." Empirically required: AX press
+///    returns `kAXErrorFailure` (-25200) against a hidden-Space window
+///    even though the AX element query succeeds (`learnings/
+///    ax-press-fails-hidden-space`), so failing fast here gives a
+///    clean error instead of an opaque `AXError` code at click time.
 ///
-/// 3. **`REASON_NOT_TOPMOST`** — RoK exists at the expected frame, but
-///    another window in `observed` (earlier in z-order, i.e., on top) has
-///    a frame that contains the click point. Could be a system overlay,
-///    notification banner, dialog, drag-and-drop tooltip, or a
-///    focus-grabbing app that just opened. A privileged synthetic click
-///    posted to those coords would deliver to the overlay, not RoK.
+/// 3. **`REASON_FRAME_MOVED`** — the (WID, PID) is on screen but its
+///    frame origin/size drifted beyond [`FRAME_TOLERANCE_POINTS`] in
+///    any of the four components. The user moved or resized RoK
+///    between discovery and click. The screen point computed from the
+///    stale frame doesn't correspond to the same UI element anymore.
 ///
-/// Returns `Ok(())` when all three pass.
+/// 4. **`REASON_POINT_OUTSIDE_FRAME`** — the requested click point is
+///    not inside the discovered frame. Pre-v0.1.5 this was an
+///    accidental side-effect of the topmost walk (no window contained
+///    the point → not-topmost); the v0.1.5 pipeline drops the topmost
+///    walk (replaced by hidden-Space + AX delivery's z-order
+///    independence) so the bounds check becomes explicit. Catches
+///    operator-side coord math bugs (negative-origin sign flip,
+///    off-by-one in `screen_point`) before they reach the AX layer.
+///
+/// Returns `Ok(())` when all four pass.
 fn validate_inner(
     expected_wid: u32,
+    expected_pid: i32,
     expected_frame: CGRect,
-    observed: &[WindowSnapshot],
+    onscreen: &[WindowSnapshot],
+    all: &[WindowSnapshot],
     click_point: CGPoint,
     tolerance: f64,
 ) -> Result<()> {
-    let Some(found) = observed.iter().find(|w| w.id == expected_wid) else {
+    // Check #1: (WID, PID) present in `all`. PID anchor catches WID reuse.
+    if !all
+        .iter()
+        .any(|w| w.id == expected_wid && w.pid == expected_pid)
+    {
         return Err(BotError::WindowChanged {
             reason: REASON_WID_GONE,
         });
+    }
+    // Check #2: same (WID, PID) reachable on a displayed Space.
+    let Some(found) = onscreen
+        .iter()
+        .find(|w| w.id == expected_wid && w.pid == expected_pid)
+    else {
+        return Err(BotError::WindowChanged {
+            reason: REASON_NOT_VISIBLE,
+        });
     };
-
+    // Check #3: frame within tolerance vs. discovery snapshot.
     if !frames_within_tolerance(found.frame, expected_frame, tolerance) {
         return Err(BotError::WindowChanged {
             reason: REASON_FRAME_MOVED,
         });
     }
-
-    // Topmost-at-point: walk in z-order (front-to-back). The first window
-    // whose frame contains click_point is the topmost. If that's not RoK,
-    // some other window is occluding the click site.
-    if let Some(top) = observed
-        .iter()
-        .find(|w| rect_contains_point(w.frame, click_point))
-    {
-        if top.id != expected_wid {
-            return Err(BotError::WindowChanged {
-                reason: REASON_NOT_TOPMOST,
-            });
-        }
-    } else {
-        // No window covers the click point at all. That can only happen
-        // if (sx, sy) is outside every on-screen window's bounds —
-        // typically because RoK moved off-screen between discovery and
-        // click, OR the screen_point math produced bad coords. Either
-        // way, posting the click would land on the desktop / dock. Treat
-        // as not-topmost: RoK isn't covering the point we'd click.
+    // Check #4: click point inside the discovered frame. Pre-v0.1.5 this
+    // was implicit in the topmost walk; v0.1.5 enforces it explicitly so
+    // the bounds invariant survives the topmost deletion.
+    if !rect_contains_point(expected_frame, click_point) {
         return Err(BotError::WindowChanged {
-            reason: REASON_NOT_TOPMOST,
+            reason: REASON_POINT_OUTSIDE_FRAME,
         });
     }
-
     Ok(())
 }
 
-/// Pure: enforce the v0.1.4 post-capture TOCTOU subset — the WID still
-/// exists and its frame is within tolerance, but **does not** check
-/// topmost-at-click.
+/// Pure: enforce the v0.1.5 post-capture TOCTOU subset — the (WID, PID)
+/// is still alive, still on a visible Space, and the frame is within
+/// tolerance. The click-point bounds check is dropped because we've
+/// already clicked (the only thing being validated is whether the
+/// screen state is still capture-able and pixel-comparable to pre).
 ///
-/// /plan-eng-review Outside Voice F4 caught that re-running the full
-/// 3-check at post-capture time false-fails on legitimate state changes:
-/// after a successful click, RoK may have spawned a modal/popup (same
-/// pid, different WID) that's now topmost. The expected RoK WID is no
-/// longer the front-most window at the click point, but the click DID
-/// land correctly and we still want to capture the resulting state. The
-/// 2-check sibling preserves the diagnostic value of `WindowChanged`
-/// (WID gone / frame moved both still produce precise exit-19 messages)
-/// while dropping the invariant that doesn't hold post-click.
+/// /plan-eng-review Outside Voice F4 (v0.1.4) caught that the
+/// pre-click topmost invariant doesn't hold post-click: a successful
+/// click may legitimately spawn a modal that becomes topmost. v0.1.5
+/// drops the topmost walk from the pre-click pipeline too (replaced
+/// by hidden-Space + AX delivery's z-order independence), so the two
+/// pipelines now differ only by the click-point bounds check. That
+/// asymmetry is preserved: pre needs to know "is the point I'm
+/// clicking on the discovered window," post just needs "is the window
+/// still capturable in the same place."
 ///
-/// Two checks, in order, first-failure-wins:
+/// Three checks, in order, first-failure-wins:
 ///
-/// 1. **`REASON_WID_GONE`** — same as `validate_inner`. RoK closed,
-///    crashed, or rebuilt its main window between click and post-capture.
-///    Posting `screencapture -l <stale_wid>` would either fail (good —
-///    `capture_with_bin`'s 0-byte gate catches it) or capture a different
-///    window (bad — would corrupt the verify pixel-diff).
+/// 1. **`REASON_WID_GONE`** — the expected (WID, PID) pair is not in
+///    `all`. RoK closed, crashed, or its window was rebuilt with a
+///    new WID between click and post-capture. Posting `screencapture
+///    -l <stale_wid>` would either fail (`capture_with_bin`'s 0-byte
+///    gate catches it) or capture a different window (bad — would
+///    corrupt the verify pixel-diff). PID anchor catches WID-reuse
+///    by another process.
 ///
-/// 2. **`REASON_FRAME_MOVED`** — same as `validate_inner`. RoK got
-///    dragged/resized between click and post-capture; the post-capture
-///    would be misaligned relative to the pre-capture, and pixel-diff
-///    would false-positive everywhere.
+/// 2. **`REASON_NOT_VISIBLE`** — the (WID, PID) is in `all` but
+///    missing from `onscreen`. Same conditions as `validate_inner`
+///    Check #2: another app went fullscreen, RoK was minimized, or
+///    a Space switch hid the window. Post-click capture would
+///    `screencapture -l` against a window not on a displayed Space;
+///    the captured pixels typically come back blank or stale, and
+///    pixel-diff would either false-positive or false-negative.
 ///
-/// Returns `Ok(())` when both pass. The dropped third check
-/// (`REASON_NOT_TOPMOST`) is **not** an invariant post-click and is
-/// not enforced here.
+/// 3. **`REASON_FRAME_MOVED`** — same as `validate_inner`. RoK got
+///    dragged/resized between click and post-capture; post-capture
+///    would be misaligned relative to pre and pixel-diff would
+///    false-positive across most pixels.
+///
+/// Returns `Ok(())` when all three pass.
 fn validate_present_inner(
     expected_wid: u32,
+    expected_pid: i32,
     expected_frame: CGRect,
-    observed: &[WindowSnapshot],
+    onscreen: &[WindowSnapshot],
+    all: &[WindowSnapshot],
     tolerance: f64,
 ) -> Result<()> {
-    let Some(found) = observed.iter().find(|w| w.id == expected_wid) else {
+    if !all
+        .iter()
+        .any(|w| w.id == expected_wid && w.pid == expected_pid)
+    {
         return Err(BotError::WindowChanged {
             reason: REASON_WID_GONE,
         });
+    }
+    let Some(found) = onscreen
+        .iter()
+        .find(|w| w.id == expected_wid && w.pid == expected_pid)
+    else {
+        return Err(BotError::WindowChanged {
+            reason: REASON_NOT_VISIBLE,
+        });
     };
-
     if !frames_within_tolerance(found.frame, expected_frame, tolerance) {
         return Err(BotError::WindowChanged {
             reason: REASON_FRAME_MOVED,
         });
     }
-
     Ok(())
 }
 
-/// Live wrapper: re-call `CGWindowListCopyWindowInfo` and pass the result
-/// to [`validate_present_inner`]. Called from `main.rs::run` between
-/// `click::click_at` returning and the post-click `capture_window` to
-/// close the TOCTOU between click delivery and post-capture.
+/// Live wrapper: re-call `CGWindowListCopyWindowInfo` twice (onscreen +
+/// all) and pass the results to [`validate_present_inner`]. Called from
+/// `main.rs::run` between `click::click_at` returning and the post-click
+/// `capture_window` to close the TOCTOU between click delivery and
+/// post-capture.
 ///
-/// Structurally similar to `validate_at_click_site` but uses the 2-check
-/// variant (no topmost). See `validate_present_inner` docs for why the
-/// topmost invariant doesn't hold post-click.
+/// Structurally similar to `validate_at_click_site` but skips the
+/// click-point bounds check (no click is about to be sent). See
+/// `validate_present_inner` docs for why the topmost invariant was
+/// dropped from both pipelines.
 pub fn validate_window_present(expected: &Window) -> Result<()> {
-    let observed = collect_window_snapshots(kCGWindowListOptionOnScreenOnly).ok_or(
+    let onscreen = collect_window_snapshots(kCGWindowListOptionOnScreenOnly).ok_or(
         BotError::WindowChanged {
             reason: REASON_WID_GONE,
         },
     )?;
+    let all =
+        collect_window_snapshots(K_CG_WINDOW_LIST_OPTION_ALL).ok_or(BotError::WindowChanged {
+            reason: REASON_WID_GONE,
+        })?;
 
     validate_present_inner(
         expected.id,
+        expected.pid,
         expected.frame,
-        &observed,
+        &onscreen,
+        &all,
         FRAME_TOLERANCE_POINTS,
     )
 }
@@ -357,30 +472,38 @@ fn rect_contains_point(rect: CGRect, p: CGPoint) -> bool {
     p.x >= x_min && p.x < x_max && p.y >= y_min && p.y < y_max
 }
 
-/// Live wrapper: re-call `CGWindowListCopyWindowInfo` and pass the result to
-/// [`validate_inner`]. Called from `main.rs::run` between
-/// `matcher::screen_point` and `click::click_at` to close the TOCTOU
-/// between window discovery and click delivery.
+/// Live wrapper: re-call `CGWindowListCopyWindowInfo` twice (onscreen +
+/// all) and pass the results to [`validate_inner`]. Called from
+/// `main.rs::run` between `matcher::screen_point` and `click::click_at`
+/// (now `ax::press_at` via `click_at`) to close the TOCTOU between
+/// window discovery and click delivery.
 ///
-/// The on-screen list is in front-to-back z-order. Auxiliary RoK windows
-/// (splash, popups) are filtered by the `select_rok_window` predicate at
-/// discovery, but here we keep ALL on-screen windows (any owner) because
-/// the topmost-at-point check needs to see overlays from other apps too.
+/// We need BOTH lists, not just `OnScreenOnly`. The on-screen check
+/// rules out hidden-Space windows (where AX press would return
+/// `kAXErrorFailure -25200`); the all-list check distinguishes that
+/// from "RoK truly gone" so the operator gets `REASON_NOT_VISIBLE`
+/// rather than the more alarming `REASON_WID_GONE`.
 pub fn validate_at_click_site(expected: &Window, click_point: CGPoint) -> Result<()> {
     // CGWindowList unavailable mid-run is itself a TOCTOU signal:
     // something changed about the window-server's state. Treat as
     // window-gone rather than a generic permission failure — Screen
     // Recording has already been preflight-checked at boot.
-    let observed = collect_window_snapshots(kCGWindowListOptionOnScreenOnly).ok_or(
+    let onscreen = collect_window_snapshots(kCGWindowListOptionOnScreenOnly).ok_or(
         BotError::WindowChanged {
             reason: REASON_WID_GONE,
         },
     )?;
+    let all =
+        collect_window_snapshots(K_CG_WINDOW_LIST_OPTION_ALL).ok_or(BotError::WindowChanged {
+            reason: REASON_WID_GONE,
+        })?;
 
     validate_inner(
         expected.id,
+        expected.pid,
         expected.frame,
-        &observed,
+        &onscreen,
+        &all,
         click_point,
         FRAME_TOLERANCE_POINTS,
     )
@@ -608,16 +731,35 @@ mod tests {
         assert!(matches_rok_bundle_id("com.rok.ios."));
     }
 
-    // ---------- validate_at_click_site (v0.1.3 TOCTOU close) ----------
+    // ---------- validate_inner / validate_present_inner (v0.1.5 4-/3-check) ----------
 
-    /// Build a `WindowSnapshot` for the `validate_inner` / `validate_present_inner`
-    /// tests. PID isn't checked by these v0.1.3 validators (added in v0.1.5
-    /// C2), but the field is set to a non-zero stub so future readers don't
-    /// mistake the default for "PID = 0 means unset".
+    /// PID used for the canonical "RoK process" in all validator tests.
+    /// Matches the live RoK pid observed in p7-spike runs (21916) — the
+    /// number is arbitrary but kept consistent so a future reader can
+    /// cross-ref with spike logs.
+    const ROK_PID: i32 = 21916;
+
+    /// PID used for the WID-reuse adversarial test. Any pid ≠ `ROK_PID`
+    /// works; this one is chosen far from `ROK_PID` to avoid the
+    /// suspicion that an off-by-one mistake could mask the test.
+    const OTHER_PID: i32 = 99999;
+
+    /// Build a `WindowSnapshot` with the canonical RoK pid. v0.1.5
+    /// validators anchor lookups on (WID, PID) rather than WID alone, so
+    /// every test snapshot needs an explicit pid. Tests vary `id` and
+    /// `frame` to drive each check; helper keeps the boilerplate down.
     fn snap(id: u32, x: f64, y: f64, w: f64, h: f64) -> WindowSnapshot {
+        snap_pid(id, ROK_PID, x, y, w, h)
+    }
+
+    /// Build a `WindowSnapshot` with an explicit pid. Used by the
+    /// WID-reuse tests where we deliberately put a "right WID, wrong
+    /// PID" entry into the live snapshot list to prove the validators
+    /// don't false-pass on numeric WID reuse.
+    fn snap_pid(id: u32, pid: i32, x: f64, y: f64, w: f64, h: f64) -> WindowSnapshot {
         WindowSnapshot {
             id,
-            pid: 21916,
+            pid,
             frame: rect(x, y, w, h),
             owner_name: None,
             title: None,
@@ -628,13 +770,16 @@ mod tests {
 
     #[test]
     fn validate_inner_happy_path() {
-        // RoK present at expected frame, click point inside it, no
-        // occluder above. All three checks pass.
-        let observed = [snap(42, 100.0, 200.0, 1280.0, 720.0)];
+        // RoK present at expected frame in both lists, click point
+        // inside frame. All four checks pass.
+        let onscreen = [snap(42, 100.0, 200.0, 1280.0, 720.0)];
+        let all = onscreen.clone();
         let result = validate_inner(
             42,
+            ROK_PID,
             rect(100.0, 200.0, 1280.0, 720.0),
-            &observed,
+            &onscreen,
+            &all,
             CGPoint::new(740.0, 560.0),
             TOL,
         );
@@ -643,12 +788,17 @@ mod tests {
 
     #[test]
     fn validate_inner_wid_gone() {
-        // Expected RoK WID 42, but only WID 99 (Finder, say) is on screen.
-        let observed = [snap(99, 0.0, 0.0, 1920.0, 1080.0)];
+        // Expected RoK (WID 42, ROK_PID) not in `all` (only WID 99
+        // present). RoK process closed/crashed between discovery and
+        // re-check. PID anchor makes this check exact.
+        let all = [snap(99, 0.0, 0.0, 1920.0, 1080.0)];
+        let onscreen = all.clone();
         match validate_inner(
             42,
+            ROK_PID,
             rect(100.0, 200.0, 1280.0, 720.0),
-            &observed,
+            &onscreen,
+            &all,
             CGPoint::new(740.0, 560.0),
             TOL,
         ) {
@@ -660,14 +810,68 @@ mod tests {
     }
 
     #[test]
-    fn validate_inner_frame_moved_origin() {
-        // RoK still WID 42 but moved 100 points right between discovery
-        // and re-check. Frame drift in origin.x triggers the second check.
-        let observed = [snap(42, 200.0, 200.0, 1280.0, 720.0)];
+    fn validate_inner_wid_reused_wrong_pid() {
+        // Adversarial: numeric WID 42 exists in `all` but under
+        // OTHER_PID (not the RoK pid we discovered). Window-server
+        // reuses WIDs after a window is destroyed. PID anchoring
+        // catches this — without it, the bot would treat the reused
+        // WID as "still RoK" and AX-press into an unrelated app.
+        let all = [snap_pid(42, OTHER_PID, 100.0, 200.0, 1280.0, 720.0)];
+        let onscreen = all.clone();
         match validate_inner(
             42,
+            ROK_PID,
             rect(100.0, 200.0, 1280.0, 720.0),
-            &observed,
+            &onscreen,
+            &all,
+            CGPoint::new(740.0, 560.0),
+            TOL,
+        ) {
+            Err(BotError::WindowChanged { reason }) => {
+                assert_eq!(reason, REASON_WID_GONE, "WID reuse must surface as gone");
+            }
+            other => panic!("expected WindowChanged{{wid_gone}}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_inner_on_hidden_space() {
+        // (WID, PID) present in `all` but missing from `onscreen` —
+        // RoK is running but on a hidden Space, minimized to Dock, or
+        // in a transient WindowServer state. AX press would return
+        // kAXErrorFailure (-25200) against this window, so we must
+        // fail fast with a distinct reason that tells the operator
+        // to switch Spaces rather than restart RoK.
+        let all = [snap(42, 100.0, 200.0, 1280.0, 720.0)];
+        let onscreen: [WindowSnapshot; 0] = [];
+        match validate_inner(
+            42,
+            ROK_PID,
+            rect(100.0, 200.0, 1280.0, 720.0),
+            &onscreen,
+            &all,
+            CGPoint::new(740.0, 560.0),
+            TOL,
+        ) {
+            Err(BotError::WindowChanged { reason }) => {
+                assert_eq!(reason, REASON_NOT_VISIBLE);
+            }
+            other => panic!("expected WindowChanged{{not_visible}}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_inner_frame_moved_origin() {
+        // RoK still (WID 42, ROK_PID) but moved 100 points right
+        // between discovery and re-check.
+        let onscreen = [snap(42, 200.0, 200.0, 1280.0, 720.0)];
+        let all = onscreen.clone();
+        match validate_inner(
+            42,
+            ROK_PID,
+            rect(100.0, 200.0, 1280.0, 720.0),
+            &onscreen,
+            &all,
             CGPoint::new(740.0, 560.0),
             TOL,
         ) {
@@ -680,13 +884,16 @@ mod tests {
 
     #[test]
     fn validate_inner_frame_moved_size() {
-        // RoK still WID 42, origin unchanged, but window resized by 50pt
-        // in width. Caught as frame_moved.
-        let observed = [snap(42, 100.0, 200.0, 1330.0, 720.0)];
+        // RoK still (WID 42, ROK_PID), origin unchanged, but window
+        // resized by 50pt in width. Caught as frame_moved.
+        let onscreen = [snap(42, 100.0, 200.0, 1330.0, 720.0)];
+        let all = onscreen.clone();
         match validate_inner(
             42,
+            ROK_PID,
             rect(100.0, 200.0, 1280.0, 720.0),
-            &observed,
+            &onscreen,
+            &all,
             CGPoint::new(740.0, 560.0),
             TOL,
         ) {
@@ -701,11 +908,14 @@ mod tests {
     fn validate_inner_frame_within_tolerance_passes() {
         // Sub-pixel jitter (0.5pt) is below the 1.0 tolerance and must
         // NOT fire frame_moved. Pin so future tightening is intentional.
-        let observed = [snap(42, 100.5, 200.0, 1280.0, 720.5)];
+        let onscreen = [snap(42, 100.5, 200.0, 1280.0, 720.5)];
+        let all = onscreen.clone();
         let result = validate_inner(
             42,
+            ROK_PID,
             rect(100.0, 200.0, 1280.0, 720.0),
-            &observed,
+            &onscreen,
+            &all,
             CGPoint::new(740.0, 560.0),
             TOL,
         );
@@ -716,68 +926,56 @@ mod tests {
     }
 
     #[test]
-    fn validate_inner_not_topmost_when_overlay_above_rok() {
-        // Z-order is front-to-back, so observed[0] is on top. Overlay WID
-        // 99 covers the click point; RoK WID 42 is below at the same
-        // frame. Topmost-at-point is 99, not 42.
-        let observed = [
+    fn validate_inner_point_outside_frame() {
+        // (WID, PID) match, frame match, but the requested click point
+        // falls outside the discovered frame. Pre-v0.1.5 this was
+        // caught accidentally by the topmost walk (no window contains
+        // the point → not-topmost); the v0.1.5 pipeline drops topmost
+        // and makes the bounds check explicit. Catches operator-side
+        // coord math bugs before they reach the AX layer.
+        let onscreen = [snap(42, 100.0, 200.0, 1280.0, 720.0)];
+        let all = onscreen.clone();
+        match validate_inner(
+            42,
+            ROK_PID,
+            rect(100.0, 200.0, 1280.0, 720.0),
+            &onscreen,
+            &all,
+            CGPoint::new(5000.0, 5000.0), // far outside RoK's frame
+            TOL,
+        ) {
+            Err(BotError::WindowChanged { reason }) => {
+                assert_eq!(reason, REASON_POINT_OUTSIDE_FRAME);
+            }
+            other => panic!("expected WindowChanged{{point_outside_frame}}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_inner_overlay_on_top_now_passes() {
+        // Pre-v0.1.5 this fired REASON_NOT_TOPMOST. v0.1.5 drops the
+        // topmost walk: kAXPressAction delivers to Catalyst Bridge
+        // apps even when another window is z-order topmost at the
+        // click point (verified empirically in p5-spike — see
+        // `learnings/ax-press-works-catalyst`). The overlay scenario
+        // is now a happy path.
+        let onscreen = [
             snap(99, 700.0, 500.0, 200.0, 200.0),  // overlay covers click
             snap(42, 100.0, 200.0, 1280.0, 720.0), // RoK below
         ];
-        match validate_inner(
-            42,
-            rect(100.0, 200.0, 1280.0, 720.0),
-            &observed,
-            CGPoint::new(740.0, 560.0),
-            TOL,
-        ) {
-            Err(BotError::WindowChanged { reason }) => {
-                assert_eq!(reason, REASON_NOT_TOPMOST);
-            }
-            other => panic!("expected WindowChanged{{not_topmost}}, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn validate_inner_not_topmost_when_no_window_covers_click_point() {
-        // Click coords land off-screen (no window's frame contains the
-        // point). Treated as not-topmost: posting there would land on
-        // empty desktop or whatever's revealed.
-        let observed = [snap(42, 100.0, 200.0, 1280.0, 720.0)];
-        match validate_inner(
-            42,
-            rect(100.0, 200.0, 1280.0, 720.0),
-            &observed,
-            CGPoint::new(5000.0, 5000.0), // way outside RoK's frame
-            TOL,
-        ) {
-            Err(BotError::WindowChanged { reason }) => {
-                assert_eq!(reason, REASON_NOT_TOPMOST);
-            }
-            other => panic!("expected WindowChanged{{not_topmost}}, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn validate_inner_topmost_when_overlay_does_not_cover_click_point() {
-        // Overlay exists above RoK but at a different region (e.g., menu
-        // bar item, top-right notification banner that doesn't cover the
-        // center of the RoK window). RoK is still topmost at the click
-        // point itself. Should pass.
-        let observed = [
-            snap(99, 0.0, 0.0, 200.0, 30.0), // top-left overlay, doesn't cover click
-            snap(42, 100.0, 200.0, 1280.0, 720.0),
-        ];
+        let all = onscreen.clone();
         let result = validate_inner(
             42,
+            ROK_PID,
             rect(100.0, 200.0, 1280.0, 720.0),
-            &observed,
-            CGPoint::new(740.0, 560.0), // RoK center
+            &onscreen,
+            &all,
+            CGPoint::new(740.0, 560.0),
             TOL,
         );
         assert!(
             result.is_ok(),
-            "overlay outside click region must pass: {result:?}"
+            "v0.1.5 AX-on-Catalyst makes z-order overlap a non-issue: {result:?}"
         );
     }
 
@@ -787,11 +985,14 @@ mod tests {
         // at (-1051, 103) size 1051x820. Click at center (-525.5, 513).
         // Negative-origin coords are valid CG global coords; the
         // contains-point math must handle them without sign confusion.
-        let observed = [snap(73313, -1051.0, 103.0, 1051.0, 820.0)];
+        let onscreen = [snap(73313, -1051.0, 103.0, 1051.0, 820.0)];
+        let all = onscreen.clone();
         let result = validate_inner(
             73313,
+            ROK_PID,
             rect(-1051.0, 103.0, 1051.0, 820.0),
-            &observed,
+            &onscreen,
+            &all,
             CGPoint::new(-525.5, 513.0),
             TOL,
         );
@@ -802,18 +1003,21 @@ mod tests {
     }
 
     #[test]
-    fn validate_inner_check_order_is_wid_then_frame_then_topmost() {
-        // Pin first-failure-wins precedence: if WID is gone AND frame
-        // would have moved AND topmost would have failed, we must report
-        // WID_GONE because it's the most diagnostic for the operator.
-        // This test exercises only the WID-gone leg (the others can't
-        // be checked without WID present), but documents the ordering.
-        let observed = [snap(99, 999.0, 999.0, 1.0, 1.0)];
+    fn validate_inner_check_order_wid_then_visible_then_frame_then_point() {
+        // Pin first-failure-wins precedence by exercising the WID-gone
+        // leg with conditions that would also have tripped checks
+        // 2-4. WID is not in `all` AND not in `onscreen` AND frame
+        // would have moved AND point would have been outside — the
+        // most diagnostic reason (WID gone) wins.
+        let all: [WindowSnapshot; 0] = [];
+        let onscreen: [WindowSnapshot; 0] = [];
         match validate_inner(
             42,
+            ROK_PID,
             rect(100.0, 200.0, 1280.0, 720.0),
-            &observed,
-            CGPoint::new(740.0, 560.0),
+            &onscreen,
+            &all,
+            CGPoint::new(99999.0, 99999.0),
             TOL,
         ) {
             Err(BotError::WindowChanged { reason }) => {
@@ -823,24 +1027,67 @@ mod tests {
         }
     }
 
-    // ---------- validate_present_inner (v0.1.4 post-capture TOCTOU subset) ----------
+    #[test]
+    fn validate_inner_not_visible_beats_frame_moved() {
+        // Second-tier precedence: NOT_VISIBLE fires before FRAME_MOVED.
+        // (WID, PID) present in `all` but the `all` entry has a
+        // drifted frame; not present in `onscreen`. The hidden-Space
+        // reason is the more actionable diagnostic ("switch Spaces"
+        // vs "RoK moved") so it wins.
+        let all = [snap(42, 999.0, 999.0, 1280.0, 720.0)]; // far from expected
+        let onscreen: [WindowSnapshot; 0] = [];
+        match validate_inner(
+            42,
+            ROK_PID,
+            rect(100.0, 200.0, 1280.0, 720.0),
+            &onscreen,
+            &all,
+            CGPoint::new(740.0, 560.0),
+            TOL,
+        ) {
+            Err(BotError::WindowChanged { reason }) => {
+                assert_eq!(
+                    reason, REASON_NOT_VISIBLE,
+                    "NOT_VISIBLE must beat FRAME_MOVED"
+                );
+            }
+            other => panic!("expected WindowChanged{{not_visible}}, got {other:?}"),
+        }
+    }
+
+    // ---------- validate_present_inner (v0.1.5 post-capture, 3-check) ----------
 
     #[test]
-    fn validate_present_inner_passes_when_wid_present_and_frame_within_tolerance() {
-        // Happy path: same WID, frame jitter under tolerance. The
-        // 2-check sibling deliberately does NOT consider topmost-at-
-        // click, so we don't pass a click point — the function signature
-        // makes the dropped invariant unrepresentable.
-        let observed = [snap(42, 100.0, 200.0, 1280.0, 720.0)];
-        let result = validate_present_inner(42, rect(100.0, 200.0, 1280.0, 720.0), &observed, TOL);
+    fn validate_present_inner_passes_when_wid_pid_present_and_frame_within_tolerance() {
+        // Happy path: (WID, PID) in both lists, frame jitter under
+        // tolerance. No click point because the post-capture path is
+        // capture-only — the function signature makes that explicit.
+        let onscreen = [snap(42, 100.0, 200.0, 1280.0, 720.0)];
+        let all = onscreen.clone();
+        let result = validate_present_inner(
+            42,
+            ROK_PID,
+            rect(100.0, 200.0, 1280.0, 720.0),
+            &onscreen,
+            &all,
+            TOL,
+        );
         assert!(result.is_ok(), "happy path must succeed: {result:?}");
     }
 
     #[test]
     fn validate_present_inner_wid_gone() {
         // RoK closed/crashed between click and post-capture.
-        let observed = [snap(99, 0.0, 0.0, 1920.0, 1080.0)];
-        match validate_present_inner(42, rect(100.0, 200.0, 1280.0, 720.0), &observed, TOL) {
+        let all = [snap(99, 0.0, 0.0, 1920.0, 1080.0)];
+        let onscreen = all.clone();
+        match validate_present_inner(
+            42,
+            ROK_PID,
+            rect(100.0, 200.0, 1280.0, 720.0),
+            &onscreen,
+            &all,
+            TOL,
+        ) {
             Err(BotError::WindowChanged { reason }) => {
                 assert_eq!(reason, REASON_WID_GONE);
             }
@@ -849,12 +1096,66 @@ mod tests {
     }
 
     #[test]
+    fn validate_present_inner_wid_reused_wrong_pid() {
+        // WID 42 was reused by an unrelated process between click and
+        // post-capture. Without the PID anchor, the post-capture would
+        // `screencapture -l 42` against the wrong window — pixel-diff
+        // would compare RoK's pre-capture against an unrelated window
+        // and false-positive on every pixel.
+        let all = [snap_pid(42, OTHER_PID, 100.0, 200.0, 1280.0, 720.0)];
+        let onscreen = all.clone();
+        match validate_present_inner(
+            42,
+            ROK_PID,
+            rect(100.0, 200.0, 1280.0, 720.0),
+            &onscreen,
+            &all,
+            TOL,
+        ) {
+            Err(BotError::WindowChanged { reason }) => {
+                assert_eq!(reason, REASON_WID_GONE);
+            }
+            other => panic!("expected WindowChanged{{wid_gone}}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_present_inner_on_hidden_space() {
+        // RoK got hidden between click and post-capture (Space switch,
+        // minimize, or fullscreen-from-another-app). Post-capture
+        // `screencapture -l` against a hidden-Space window typically
+        // returns blank or stale pixels; failing fast here keeps
+        // pixel-diff from drawing a wrong conclusion.
+        let all = [snap(42, 100.0, 200.0, 1280.0, 720.0)];
+        let onscreen: [WindowSnapshot; 0] = [];
+        match validate_present_inner(
+            42,
+            ROK_PID,
+            rect(100.0, 200.0, 1280.0, 720.0),
+            &onscreen,
+            &all,
+            TOL,
+        ) {
+            Err(BotError::WindowChanged { reason }) => {
+                assert_eq!(reason, REASON_NOT_VISIBLE);
+            }
+            other => panic!("expected WindowChanged{{not_visible}}, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn validate_present_inner_frame_moved_origin() {
         // RoK still WID 42 but moved 100pt between click and post-capture.
-        // Post-capture would be misaligned vs pre — pixel-diff would
-        // false-positive on virtually every pixel.
-        let observed = [snap(42, 200.0, 200.0, 1280.0, 720.0)];
-        match validate_present_inner(42, rect(100.0, 200.0, 1280.0, 720.0), &observed, TOL) {
+        let onscreen = [snap(42, 200.0, 200.0, 1280.0, 720.0)];
+        let all = onscreen.clone();
+        match validate_present_inner(
+            42,
+            ROK_PID,
+            rect(100.0, 200.0, 1280.0, 720.0),
+            &onscreen,
+            &all,
+            TOL,
+        ) {
             Err(BotError::WindowChanged { reason }) => {
                 assert_eq!(reason, REASON_FRAME_MOVED);
             }
@@ -864,10 +1165,17 @@ mod tests {
 
     #[test]
     fn validate_present_inner_frame_moved_size() {
-        // Window resized by 50pt in width mid-flow; same WID, different
-        // frame.
-        let observed = [snap(42, 100.0, 200.0, 1330.0, 720.0)];
-        match validate_present_inner(42, rect(100.0, 200.0, 1280.0, 720.0), &observed, TOL) {
+        // Window resized by 50pt in width mid-flow.
+        let onscreen = [snap(42, 100.0, 200.0, 1330.0, 720.0)];
+        let all = onscreen.clone();
+        match validate_present_inner(
+            42,
+            ROK_PID,
+            rect(100.0, 200.0, 1280.0, 720.0),
+            &onscreen,
+            &all,
+            TOL,
+        ) {
             Err(BotError::WindowChanged { reason }) => {
                 assert_eq!(reason, REASON_FRAME_MOVED);
             }
@@ -877,27 +1185,43 @@ mod tests {
 
     #[test]
     fn validate_present_inner_passes_with_overlay_on_top() {
-        // The structural difference from validate_inner: an overlay
-        // (WID 99, on top in z-order) covering the click point would
-        // fire REASON_NOT_TOPMOST in the 3-check variant. The 2-check
-        // sibling MUST pass this — it's the whole reason for the split
-        // (post-click overlays/modals are legitimate state changes).
-        let observed = [
+        // Click spawned a modal/overlay that's now z-order topmost.
+        // Both the overlay and RoK are in `onscreen`; RoK's (WID, PID)
+        // is found. v0.1.5 doesn't check topmost anywhere, so this is
+        // unambiguously a happy path — preserved from v0.1.4 where it
+        // was the post-capture pipeline's distinguishing test.
+        let onscreen = [
             snap(99, 700.0, 500.0, 200.0, 200.0), // overlay (e.g. modal spawned by click)
             snap(42, 100.0, 200.0, 1280.0, 720.0), // RoK below
         ];
-        let result = validate_present_inner(42, rect(100.0, 200.0, 1280.0, 720.0), &observed, TOL);
+        let all = onscreen.clone();
+        let result = validate_present_inner(
+            42,
+            ROK_PID,
+            rect(100.0, 200.0, 1280.0, 720.0),
+            &onscreen,
+            &all,
+            TOL,
+        );
         assert!(
             result.is_ok(),
-            "overlay above RoK must NOT fire WindowChanged in the 2-check sibling: {result:?}"
+            "overlay above RoK must NOT fire WindowChanged: {result:?}"
         );
     }
 
     #[test]
     fn validate_present_inner_frame_within_tolerance_passes() {
         // Sub-pixel jitter under the 1.0 tolerance must NOT fire frame_moved.
-        let observed = [snap(42, 100.5, 200.0, 1280.0, 720.5)];
-        let result = validate_present_inner(42, rect(100.0, 200.0, 1280.0, 720.0), &observed, TOL);
+        let onscreen = [snap(42, 100.5, 200.0, 1280.0, 720.5)];
+        let all = onscreen.clone();
+        let result = validate_present_inner(
+            42,
+            ROK_PID,
+            rect(100.0, 200.0, 1280.0, 720.0),
+            &onscreen,
+            &all,
+            TOL,
+        );
         assert!(
             result.is_ok(),
             "0.5pt jitter must pass under 1.0pt tolerance: {result:?}"
@@ -943,12 +1267,18 @@ mod tests {
         // pattern-matching on the error message.
         assert_eq!(REASON_WID_GONE, "window_id_gone");
         assert_eq!(REASON_FRAME_MOVED, "frame_moved");
-        assert_eq!(REASON_NOT_TOPMOST, "not_topmost_at_click");
+        assert_eq!(REASON_NOT_VISIBLE, "not_visible");
+        assert_eq!(REASON_POINT_OUTSIDE_FRAME, "point_outside_frame");
     }
 
     #[test]
     fn window_change_maps_to_exit_19() {
-        for reason in [REASON_WID_GONE, REASON_FRAME_MOVED, REASON_NOT_TOPMOST] {
+        for reason in [
+            REASON_WID_GONE,
+            REASON_FRAME_MOVED,
+            REASON_NOT_VISIBLE,
+            REASON_POINT_OUTSIDE_FRAME,
+        ] {
             let err = BotError::WindowChanged { reason };
             assert_eq!(err.exit_code(), 19, "reason {reason} must map to exit 19");
         }
