@@ -102,12 +102,28 @@ pub const VERIFY_DELAY_MS: u64 = 500;
 /// `PIXEL_DIFF_REJECT_THRESHOLD`") for the calibration approach.
 pub const PIXEL_DIFF_REJECT_THRESHOLD: u64 = 1000;
 
-/// Reason tag surfaced via `BotError::ClickNotVerified { reason }`. v0.1.4
-/// ships ONE reason tag after /plan-eng-review Outside Voice F2 forced
-/// dropping the originally-planned `match_stable` failure path. Pinned as
-/// `&'static str` so operator-facing log lines and shell pattern-matchers
+/// Reason tags surfaced via `BotError::ClickNotVerified { reason }`. Pinned
+/// as `&'static str` so operator-facing log lines and shell pattern-matchers
 /// see one of these exact values.
+///
+/// `REASON_SCREEN_UNCHANGED` is the common case: pre/post captures decoded
+/// successfully, dims matched, and pixel-diff fell below the threshold —
+/// RoK did not visibly react. /plan-eng-review Outside Voice F2 forced
+/// dropping the originally-planned `match_stable` tag (mis-flagged
+/// stays-visible buttons).
+///
+/// `REASON_DIM_MISMATCH` fires when the pre and post captures decode to
+/// `GrayImage`s with different dimensions. The verify gate has no
+/// meaningful comparison to make in this state: pixel-diff over differently
+/// shaped buffers is undefined, and the dim mismatch itself is evidence
+/// the capture pipeline state-changed between pre and post (display DPI
+/// reconfig mid-flow, RoK toggled fullscreen-borderless, screencapture
+/// padded to a different size). Adversarial review caught a fail-open
+/// path where the dim-mismatch sentinel passed verdict; this tag closes
+/// it. Operator sees exit 20 with a reason that points at the capture
+/// pipeline, not at the click.
 pub const REASON_SCREEN_UNCHANGED: &str = "screen_unchanged";
+pub const REASON_DIM_MISMATCH: &str = "dim_mismatch";
 
 /// Pure: count Luma8 pixels where `a` and `b` differ.
 ///
@@ -173,6 +189,27 @@ pub const fn verdict_from_pixel_diff(diff: u64) -> Result<()> {
 pub fn after_state(pre_path: &Path, post_path: &Path, pre_match: &Match) -> Result<()> {
     let pre = load_haystack(pre_path)?;
     let post = load_haystack(post_path)?;
+
+    // Fail-closed on dim mismatch. pixel_diff has a u64::MAX sentinel for
+    // this case, but routing it through verdict_from_pixel_diff produces
+    // Ok (sentinel > threshold) — which silently passes verify on a
+    // capture-pipeline integrity drift. Adversarial review caught this as
+    // a fail-open defect; explicit check here closes it with a distinct
+    // reason tag the operator can diagnose against.
+    if pre.dimensions() != post.dimensions() {
+        tracing::warn!(
+            target: "rok_bot",
+            pre_dims = ?pre.dimensions(),
+            post_dims = ?post.dimensions(),
+            "after-state dim mismatch — capture pipeline state changed between \
+             pre and post (display reconfig, fullscreen toggle, screencapture \
+             padding); verify cannot meaningfully compare"
+        );
+        return Err(BotError::ClickNotVerified {
+            reason: REASON_DIM_MISMATCH,
+        });
+    }
+
     let diff = pixel_diff(&pre, &post);
 
     tracing::info!(
@@ -214,9 +251,20 @@ fn log_post_match_diagnostic(post_path: &Path, pre_match: &Match) {
             );
         }
         Ok(None) => {
+            // Earlier draft logged this as "strong positive signal (target gone)"
+            // but adversarial review noted the same line fires when the matched
+            // button visually darkens/depresses post-click: the highlight
+            // transition can drop the NCC score below MATCH_THRESHOLD, surfacing
+            // as Ok(None) even though the target is still on screen. The
+            // operator reading the log would mis-diagnose "view toggled" when
+            // really "button-press highlight transition." Reword to surface the
+            // ambiguity rather than over-promising.
             tracing::info!(
                 target: "rok_bot",
-                "post-match diagnostic: target gone (strong positive signal)"
+                "post-match diagnostic: target absent or scored below MATCH_THRESHOLD \
+                 (could be a real state change, OR a button-press / highlight \
+                 transition that dropped the NCC score; verify via image inspection \
+                 of rok-capture-post.png if uncertain)"
             );
         }
         Err(err) => {
@@ -467,6 +515,36 @@ mod tests {
             result.is_ok(),
             "captures differing by ~2000 pixels must pass verify: {result:?}"
         );
+    }
+
+    #[test]
+    fn after_state_returns_dim_mismatch_when_pre_post_dimensions_differ() {
+        // Adversarial review of v0.1.4 caught a fail-open path: pixel_diff
+        // returns u64::MAX on dim mismatch, and verdict_from_pixel_diff
+        // passes on u64::MAX (sentinel > threshold). Without the explicit
+        // dim check in after_state, dimension-changing capture-pipeline
+        // drift (display reconfig, fullscreen toggle, screencapture
+        // padding) silently passes verify. This test pins the fail-closed
+        // path: write two synthetic PNGs at different dimensions and
+        // assert the dim_mismatch reason tag surfaces.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pre_path = dir.path().join("pre.png");
+        let post_path = dir.path().join("post.png");
+
+        write_luma_as_rgba_png(&flat_luma(120, 100, 0), &pre_path);
+        write_luma_as_rgba_png(&flat_luma(120, 99, 0), &post_path); // height differs
+
+        match after_state(&pre_path, &post_path, &dummy_match((120, 100))) {
+            Err(BotError::ClickNotVerified { reason }) => {
+                assert_eq!(
+                    reason, REASON_DIM_MISMATCH,
+                    "dim mismatch must surface as dim_mismatch reason, not screen_unchanged"
+                );
+            }
+            other => {
+                panic!("expected ClickNotVerified{{dim_mismatch}} on dim mismatch, got {other:?}")
+            }
+        }
     }
 
     #[test]

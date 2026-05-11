@@ -119,16 +119,30 @@ pub enum BotError {
     /// post-click captures of the RoK window are pixel-identical within
     /// `verify::PIXEL_DIFF_REJECT_THRESHOLD`. RoK did not visibly react.
     ///
-    /// v0.1.4 ships ONE reason tag (`"screen_unchanged"`) per Outside
-    /// Voice F2 from /plan-eng-review: the originally-planned second tag
-    /// (`"match_stable"` — post re-match shows target at same coords/score)
-    /// would mis-flag legitimate clicks on RoK buttons that stay visible
-    /// after click (dropdowns, tabs, selections). Pixel-diff is the only
-    /// gate. The re-match runs inside `verify::after_state` but logs
-    /// diagnostics only — it does not drive this variant.
+    /// v0.1.4 ships two reason tags:
     ///
-    /// Common causes (operator's diagnostic checklist):
+    /// - `"screen_unchanged"` — the common case. Pre and post captures
+    ///   decoded successfully, dims matched, but pixel-diff fell below
+    ///   `verify::PIXEL_DIFF_REJECT_THRESHOLD`. RoK did not visibly react.
+    ///   Outside Voice F2 from /plan-eng-review forced dropping the
+    ///   originally-planned third tag (`"match_stable"` — post re-match
+    ///   shows target at same coords/score), because it mis-flagged
+    ///   legitimate clicks on RoK buttons that stay visible after click
+    ///   (dropdowns, tabs, selections). Pixel-diff is the gate; the
+    ///   re-match runs inside `verify::after_state` but logs diagnostics
+    ///   only.
+    /// - `"dim_mismatch"` — added in response to adversarial review of
+    ///   v0.1.4. Pre and post captures decoded to `GrayImage`s with
+    ///   different dimensions, so pixel-diff has nothing meaningful to
+    ///   compare. Fires when the capture pipeline state-changed between
+    ///   pre and post (display DPI reconfig, RoK fullscreen-borderless
+    ///   toggle, screencapture padded to a different size). The verify
+    ///   gate fails closed here rather than passing on the `u64::MAX`
+    ///   sentinel from `pixel_diff`.
     ///
+    /// Common causes by reason tag (operator's diagnostic checklist):
+    ///
+    /// **`screen_unchanged`:**
     /// - Target image is stale (asset rot — RoK shipped a UI update that
     ///   shifted the matched element's pixel rendering by more than the
     ///   matcher's tolerance, so the click landed on empty space).
@@ -143,19 +157,30 @@ pub enum BotError {
     ///   and the post-capture (rare — `VERIFY_DELAY_MS` gives 2× typical
     ///   transition margin).
     ///
+    /// **`dim_mismatch`:**
+    /// - Operator changed display DPI / Scaled-resolution between
+    ///   pre-capture and post-capture.
+    /// - RoK toggled fullscreen-borderless mid-flow (frame stays within
+    ///   tolerance but internal content area changed).
+    /// - Display arrangement reconfig (BetterDisplay reconnect, external
+    ///   monitor hot-plug) altered the capture's backing pixel grid.
+    /// - Capture-pipeline integrity drift (`screencapture` chose a
+    ///   different output mode for the two calls).
+    ///
     /// **Not** a cause covered by this variant: server-bound clicks
     /// (resource spend, troop dispatch, server sync) that show a 1-3s UI
-    /// spinner before state changes render. Those fire this variant
+    /// spinner before state changes render. Those fire `screen_unchanged`
     /// despite the click landing correctly — v0.1.4 scope is UI-local
     /// only. See TODOS.md P2 "v0.1.4+ — server-roundtrip click verify"
     /// for the retry-and-poll path that fixes them.
     #[error(
-        "synthetic click posted but RoK did not visibly react in pixel space \
-         (reason: {reason}). The click event reached the HID tap, but pixel-space \
-         comparison of the pre- and post-click captures shows no change above \
-         threshold. Common causes: stale target image (asset rot), Accessibility \
-         silently revoked, non-interactive element, RoK frozen, or click landed \
-         in a server-bound state still loading (TODOS P2)."
+        "synthetic click posted but post-state verify failed (reason: {reason}). \
+         The click event reached the HID tap. For reason='screen_unchanged': \
+         pre/post pixel-space comparison shows no change above threshold \
+         (stale target, AX revoked, non-interactive element, RoK frozen, or \
+         server-bound click still loading per TODOS P2). For reason='dim_mismatch': \
+         pre/post captures have different dimensions, indicating capture-pipeline \
+         state changed between calls (display reconfig, fullscreen toggle, etc.)."
     )]
     ClickNotVerified { reason: &'static str },
 }
@@ -185,7 +210,7 @@ pub type Result<T> = std::result::Result<T, BotError>;
 mod tests {
     use super::*;
     use crate::click::{REASON_DOWN, REASON_SOURCE, REASON_UP};
-    use crate::verify::REASON_SCREEN_UNCHANGED;
+    use crate::verify::{REASON_DIM_MISMATCH, REASON_SCREEN_UNCHANGED};
 
     #[test]
     fn exit_codes_are_stable_and_unique() {
@@ -301,18 +326,24 @@ mod tests {
                 "WindowChanged({reason}) must map to exit 19"
             );
         }
-        // ClickNotVerified has ONE documented reason tag after the
-        // /plan-eng-review Outside Voice reversal dropped match_stable.
-        // Pin via the verify-module constant so a future rename of the
-        // tag is forced through both gates (here and verify.rs).
-        assert_eq!(
-            BotError::ClickNotVerified {
-                reason: REASON_SCREEN_UNCHANGED,
-            }
-            .exit_code(),
-            20,
-            "ClickNotVerified({REASON_SCREEN_UNCHANGED}) must map to exit 20"
-        );
+        // ClickNotVerified has TWO documented reason tags. The first
+        // (screen_unchanged) is the common-case pixel-diff failure;
+        // the second (dim_mismatch) closes a fail-open path adversarial
+        // review caught during /review of v0.1.4 (pixel_diff's u64::MAX
+        // sentinel was passing verdict on capture-pipeline integrity
+        // drift). /plan-eng-review's D7 dropped match_stable; the
+        // dim_mismatch addition is a fail-closed correction, not a
+        // walk-back of that decision (match_stable mis-flagged valid
+        // clicks; dim_mismatch surfaces a real capture-pipeline state
+        // change). Pin via the verify-module constants so a future
+        // rename is forced through both gates (here and verify.rs).
+        for reason in [REASON_SCREEN_UNCHANGED, REASON_DIM_MISMATCH] {
+            assert_eq!(
+                BotError::ClickNotVerified { reason }.exit_code(),
+                20,
+                "ClickNotVerified({reason}) must map to exit 20"
+            );
+        }
     }
 
     #[test]
@@ -402,29 +433,29 @@ mod tests {
     }
 
     #[test]
-    fn click_not_verified_message_includes_reason_and_pixel_space() {
-        // Operator's first instinct on ClickNotVerified is "what does
-        // pixel-space mean and which gate fired?" The reason tag must
-        // surface so the log lands on the right diagnostic, and the
-        // "pixel space" phrasing must appear so the message is
+    fn click_not_verified_message_includes_reason_and_post_state_phrasing() {
+        // Operator's first instinct on ClickNotVerified is "which gate
+        // fired?" The reason tag must surface in Display output so the
+        // operator's log line lands on the right diagnostic. The
+        // "post-state verify" phrasing must appear so the message is
         // semantically distinguishable from ClickFailed (creation-time
         // CGEvent failure, different exit code, different fix path).
-        // Using the verify-module constant rather than a literal pins
+        // Using the verify-module constants rather than literals pins
         // the test to the same string-of-truth the runtime emits.
-        let err = BotError::ClickNotVerified {
-            reason: REASON_SCREEN_UNCHANGED,
-        };
-        let msg = err.to_string();
-        assert!(
-            msg.contains(REASON_SCREEN_UNCHANGED),
-            "ClickNotVerified Display must include the reason tag: {msg}"
-        );
-        let lower = msg.to_lowercase();
-        assert!(
-            lower.contains("pixel space"),
-            "ClickNotVerified Display must reference 'pixel space' to distinguish \
-             from ClickFailed: {msg}"
-        );
+        for reason in [REASON_SCREEN_UNCHANGED, REASON_DIM_MISMATCH] {
+            let err = BotError::ClickNotVerified { reason };
+            let msg = err.to_string();
+            assert!(
+                msg.contains(reason),
+                "ClickNotVerified Display must include the reason tag '{reason}': {msg}"
+            );
+            let lower = msg.to_lowercase();
+            assert!(
+                lower.contains("post-state verify"),
+                "ClickNotVerified Display must reference 'post-state verify' to \
+                 distinguish from ClickFailed: {msg}"
+            );
+        }
     }
 
     #[test]
