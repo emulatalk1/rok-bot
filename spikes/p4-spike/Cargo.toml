@@ -1,0 +1,21 @@
+[package]
+name = "p4-spike"
+version = "0.0.1"
+edition = "2024"
+publish = false
+description = "v0.1.5 Phase 0 spike — verify CGEventPostToPid delivers to RoK (iOS-on-Mac Catalyst Bridge) regardless of window stacking"
+
+# Detach from the parent rok-bot Cargo project, same as p3-spike. Throwaway
+# binary with its own Cargo.lock and dep tree.
+[workspace]
+
+[dependencies]
+# `elcapitan` feature gates CGEvent::post_to_pid (the entire point of this spike).
+# El Capitan = macOS 10.11; we target Sequoia 15+. Always available for us.
+core-graphics   = { version = "0.25", features = ["elcapitan"] }
+core-foundation = "0.10"
+libc            = "0.2"
+
+[[bin]]
+name = "p4-spike"
+path = "src/main.rs"

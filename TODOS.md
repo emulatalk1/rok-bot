@@ -4,6 +4,43 @@ Items deferred from planning sessions. Each entry should be self-contained enoug
 
 ---
 
+## ❌ DEAD — `CGEventPostToPid` migration for screen-position-independent clicks
+
+**Source:** live-smoke 2026-05-11 (exit 19 `not_topmost_at_click` whenever RoK
+was positioned such that another window covered the click point on screen),
+spike `spikes/p4-spike/`
+**Verdict:** Catalyst Bridge silently drops PID-posted events.
+
+The hope was that `CGEvent::post_to_pid(pid)` would deliver clicks to RoK's
+process queue, bypassing screen-pixel-level z-order dispatch entirely and
+making the v0.1.4 TOCTOU topmost-at-click check unnecessary. Empirical
+result (see spike README): the call returns success and the event is
+constructed correctly, but RoK's AppKit→UIKit Catalyst translation layer
+drops the event somewhere. Zero observable change at the click point (so
+NOT screen-routed to iTerm either), zero observable change inside RoK
+above the ambient animation noise floor.
+
+Implication: the screen-pixel dependency of v0.1.3's click-delivery is
+NOT fixable at the click-delivery layer for iOS-on-Mac apps. The two
+viable paths are:
+
+1. **Mode 1 production model:** activate RoK before each click. Bot
+   keeps grabbing foreground; user can't do other work in parallel. Add
+   a `NSRunningApplication::activate` (or equivalent) call to `click_at`
+   immediately before posting. Documented behavior; matches existing
+   exit-19 guidance ("re-run when RoK is foreground and stable").
+2. **Mode 2 (deferred to v0.2):** virtual-display isolation. RoK on a
+   BetterDisplay virtual display where no other windows ever live. Screen
+   dispatch and z-order topmost both become trivially correct because
+   nothing can occlude RoK. This is what Mode 2 was always going to do
+   and the spike result confirms it's the right path.
+
+Do not re-investigate `CGEventPostToPid` without first reading the spike
+README — there's no second pass that produces a different result on
+Catalyst Bridge apps until Apple changes the bridge implementation.
+
+---
+
 ## ✅ DONE — BetterDisplay setup automation
 
 **Resolved 2026-05-06** via `docs/setup.md` (commit `f8ba718`). Covers Mode 1 (zero
