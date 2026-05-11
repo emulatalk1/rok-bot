@@ -49,20 +49,15 @@ The two-mode runtime contract design splits into two milestones per Codex tensio
 
 ---
 
-## P2 (partially done): TCC permissions preflight
+## ✅ DONE — TCC permissions preflight (Screen Recording + Accessibility)
 
 **Source:** /plan-eng-review codex tension 4
-**Status:** Screen Recording check ✅ DONE in v0.1 (`src/permissions.rs::check_screen_recording`). Uses the safe `core_graphics::access::ScreenCaptureAccess::preflight()` wrapper. After the /review pass at 76f9d41, also falls back to `request()` on first-run denial — without that, fresh-install Macs hit a permanent exit 13 with no UI to grant from. Returns `BotError::PermissionsMissing { which: "Screen Recording" }` (exit code 13).
+**Resolved:** v0.1 (Screen Recording) + v0.1.3 (Accessibility), `src/permissions.rs`.
 
-**Remaining: Accessibility check.**
-**Effort:** human ~1 hour / CC ~15 min
-**Depends on:** the synthetic-input milestone (first `CGEvent.post` call landing in src/)
+- **Screen Recording** via the safe `core_graphics::access::ScreenCaptureAccess::preflight()` wrapper. Falls back to `request()` on first-run denial — without that, fresh-install Macs hit a permanent exit 13 with no UI to grant from.
+- **Accessibility** via hand-rolled FFI to `AXIsProcessTrustedWithOptions(prompt=true)` (verified in `spikes/p3-spike/` before landing). `peek_accessibility()` exists for non-prompting probes. Required for `CGEventPost` at click site.
 
-The bot will need Accessibility once it starts injecting clicks. Approach when that milestone arrives:
-- Mirror the Screen Recording shape: a `check_accessibility()` in `src/permissions.rs` returning `BotError::PermissionsMissing { which: "Accessibility" }` on denial.
-- macOS API: `AXIsProcessTrustedWithOptions` (in `ApplicationServices`); the safe wrapper lives in the `accessibility-sys` crate or can be a tiny extern. Or call `CGRequestPostEventAccess()` (introduced macOS 10.15) which returns bool.
-- Update `docs/setup.md` with the Accessibility grant step alongside the existing Screen Recording note.
-- Wire the new check into `main.rs::run()` immediately after `check_screen_recording()`.
+Both surface `BotError::PermissionsMissing { which: "..." }` (exit 13). `docs/setup.md` covers both grants in the boot sequence.
 
 ---
 

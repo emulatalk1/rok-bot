@@ -4,27 +4,30 @@ Rust-based macOS automation experiment for Rise of Kingdoms on Apple Silicon. Pe
 
 ## Project status
 
-**v0.1.2 — Mode 1 (visible) + window capture + template matching.** Find the RoK main window via `CGWindowListCopyWindowInfo`, classify which display it lives on (built-in via `CGDisplayIsBuiltin` → `Mode::Visible`, anything else → `Mode::Virtual`), capture the window to `rok-capture.png` via `screencapture -l <wid>` CLI, then locate a known UI element inside the capture via `imageproc::match_template_parallel` (NCC sliding window). Exit 0 on match, 15 (`TargetNotFound`) below `MATCH_THRESHOLD = 0.85`. Mode::Virtual exits `RokNotOnPrimary` (12). Screen Recording preflight runs first (with first-install `request()` fallback). Bundle-ID anti-spoof check (`com.rok.ios.*` prefix) on the matched window. Haystack decode goes through `image::ImageReader` with `Limits` (8192×8192 cap) to refuse decompression-bomb PNGs. Exit codes: 10-17. No clicks or Mode 2 lifecycle yet — those are the next sub-milestones (v0.1.3 click + Accessibility preflight, v0.1.4 verify).
+**v0.1.4 — Mode 1 (visible) end-to-end click pipeline with after-state verification.** Find the RoK main window via `CGWindowListCopyWindowInfo` + bundle-ID anti-spoof (`com.rok.ios.*` prefix), classify which display it lives on (built-in via `CGDisplayIsBuiltin` → `Mode::Visible`, anything else → `Mode::Virtual` → exit 12), capture the window via `screencapture -l <wid>` CLI, locate a known UI element via `imageproc::match_template_parallel` (NCC sliding window, `MATCH_THRESHOLD = 0.85`), TOCTOU-validate the window at the click site (WID + frame + topmost), post a synthetic left-click at HID event-tap level via `CGEventPost(kCGHIDEventTap, ...)`, sleep `VERIFY_DELAY_MS = 500ms`, re-validate window presence (WID + frame, no topmost — a click may legitimately spawn a modal), re-capture to `rok-capture-post.png`, and verify the click changed the screen via pixel-diff over decoded Luma8 against `PIXEL_DIFF_REJECT_THRESHOLD = 1000` differing pixels. Below the threshold → exit 20 (`ClickNotVerified`). Preflights run before any of this: Screen Recording TCC (with first-install `request()` fallback), Accessibility TCC (required for `CGEventPost`). Haystack decode goes through `image::ImageReader` with `Limits` (8192×8192 cap) to refuse decompression-bomb PNGs. The placeholder needle in `assets/targets/city-button.png` carries a structural sentinel pattern (`[255, 0, 255, 0]` top-left luma + xorshift32 noise body); `matcher::needle_has_placeholder_sentinel` fail-closes BEFORE NCC runs so the bot can never synthetically click against a falsely-matched placeholder — a live-QA-caught safety brake (see `d2ce910`). Exit codes: 10-20. Next milestone is v0.2 continuous Mode 2 (drop the `Mode::Virtual` gate, loop capture+match+click+verify against RoK on a BetterDisplay virtual display).
 
 ## Project structure
 
 ```
 src/
 ├── main.rs          boot wiring + tracing init + structured exit codes
-├── error.rs         BotError taxonomy (8 variants, exit codes 10-17)
-├── permissions.rs   TCC Screen Recording preflight + first-run request fallback
-├── window.rs        CGWindowList wrapper, owner+title filter, bundle-ID anti-spoof
+├── error.rs         BotError taxonomy (11 variants, exit codes 10-20)
+├── permissions.rs   TCC Screen Recording + Accessibility preflight + first-run request fallback
+├── window.rs        CGWindowList wrapper, owner+title filter, bundle-ID anti-spoof, TOCTOU validators (v0.1.3 click-site + v0.1.4 post-click)
 ├── display.rs       CG-only Mode detection, mode_to_result mapping
 ├── capture.rs       screencapture CLI wrapper for window screenshot (v0.1.1)
-└── matcher.rs       NCC template matching via imageproc; load_haystack with Limits (v0.1.2)
+├── matcher.rs       NCC template matching via imageproc + placeholder-sentinel safety brake (v0.1.2 + v0.1.4)
+├── click.rs         synthetic left-click via CGEventPost at HID event-tap level (v0.1.3)
+└── verify.rs        after-state pixel-diff verification over decoded Luma8 (v0.1.4)
 assets/targets/
-└── city-button.png  embedded target needle (placeholder until first real RoK crop)
+└── city-button.png  embedded target needle (placeholder with sentinel pattern until first real RoK crop)
 docs/
 ├── setup.md                    user-facing setup guide (Mode 1 today, Mode 2 in v0.2)
-├── cargo_dependency_audit.md   pre-implementation pin audit (now partially superseded by Cargo.toml)
+├── cargo_dependency_audit.md   pre-implementation pin audit (superseded by Cargo.toml)
 └── rok_rust_bot_research.md    architecture research (pre-implementation)
 spikes/
 ├── p2-spike/        screen capture verification (uses Apple's screencapture CLI)
+├── p3-spike/        Rust CGEvent + CGEventPost path verification (v0.1.3 Phase 0)
 └── p7-spike/        Premise 7 verification (RoK auto-migrates across BD reconnect)
 TODOS.md             deferred work, organized by priority
 ```
@@ -33,7 +36,7 @@ TODOS.md             deferred work, organized by priority
 
 ```sh
 cargo build --release --locked
-cargo test --locked                                                   # 67 tests as of v0.1.2
+cargo test --locked                                                   # 136 tests as of v0.1.4 (137 in --release)
 cargo clippy --all-targets --all-features --locked -- -D warnings     # strict, mbrain-style
 cargo fmt --all -- --check
 ```
