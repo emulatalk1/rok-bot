@@ -2,18 +2,19 @@
 
 Rust-based macOS automation experiment for **Rise of Kingdoms** on Apple Silicon. Personal/learning project. Public so others can read the design choices, not because it's polished or supported.
 
-## Status: v0.1 — Mode 1 (visible) end-to-end click pipeline + after-state verification
+## Status: v0.1 — Mode 1 (visible) end-to-end pipeline with Accessibility-API click delivery
 
-What works today (v0.1.4):
+What works today (v0.1.5):
 - Find the RoK main window via `CGWindowListCopyWindowInfo` (filtered by `owner == title == "RiseOfKingdoms"` plus a bundle-ID anti-spoof check against `com.rok.ios.*`).
+- **Hidden-Space distinction at boot.** If RoK is running but its window isn't on a currently-displayed Space (another app went fullscreen, RoK is minimized to Dock), exit 19 `WindowChanged { not_visible }` with an actionable message — distinct from exit 10 `WindowNotFound` (RoK not running). Detected by falling back to `kCGWindowListOptionAll` when `OnScreenOnly` doesn't match.
 - Classify which display it's on via `CGDisplayIsBuiltin` (the laptop's Retina panel specifically — NOT the menu-bar display, which the user can move).
 - Screen Recording **and** Accessibility TCC preflights with first-install `request()` fallback so brand-new Macs aren't trapped in a permission dead-end.
 - **Capture the RoK window to `rok-capture-pre.png`** (Mode 1 only) via Apple's `screencapture -l <wid> -x -o` CLI — silent, no shadow, ~50-100ms per call.
 - **Template-match a known UI element** via `imageproc::match_template_parallel` (rayon-parallel NCC sliding window). Embedded needle, configurable `MATCH_THRESHOLD` (default `0.85`). Sub-second on M-series for the standard 2102×1640 Retina haystack.
 - **Placeholder-sentinel safety brake.** The shipped needle is a structural placeholder (`[255, 0, 255, 0]` top-left luma + xorshift32 noise body); `matcher::needle_has_placeholder_sentinel` fail-closes BEFORE NCC runs so the bot can never synthetically click against a falsely-matched placeholder. /qa caught a real placeholder false-match at 0.93 NCC; this brake prevents the class.
-- **TOCTOU-validate the window at the click site** (WID + frame + topmost) before posting any synthetic input.
-- **Synthesize a left-click via `CGEvent::post(kCGHIDEventTap, ...)`** at HID event-tap level — the same level the OS uses for real mouse input.
-- **Verify the click landed visibly.** Re-validate window presence (WID + frame — no topmost check; a click may legitimately spawn a modal), sleep `VERIFY_DELAY_MS = 500ms`, re-capture to `rok-capture-post.png`, and pixel-diff the two haystacks over decoded Luma8. Below `PIXEL_DIFF_REJECT_THRESHOLD = 1000` differing pixels → exit 20 (`ClickNotVerified`). Pixel-diff (not file-bytes) because PNG DEFLATE is non-deterministic.
+- **4-check pre-click TOCTOU validation** (v0.1.5, anchored on WID+PID, runs BEFORE the AX TCC prompt so a hidden-Space exit doesn't waste an Accessibility grant). Maps to four `WindowChanged` reasons: `window_id_gone`, `not_visible`, `frame_moved`, `point_outside_frame`. The v0.1.3 topmost walk is gone — AX press delivers through z-order overlap on Catalyst Bridge apps (verified in p5-spike).
+- **Click delivery via macOS Accessibility API.** `AXUIElementPerformAction(kAXPressAction)` in `src/ax.rs` — `AXUIElementCreateApplication(pid)` → `SetMessagingTimeout(2.0s)` → `CopyElementAtPosition(x, y)` → `PerformAction("AXPress")`. Replaces v0.1.3-4's `CGEvent::post(kCGHIDEventTap)` because `CGEventPostToPid` is silently dropped for Catalyst Bridge apps like RoK (p4-spike); AX delivers in the same scenario (p5-spike).
+- **Verify the click landed visibly.** 3-check post-click re-validation (WID+PID gone / hidden-Space / frame), sleep `VERIFY_DELAY_MS = 500ms`, re-capture to `rok-capture-post.png`, and pixel-diff the two haystacks over decoded Luma8. Below `PIXEL_DIFF_REJECT_THRESHOLD = 1000` differing pixels → exit 20 (`ClickNotVerified`). Pixel-diff (not file-bytes) because PNG DEFLATE is non-deterministic.
 - Decompression-bomb guard on haystack decode (`image::ImageReader` with `Limits { max_image_width: 8192, max_image_height: 8192 }`).
 - Structured exit codes (10–20) for shell consumers; tracing logs to stderr with `error_kind` + `exit_code` fields.
 
@@ -42,16 +43,16 @@ Expected outputs:
 - Target absent / below `MATCH_THRESHOLD` / placeholder-sentinel detected → `[ERROR] target not found in capture (best match below confidence threshold)` exit 15. Sentinel detection logs `WARN placeholder sentinel needle detected (top-left luma [255,0,255,0]); refusing to match`.
 - Haystack PNG missing or oversized → `[ERROR] failed to load … image …` exit 16
 - Needle strictly larger than haystack in either dim → `[ERROR] target image is too large …` exit 17
-- `CGEvent::post` failed → `[ERROR] click failed: …` exit 18
-- Window vanished or moved between match and click → `[ERROR] window changed: …` exit 19
-- Click posted but screen didn't change → `[ERROR] click not verified: …` exit 20 (reason tags: `screen_unchanged`, `dim_mismatch`).
+- AX press refused or failed → `[ERROR] synthetic click could not be delivered (reason: …)` exit 18. Reason tags (from `src/ax.rs`): `ax_app_resolve_failed`, `ax_element_resolve_failed`, `ax_press_failed`, `ax_timeout`.
+- Window vanished, hidden, moved, or click point outside frame → `[ERROR] RoK window state changed or unreachable (reason: …)` exit 19. Reason tags (from `src/window.rs`): `window_id_gone`, `not_visible`, `frame_moved`, `point_outside_frame`. `not_visible` is the actionable case where RoK is running but on a hidden Space or minimized — switch Spaces / unminimize rather than restart.
+- Click delivered but screen didn't change → `[ERROR] synthetic click delivered but post-state verify failed (reason: …)` exit 20 (reason tags: `screen_unchanged`, `dim_mismatch`).
 
 Full setup walkthrough: [docs/setup.md](docs/setup.md). Pre-commit hook install instructions are in there too.
 
 ## Repo layout
 
 ```
-src/                     v0.1 Rust source (9 modules, 136 unit + integration tests)
+src/                     v0.1 Rust source (10 modules, 140 unit + integration tests)
 assets/targets/          embedded matcher needles (placeholder until first real RoK crop)
 docs/setup.md            user-facing setup guide
 docs/rok_rust_bot_research.md   pre-implementation architecture research
@@ -65,7 +66,7 @@ CLAUDE.md                project instructions for Claude Code agent sessions
 
 ```sh
 cargo build --release --locked
-cargo test --locked                                                  # 136 passing (137 in --release)
+cargo test --locked                                                  # 140 passing
 cargo clippy --all-targets --all-features --locked -- -D warnings    # mbrain-style strict
 cargo fmt --all -- --check
 ```
