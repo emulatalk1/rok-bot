@@ -66,25 +66,26 @@ pub enum BotError {
         haystack: (u32, u32),
     },
 
-    /// CGEvent construction failed prior to posting. **Creation-time only**:
-    /// either `CGEventSource::new(HIDSystemState)` returned `Err` or
-    /// `CGEvent::new_mouse_event(...)` returned `Err`. Post-time failures are
-    /// not detectable — `CGEvent::post` returns `()`, not a `Result`, so once
-    /// construction succeeds there is no Quartz-level signal that the event
-    /// was dropped, filtered, or ignored. Verifying the click landed is
-    /// v0.1.4's job (after-state capture diff), not this variant's.
+    /// The synthetic click did not reach the target window. v0.1.5 routes
+    /// click delivery through the macOS Accessibility (AX) API
+    /// (`AXUIElementPerformAction(kAXPressAction)`), which has a richer
+    /// failure surface than v0.1.3-4's `CGEventPost`: AX calls return
+    /// typed `AXError` codes, so unlike `CGEvent::post` (which returns
+    /// `()`) we can distinguish app-resolve failure, element-resolve
+    /// failure, press-action failure, and RPC timeout. Each maps to a
+    /// distinct `reason` string declared in `src/ax.rs` (see
+    /// `REASON_AX_APP_RESOLVE_FAILED`, `REASON_AX_ELEMENT_RESOLVE_FAILED`,
+    /// `REASON_AX_PRESS_FAILED`, `REASON_AX_TIMEOUT`).
     ///
-    /// `reason` distinguishes which creation step failed
-    /// (`"source_creation_failed"`, `"down_event_creation_failed"`,
-    /// `"up_event_creation_failed"`) so the operator's first debugging
-    /// instinct lands on the right call site without having to cross-ref the
-    /// preceding warn log.
+    /// Verifying that a successful AX press caused a visible state
+    /// change is `ClickNotVerified`'s job — a successful AX press tells
+    /// us the action was accepted by the target's accessibility tree,
+    /// not that the underlying control actually responded.
     #[error(
-        "synthetic click could not be constructed (reason: {reason}). \
-         No event was posted to the HID tap. This typically means the system \
-         denied CGEventSource creation or CGEvent::new_mouse_event rejected \
-         the inputs; check the preceding warn log for the underlying Quartz \
-         error."
+        "synthetic click could not be delivered (reason: {reason}). \
+         The click did not reach the target window. The macOS Accessibility \
+         layer refused or failed the request before delivery — check the \
+         preceding warn log for the underlying AXError code."
     )]
     ClickFailed { reason: &'static str },
 
@@ -128,10 +129,11 @@ pub enum BotError {
     )]
     WindowChanged { reason: &'static str },
 
-    /// After-state verification reported no visible change post-click. The
-    /// synthetic click event reached the HID tap (v0.1.3's
-    /// `click::click_at` returned `Ok(())`), but the pre-click and
-    /// post-click captures of the RoK window are pixel-identical within
+    /// After-state verification reported no visible change post-click.
+    /// The synthetic click was delivered (v0.1.5's AX press returned
+    /// success, meaning the target's accessibility tree accepted the
+    /// action), but the pre-click and post-click captures of the RoK
+    /// window are pixel-identical within
     /// `verify::PIXEL_DIFF_REJECT_THRESHOLD`. RoK did not visibly react.
     ///
     /// v0.1.4 ships two reason tags:
@@ -162,8 +164,11 @@ pub enum BotError {
     ///   shifted the matched element's pixel rendering by more than the
     ///   matcher's tolerance, so the click landed on empty space).
     /// - Accessibility permission was silently revoked between
-    ///   `permissions::check_accessibility` and the post (rare; would
-    ///   suppress the synthetic event below the HID tap).
+    ///   `permissions::check_accessibility` and the AX press (rare;
+    ///   `AXUIElementPerformAction` would return `kAXErrorFailure`
+    ///   in that window before C4's `press_at` got a chance to surface
+    ///   `ClickFailed`, but a race after a successful press could
+    ///   produce this state).
     /// - The matched UI element is non-interactive (decorative button
     ///   art, disabled state, or chrome that doesn't respond to input).
     /// - RoK is frozen, stuttering, or paused (App Nap, system load,
@@ -189,13 +194,15 @@ pub enum BotError {
     /// only. See TODOS.md P2 "v0.1.4+ — server-roundtrip click verify"
     /// for the retry-and-poll path that fixes them.
     #[error(
-        "synthetic click posted but post-state verify failed (reason: {reason}). \
-         The click event reached the HID tap. For reason='screen_unchanged': \
-         pre/post pixel-space comparison shows no change above threshold \
-         (stale target, AX revoked, non-interactive element, RoK frozen, or \
-         server-bound click still loading per TODOS P2). For reason='dim_mismatch': \
-         pre/post captures have different dimensions, indicating capture-pipeline \
-         state changed between calls (display reconfig, fullscreen toggle, etc.)."
+        "synthetic click delivered but post-state verify failed (reason: {reason}). \
+         The AX press succeeded and the target window's accessibility tree \
+         accepted the action. For reason='screen_unchanged': pre/post \
+         pixel-space comparison shows no change above threshold (stale \
+         target, non-interactive element accepting the press without \
+         visible effect, RoK frozen, or server-bound click still loading \
+         per TODOS P2). For reason='dim_mismatch': pre/post captures have \
+         different dimensions, indicating capture-pipeline state changed \
+         between calls (display reconfig, fullscreen toggle, etc.)."
     )]
     ClickNotVerified { reason: &'static str },
 }
@@ -483,15 +490,13 @@ mod tests {
     }
 
     #[test]
-    fn click_failed_message_includes_reason_and_no_post_promise() {
+    fn click_failed_message_includes_reason_and_undelivered_promise() {
         // The `reason` tag must surface so the operator's first-look log
-        // line points at the right call site. The "no event was posted"
-        // phrasing pins the contract that ClickFailed is a creation-time
-        // error — no synthetic event ever left the process — so debugging
-        // doesn't need to consider partial-click scenarios. (Earlier draft
-        // also said "the cursor was not moved" but design A4 means the
-        // cursor is never moved on the success path either, so that
-        // phrasing was misleading.)
+        // line points at the right call site. v0.1.5 rewrote the message
+        // to drop HID vocabulary (the path is now AX, not CGEventPost);
+        // the new contract is that `ClickFailed` means the click never
+        // reached the target window — debugging doesn't need to consider
+        // partial-delivery scenarios.
         let err = BotError::ClickFailed {
             reason: REASON_DOWN,
         };
@@ -502,8 +507,9 @@ mod tests {
         );
         let lower = msg.to_lowercase();
         assert!(
-            lower.contains("no event was posted"),
-            "ClickFailed Display must promise no event was posted: {msg}"
+            lower.contains("did not reach"),
+            "ClickFailed Display must promise the click did not reach the \
+             target window: {msg}"
         );
     }
 }
