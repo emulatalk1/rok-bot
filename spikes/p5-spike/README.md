@@ -425,8 +425,80 @@ display whose Space is always "displayed" by definition.
    production v0.1.5 binary may behave differently. Test on a clean
    TCC state before shipping.
 
+## v0.2 procedure — verify AX behavior with RoK on a BetterDisplay virtual display
+
+Use the existing `--inspect` and `--app-tree` modes (no new code) to
+answer the open question the false-positive addendum identifies:
+
+**Does the canvas's `AXPosition` / `AXSize` / `AXActivationPoint` update
+when RoK moves to a virtual display, or does AX report stale built-in
+coords?**
+
+The answer determines whether the v0.1.5 AX targeting bug becomes
+harmless on a virtual display (canvas center = virtual-display center,
+off-screen popup on the virtual display, invisible to the user → fine)
+or stays problematic (canvas center = stale built-in coords, popup
+opens on the built-in display where the user sees it → not fine for
+Mode 2's "user doesn't observe RoK" goal).
+
+### Procedure
+
+1. Attach a BetterDisplay virtual display (`docs/setup.md` covers the
+   walkthrough). Recommended geometry: 1512×945 logical, positioned to
+   the LEFT of the built-in so its CG origin is negative
+   (e.g., `(-1512, 0, 1512, 945)`).
+2. Drag RoK to the virtual display. Its window CG frame should now
+   report a negative X origin (around `-1051` if RoK keeps its v0.1.5
+   default position offset).
+3. Find RoK's pid: `pgrep -if "rise.*kingdoms"`.
+4. Read the new window frame: `cargo run --release` from the parent
+   project (`rok-bot/`) and inspect the `found RoK window` log line, or
+   use `cua-driver call list_windows` if registered. Note the X origin
+   should be negative.
+5. Compute a click point inside the new (negative-origin) frame:
+   `x = origin_x + size_w / 2`, `y = origin_y + size_h / 2`. Example:
+   if the frame is `(-661, 61, 1051, 820)`, click point is
+   `(-135.5, 471)`.
+6. Run `./target/release/p5-spike <pid> <x> <y> --inspect`. This is
+   read-only; it does NOT post a click. Look for:
+   - **`[AXPosition]`** — should be the canvas's new origin, ~`(-661, 93)`.
+     If it still reports the built-in coords (~`(391, 93)`), the bridge
+     caches AX geometry and Mode 2 has a stale-coord problem.
+   - **`[AXSize]`** — unchanged, ~`(1051, 788)`.
+   - **`[AXActivationPoint]`** — should be the canvas's new center.
+     If it reports the built-in's `(916.91, 487.24)` instead of the
+     virtual-display's center, AXPress on a Mode 2 RoK still fires
+     on the built-in display.
+7. Also run `./target/release/p5-spike <pid> --app-tree` to confirm the
+   tree structure (`AXWindow` → `AXGroup iOSContentGroup` → single
+   AXGroup descendant) is unchanged across displays.
+
+### Decision matrix
+
+| `[AXPosition]` reads | `[AXActivationPoint]` reads | Mode 2 viability |
+|---|---|---|
+| Virtual-display coords | Virtual-display center | ✅ AX targeting bug is harmless on Mode 2 — popup opens on virtual display, user never sees it. Pixel-diff verify still works because canvas surface state changes. |
+| Built-in coords (stale) | Either | ⚠️ AX bridge caches per-display geometry. Mode 2's click delivery would fire on the built-in display, defeating "user doesn't observe RoK." Need to investigate AX cache invalidation, possibly switch click path. |
+| Virtual coords | Built-in (stale) | ⚠️ Partial-stale state. Bridge updates position but not activation point. Same Mode 2 problem as above. |
+| Either / AXError -25214 | n/a | ⚠️ AX doesn't resolve elements on virtual displays at all. Need full SkyLight + activation path, but the auto-raise problem reappears. |
+
+### What to do with the result
+
+- **Green row:** continue v0.2 work with current AX press path. Skip the
+  Mode 1 click-rework entirely. First v0.2 patch is the
+  `src/main.rs:142` gate relaxation.
+- **Yellow/red rows:** v0.2 click delivery needs a different mechanism.
+  Options: bare `SLEventPostToPid` + activation alternative on the
+  virtual display (the auto-raise of an invisible display is harmless),
+  or keyboard-only navigation if RoK responds to it.
+
 ## Decommissioning
 
 When v0.1.5 ships, `docs/setup.md` and `TODOS.md` get a sentence
 pointing to this spike's result. The spike directory itself stays as
 historical evidence (precedent: p2, p3, p4 all stayed).
+
+**v0.1.5 status (2026-05-11):** ship-blocked, see false-positive
+addendum at top + `TODOS.md` P0 entry. Spike does not get decommissioned
+yet — the diagnostic modes are still active tools for the v0.2 Mode 2
+investigation per the procedure section above.
