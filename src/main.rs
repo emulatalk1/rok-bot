@@ -1,4 +1,4 @@
-//! rok-bot v0.1 — Mode 1 (visible) only.
+//! rok-bot v0.1.6 — Mode 1 (visible) + Mode 2 (virtual display) pipeline.
 //!
 //! Boot sequence:
 //!     1. Init tracing (RUST_LOG controls level; default INFO).
@@ -9,26 +9,30 @@
 //!        produce useful capture+match output without click; the hard check
 //!        fires later only if a click is actually about to happen.
 //!     4. Find the RoK main window via Core Graphics.
-//!     5. Detect which display it lives on.
-//!     6. Branch:
-//!          `Mode::Visible` → capture window → template-match → validate
-//!                            capture/needle dims (A16 zero-dim hard-fail)
-//!                            → hard Accessibility check (A11; exit 13 if
-//!                            denied) → translate match to screen coords
-//!                            (`matcher::screen_point`) → synthesize click
-//!                            (`click::click_at`) → exit 0.
-//!          `Mode::Virtual` → exit `BotError::RokNotOnPrimary` (Mode 2 lives in v0.2).
-//!     7. Any error → log + exit with the variant's exit code.
+//!     5. Detect which display it lives on. Both `Mode::Visible` (built-in)
+//!        and `Mode::Virtual` (BetterDisplay / external) proceed; the
+//!        v0.1.5 exit-12 gate (`mode_to_result`) was deleted in v0.1.6
+//!        once stealth HID + activation made Mode 2 the structural fix for
+//!        Catalyst Bridge's auto-raise behavior.
+//!     6. Capture → template-match → validate capture/needle dims (A16
+//!        zero-dim hard-fail) → click-site TOCTOU close (4-check) → hard
+//!        Accessibility check (A11; exit 13 if denied) → translate match
+//!        to screen coords (`matcher::screen_point`) → synthesize click
+//!        (`click::click_at` — activate + stealth + HID tap).
+//!     7. Post-click verify: sleep, re-validate window present (3-check),
+//!        re-capture, pixel-diff vs pre. Exit 20 if pre/post identical
+//!        within threshold (RoK did not visibly react).
+//!     8. Any error → log + exit with the variant's exit code.
 //!
-//! v0.1.4 (this milestone) adds the post-click after-state verification
-//! via pixel-space diff between pre-click and post-click captures. The
-//! verify gate exits 20 `ClickNotVerified { reason: "screen_unchanged" }`
-//! when the post capture differs from the pre by fewer than
-//! `verify::PIXEL_DIFF_REJECT_THRESHOLD` pixels. See `verify` module docs
-//! for why pixel-diff (not byte-diff) and why the originally-planned
-//! `match_stable` failure path was dropped during /plan-eng-review.
+//! Why both modes proceed in v0.1.6: Catalyst Bridge auto-raises RoK on
+//! any synthetic `UITouch` that wakes its event pipeline (verified across
+//! 6 click-delivery paths during the 2026-05-11 ship-block research; see
+//! TODOS.md P0 entry). On Mode 1 that defeats "user does other things
+//! while bot runs"; on Mode 2 the raise is invisible (RoK lives on a
+//! display nothing observes), so the constraint evaporates. The v0.1.5
+//! Mode 1 lead is preserved at tag `v0.1.5-rc, ship-blocked` for project
+//! record; v0.1.6 builds Mode 2 on top.
 
-mod ax;
 mod capture;
 mod click;
 mod display;
@@ -44,7 +48,7 @@ use tracing_subscriber::EnvFilter;
 
 use crate::capture::capture_window;
 use crate::click::click_at;
-use crate::display::{Mode, detect_mode, mode_to_result};
+use crate::display::{Mode, detect_mode};
 use crate::error::{BotError, Result};
 use crate::matcher::{find_target, screen_point, validate_match_dims};
 use crate::permissions::{
@@ -91,7 +95,6 @@ const fn error_kind(err: &BotError) -> &'static str {
     match err {
         BotError::WindowNotFound => "WindowNotFound",
         BotError::WindowScreenUnresolved => "WindowScreenUnresolved",
-        BotError::RokNotOnPrimary => "RokNotOnPrimary",
         BotError::PermissionsMissing { .. } => "PermissionsMissing",
         BotError::CaptureFailed { .. } => "CaptureFailed",
         BotError::TargetNotFound => "TargetNotFound",
@@ -139,16 +142,25 @@ fn run() -> Result<()> {
     );
 
     let mode = detect_mode(&window)?;
-    mode_to_result(mode)?;
-    debug_assert_eq!(
-        mode,
-        Mode::Visible,
-        "mode_to_result returned Ok only for Visible"
-    );
-    tracing::info!(
-        target: "rok_bot",
-        "Mode 1 (visible) — RoK is on the built-in display."
-    );
+    // v0.1.6: both modes proceed. Mode 1 = built-in display, Mode 2 =
+    // virtual / external display. The mechanical click-delivery path is
+    // identical (stealth HID + activation); the user-observable
+    // difference is whether RoK's surface is on a display the user can
+    // see. Mode 2 is the structural fix for Catalyst Bridge's auto-raise
+    // (see crate docs).
+    match mode {
+        Mode::Visible => tracing::info!(
+            target: "rok_bot",
+            "Mode 1 (visible) — RoK is on the built-in display."
+        ),
+        Mode::Virtual => tracing::info!(
+            target: "rok_bot",
+            "Mode 2 (virtual) — RoK is on a non-built-in display \
+             (BetterDisplay virtual, external, or Sidecar). \
+             Activate-and-raise is invisible to the user; \
+             pipeline proceeds."
+        ),
+    }
 
     let pre_capture_path = PathBuf::from(CAPTURE_PRE_PATH);
     capture_window(window.id, &pre_capture_path)?;

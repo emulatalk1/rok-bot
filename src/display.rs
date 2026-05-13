@@ -105,20 +105,6 @@ pub fn detect_mode(window: &Window) -> Result<Mode> {
     classify(window.center(), &displays)
 }
 
-/// Pure: map a detected `Mode` to the v0.1 contract:
-///     `Mode::Visible` → `Ok(())` (Mode 1 happy path)
-///     `Mode::Virtual` → `Err(BotError::RokNotOnPrimary)` (Mode 2 deferred to v0.2)
-///
-/// Extracted from `main::run` so both arms are unit-testable. A future
-/// refactor that flipped the arms or returned `Ok` for `Virtual` would
-/// fail [`mode_visible_maps_to_ok`] / [`mode_virtual_maps_to_rok_not_on_primary`].
-pub const fn mode_to_result(mode: Mode) -> Result<()> {
-    match mode {
-        Mode::Visible => Ok(()),
-        Mode::Virtual => Err(BotError::RokNotOnPrimary),
-    }
-}
-
 fn enumerate_displays() -> Vec<DisplayInfo> {
     let ids = match CGDisplay::active_displays() {
         Ok(ids) => ids,
@@ -314,18 +300,8 @@ mod tests {
         assert_ne!(Mode::Visible, Mode::Virtual);
     }
 
-    // ---- mode_to_result contract (Testing T1) ----
-
-    #[test]
-    fn mode_visible_maps_to_ok() {
-        assert!(mode_to_result(Mode::Visible).is_ok());
-    }
-
-    #[test]
-    fn mode_virtual_maps_to_rok_not_on_primary() {
-        assert_eq!(
-            mode_to_result(Mode::Virtual).unwrap_err(),
-            BotError::RokNotOnPrimary
-        );
-    }
+    // v0.1.5's `mode_to_result` + its two arm-mapping tests
+    // (mode_visible_maps_to_ok / mode_virtual_maps_to_rok_not_on_primary)
+    // were deleted in v0.1.6 when src/main.rs dropped the Mode::Virtual
+    // exit gate. Both modes now proceed through the same pipeline.
 }

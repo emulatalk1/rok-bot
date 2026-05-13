@@ -8,13 +8,6 @@ pub enum BotError {
     #[error("RoK window center is not on any online display")]
     WindowScreenUnresolved,
 
-    #[error(
-        "RoK is not on the primary display. v0.1 supports Mode 1 (visible) only — \
-         drag RoK to your built-in display, then re-run. \
-         Mode 2 (background on a virtual display) is planned for v0.2."
-    )]
-    RokNotOnPrimary,
-
     /// Returned by `permissions::check_screen_recording` when
     /// `CGPreflightScreenCaptureAccess` reports the running app lacks the
     /// permission. v0.1 only checks Screen Recording; Accessibility is added
@@ -66,26 +59,47 @@ pub enum BotError {
         haystack: (u32, u32),
     },
 
-    /// The synthetic click did not reach the target window. v0.1.5 routes
-    /// click delivery through the macOS Accessibility (AX) API
-    /// (`AXUIElementPerformAction(kAXPressAction)`), which has a richer
-    /// failure surface than v0.1.3-4's `CGEventPost`: AX calls return
-    /// typed `AXError` codes, so unlike `CGEvent::post` (which returns
-    /// `()`) we can distinguish app-resolve failure, element-resolve
-    /// failure, press-action failure, and RPC timeout. Each maps to a
-    /// distinct `reason` string declared in `src/ax.rs` (see
-    /// `REASON_AX_APP_RESOLVE_FAILED`, `REASON_AX_ELEMENT_RESOLVE_FAILED`,
-    /// `REASON_AX_PRESS_FAILED`, `REASON_AX_TIMEOUT`).
+    /// The synthetic click did not reach the target window. v0.1.6
+    /// routes click delivery through `CGEvent::post(HID)` with explicit
+    /// `osascript`-driven activation and cursor stealth (see
+    /// `src/click.rs` for the full flow). v0.1.5's AX-press path was
+    /// reverted because `AXUIElementPerformAction(kAXPressAction)` is
+    /// positionless on Mac Catalyst Bridge apps (every press fires at
+    /// the canvas-center `AXActivationPoint`, regardless of the (x, y)
+    /// passed to `CopyElementAtPosition`).
     ///
-    /// Verifying that a successful AX press caused a visible state
-    /// change is `ClickNotVerified`'s job — a successful AX press tells
-    /// us the action was accepted by the target's accessibility tree,
-    /// not that the underlying control actually responded.
+    /// `reason` distinguishes which step in the click pipeline failed:
+    ///
+    /// - `"activation_failed"` — `osascript` returned non-zero when
+    ///   trying to set RoK frontmost. RoK's pid changed between
+    ///   `find_rok_window` and the click site, OR System Events refused
+    ///   the request (rare).
+    /// - `"probe"` — `CGEvent::new(source)` failed when probing the
+    ///   user's current cursor position. CG-level issue.
+    /// - `"disassociate"` — `CGAssociateMouseAndMouseCursorPosition
+    ///   (false)` refused. The visible cursor cannot be detached from
+    ///   the logical cursor; aborting prevents a visible cursor jump
+    ///   during the HID tap.
+    /// - `"source"` — `CGEventSource::new(HIDSystemState)` failed. CG-
+    ///   level issue, typically only seen after a Mac restart or a
+    ///   runaway-leak in another app.
+    /// - `"down"` / `"up"` — `CGEvent::new_mouse_event` returned `Err`
+    ///   for the down or up half of the click pair. Accessibility
+    ///   permission may have been revoked between
+    ///   `permissions::check_accessibility` and this site; a denial
+    ///   there normally surfaces as `PermissionsMissing` (exit 13), but
+    ///   the race exists.
+    ///
+    /// Verifying that a successful HID tap caused a visible state change
+    /// is `ClickNotVerified`'s job — `CGEvent::post` returns `()` and
+    /// provides no delivery confirmation, so success here means the
+    /// event was posted, not that RoK reacted.
     #[error(
         "synthetic click could not be delivered (reason: {reason}). \
-         The click did not reach the target window. The macOS Accessibility \
-         layer refused or failed the request before delivery — check the \
-         preceding warn log for the underlying AXError code."
+         The click did not reach the target window. A step in the \
+         activate→stealth→HID-tap pipeline failed before the event \
+         pair was posted — check the preceding warn log for the \
+         underlying CG/osascript error."
     )]
     ClickFailed { reason: &'static str },
 
@@ -114,10 +128,10 @@ pub enum BotError {
     ///   since discovery.
     /// - `"point_outside_frame"` — pre-click only. The requested click
     ///   point is not inside the discovered frame. Catches operator-
-    ///   side coord math bugs before the AX layer is engaged. Pre-v0.1.5
-    ///   this was caught accidentally by the topmost walk (deleted in
-    ///   v0.1.5 because `kAXPressAction` delivers through z-order overlap
-    ///   on Catalyst Bridge apps — see learnings/ax-press-works-catalyst).
+    ///   side coord math bugs before any synthetic input is engaged.
+    ///   Pre-v0.1.5 this was caught accidentally by the topmost walk;
+    ///   v0.1.5 added the explicit bounds check, and v0.1.6 preserves
+    ///   it (click-mechanism-independent).
     #[error(
         "RoK window state changed or unreachable (reason: {reason}). \
          Aborted before sending privileged synthetic input to avoid \
@@ -164,11 +178,10 @@ pub enum BotError {
     ///   shifted the matched element's pixel rendering by more than the
     ///   matcher's tolerance, so the click landed on empty space).
     /// - Accessibility permission was silently revoked between
-    ///   `permissions::check_accessibility` and the AX press (rare;
-    ///   `AXUIElementPerformAction` would return `kAXErrorFailure`
-    ///   in that window before C4's `press_at` got a chance to surface
-    ///   `ClickFailed`, but a race after a successful press could
-    ///   produce this state).
+    ///   `permissions::check_accessibility` and the HID tap (rare;
+    ///   `CGEvent::post` returns `()` and provides no delivery
+    ///   confirmation, so a silent revocation surfaces here, not as
+    ///   `ClickFailed`).
     /// - The matched UI element is non-interactive (decorative button
     ///   art, disabled state, or chrome that doesn't respond to input).
     /// - RoK is frozen, stuttering, or paused (App Nap, system load,
@@ -195,14 +208,14 @@ pub enum BotError {
     /// for the retry-and-poll path that fixes them.
     #[error(
         "synthetic click delivered but post-state verify failed (reason: {reason}). \
-         The AX press succeeded and the target window's accessibility tree \
-         accepted the action. For reason='screen_unchanged': pre/post \
-         pixel-space comparison shows no change above threshold (stale \
-         target, non-interactive element accepting the press without \
-         visible effect, RoK frozen, or server-bound click still loading \
-         per TODOS P2). For reason='dim_mismatch': pre/post captures have \
-         different dimensions, indicating capture-pipeline state changed \
-         between calls (display reconfig, fullscreen toggle, etc.)."
+         The activate→stealth→HID-tap pipeline ran to completion. For \
+         reason='screen_unchanged': pre/post pixel-space comparison shows \
+         no change above threshold (stale target, non-interactive element \
+         absorbing the click without visible effect, RoK frozen, or \
+         server-bound click still loading per TODOS P2). For \
+         reason='dim_mismatch': pre/post captures have different \
+         dimensions, indicating capture-pipeline state changed between \
+         calls (display reconfig, fullscreen toggle, etc.)."
     )]
     ClickNotVerified { reason: &'static str },
 }
@@ -213,7 +226,11 @@ impl BotError {
         match self {
             Self::WindowNotFound => 10,
             Self::WindowScreenUnresolved => 11,
-            Self::RokNotOnPrimary => 12,
+            // 12 was BotError::RokNotOnPrimary (Mode 1 only gate). Deleted
+            // in v0.1.6 when src/main.rs dropped the Mode::Virtual gate
+            // to enable Mode 2. The numeric slot is left unused (not
+            // reassigned) so shell users with stale `case "$?" in 12)` arms
+            // see a clean "exit 12 never fires" rather than a meaning swap.
             Self::PermissionsMissing { .. } => 13,
             Self::CaptureFailed { .. } => 14,
             Self::TargetNotFound => 15,
@@ -231,9 +248,9 @@ pub type Result<T> = std::result::Result<T, BotError>;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ax::{
-        REASON_AX_APP_RESOLVE_FAILED, REASON_AX_ELEMENT_RESOLVE_FAILED, REASON_AX_PRESS_FAILED,
-        REASON_AX_TIMEOUT,
+    use crate::click::{
+        REASON_ACTIVATION_FAILED, REASON_DISASSOCIATE, REASON_DOWN, REASON_PROBE, REASON_SOURCE,
+        REASON_UP,
     };
     use crate::verify::{REASON_DIM_MISMATCH, REASON_SCREEN_UNCHANGED};
 
@@ -242,7 +259,6 @@ mod tests {
         let codes = [
             BotError::WindowNotFound.exit_code(),
             BotError::WindowScreenUnresolved.exit_code(),
-            BotError::RokNotOnPrimary.exit_code(),
             BotError::PermissionsMissing {
                 which: "Screen Recording",
             }
@@ -256,7 +272,7 @@ mod tests {
             }
             .exit_code(),
             BotError::ClickFailed {
-                reason: REASON_AX_PRESS_FAILED,
+                reason: REASON_DOWN,
             }
             .exit_code(),
             BotError::WindowChanged {
@@ -286,7 +302,10 @@ mod tests {
     fn exit_codes_have_specific_stable_values() {
         assert_eq!(BotError::WindowNotFound.exit_code(), 10);
         assert_eq!(BotError::WindowScreenUnresolved.exit_code(), 11);
-        assert_eq!(BotError::RokNotOnPrimary.exit_code(), 12);
+        // Exit 12 was BotError::RokNotOnPrimary, deleted in v0.1.6 when
+        // the Mode::Virtual gate was dropped. No producer means no test;
+        // a future re-introduction must pick a different slot to avoid
+        // colliding with shell users' stale `case "$?" in 12)` arms.
         assert_eq!(
             BotError::PermissionsMissing {
                 which: "Screen Recording"
@@ -320,19 +339,23 @@ mod tests {
             .exit_code(),
             17
         );
-        // Pin all four v0.1.5 AX `reason` values to 18 — reason is a string
-        // tag for the operator-facing log, not part of the exit-code contract,
-        // but exercising each variant ensures a future PartialEq-on-reason
-        // refactor can't accidentally fork the exit code per-reason. Using
-        // the ax.rs constants (vs literal strings) keeps the test in sync
-        // with any future rename of the reason tags. The v0.1.3-4 Quartz
-        // reasons (REASON_SOURCE/DOWN/UP) were deleted in C4 when click.rs
-        // switched to AX delivery.
+        // Pin all six v0.1.6 click `reason` values to 18 — reason is a
+        // string tag for the operator-facing log, not part of the exit-
+        // code contract, but exercising each variant ensures a future
+        // PartialEq-on-reason refactor can't accidentally fork the exit
+        // code per-reason. Using the click.rs constants (vs literal
+        // strings) keeps the test in sync with any future rename of the
+        // reason tags. The v0.1.5 AX reasons
+        // (REASON_AX_APP_RESOLVE_FAILED / .._ELEMENT_RESOLVE_FAILED /
+        // ..PRESS_FAILED / ..TIMEOUT) were deleted in v0.1.6 when
+        // click.rs reverted from AX press to stealth HID + activation.
         for reason in [
-            REASON_AX_APP_RESOLVE_FAILED,
-            REASON_AX_ELEMENT_RESOLVE_FAILED,
-            REASON_AX_PRESS_FAILED,
-            REASON_AX_TIMEOUT,
+            REASON_ACTIVATION_FAILED,
+            REASON_PROBE,
+            REASON_DISASSOCIATE,
+            REASON_SOURCE,
+            REASON_DOWN,
+            REASON_UP,
         ] {
             assert_eq!(
                 BotError::ClickFailed { reason }.exit_code(),
@@ -342,11 +365,13 @@ mod tests {
         }
         // WindowChanged variants share exit 19. Pin all 4 documented
         // v0.1.5 reasons even though reason isn't part of the exit-code
-        // contract — same rationale as ClickFailed. The v0.1.3 reason
-        // "not_topmost_at_click" was deleted in v0.1.5 (replaced by
-        // "not_visible" for the hidden-Space case and dropped for the
-        // click-time occluder case, since AX press delivers through
-        // z-order overlap on Catalyst Bridge apps).
+        // contract — same rationale as ClickFailed. v0.1.6 preserves the
+        // v0.1.5 set: window_id_gone, frame_moved, not_visible,
+        // point_outside_frame. The pre-v0.1.5 "not_topmost_at_click" was
+        // deleted in v0.1.5 when AX press took over click delivery; in
+        // v0.1.6 the explicit osascript activation + the HID tap making
+        // RoK topmost-on-its-display tautologically removed the need to
+        // re-introduce a topmost-at-click check.
         for reason in [
             "window_id_gone",
             "frame_moved",
@@ -460,12 +485,6 @@ mod tests {
     }
 
     #[test]
-    fn rok_not_on_primary_mentions_v0_2() {
-        let msg = BotError::RokNotOnPrimary.to_string();
-        assert!(msg.contains("v0.2"), "msg should reference v0.2: {msg}");
-    }
-
-    #[test]
     fn click_not_verified_message_includes_reason_and_post_state_phrasing() {
         // Operator's first instinct on ClickNotVerified is "which gate
         // fired?" The reason tag must surface in Display output so the
@@ -494,17 +513,18 @@ mod tests {
     #[test]
     fn click_failed_message_includes_reason_and_undelivered_promise() {
         // The `reason` tag must surface so the operator's first-look log
-        // line points at the right call site. v0.1.5 rewrote the message
-        // to drop HID vocabulary (the path is now AX, not CGEventPost);
-        // the new contract is that `ClickFailed` means the click never
-        // reached the target window — debugging doesn't need to consider
+        // line points at the right call site. v0.1.6 rewrote the message
+        // back to HID + activation vocabulary (the path reverted from
+        // AX press because Catalyst Bridge AX press is positionless).
+        // Contract: `ClickFailed` means the click never reached the
+        // target window — debugging doesn't need to consider
         // partial-delivery scenarios.
         let err = BotError::ClickFailed {
-            reason: REASON_AX_PRESS_FAILED,
+            reason: REASON_DOWN,
         };
         let msg = err.to_string();
         assert!(
-            msg.contains(REASON_AX_PRESS_FAILED),
+            msg.contains(REASON_DOWN),
             "ClickFailed Display must include the reason tag: {msg}"
         );
         let lower = msg.to_lowercase();
