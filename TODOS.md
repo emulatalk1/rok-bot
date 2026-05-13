@@ -4,6 +4,84 @@ Items deferred from planning sessions. Each entry should be self-contained enoug
 
 ---
 
+## 🚨 P0: v0.1.5 SHIP BLOCKER — Mode 1 click delivery structurally non-viable on Catalyst Bridge; pivot to v0.2 Mode 2
+
+**Source:** `/qa` 2026-05-11 live click-target verification (3 end-to-end runs against running RoK) + same-day click-delivery research across 6 distinct paths.
+**Status:** Blocks `/ship` of v0.1.5. 8 commits sit on local `main` (carryover `5b56906` + `b1ab9ac`, then v0.1.5 chain `2fe892b`..`5110f6a`), unpushed. **Do not push until v0.2 Mode 2 lands.**
+**Effort:** RESOLVED — Mode 1 ruled out. Remaining work is v0.2 Mode 2 (BetterDisplay virtual display) scope, tracked in the P2 v0.2 entries below.
+
+### Bug 1: AX press fires the wrong UI element
+
+`src/ax.rs::press_at` calls `AXUIElementCopyElementAtPosition(app_ref, x, y)` then `AXUIElementPerformAction(element, kAXPressAction)`. Every unit test passes. FFI signatures verified against Apple SDK. p5-spike showed "AX press works on Catalyst Bridge." Live runs show exit 0 with pixel_diff well above threshold.
+
+**But the bot has never actually pressed the intended button.** Three runs targeted the castle/world toggle button at screen (441.5, 827.5) — the matcher correctly located it at score >0.99. The AX press FFI succeeded. The screen changed substantially (pixel_diff 580k-680k). And what RoK actually did was open a center-screen governor profile popup for the game-map entity at coord X:851 Y:271. The castle button is visible in the post-click capture, untouched, no press highlight. Three runs, three identical wrong outcomes. Full QA report at `~/.gstack/projects/emulatalk1-rok-bot/hbchuc-main-test-outcome-20260511-222219.md`.
+
+**Root cause (confirmed via `spikes/p5-spike/ ... --inspect | --app-tree | --ax-set-point`).** Mac Catalyst Bridge maps RoK's entire game canvas to a single `AXGenericElement` covering the full window content area. Tree dump:
+
+- `AXApplication "RiseOfKingdoms"`
+  - `AXWindow "RiseOfKingdoms" (SceneWindow)` with 5 children:
+    - `AXGroup iOSContentGroup` (frame 391,93 1051x788) — Catalyst Bridge canvas wrapper. NO actions. 1 grandchild `AXGroup` (1051.82×788.48, actions `[AXScrollToVisible, AXCancel, AXShowMenu]`, NO AXPress).
+    - `AXButton AXCloseButton / MinimizeButton / FullScreenButton` — macOS window chrome, not game UI.
+    - `AXStaticText` — title bar.
+  - `AXMenuBar`.
+
+`AXUIElementCopyElementAtPosition` at three different game-canvas coords — lower-left (441.5, 827.5), center (916, 471), mid-bottom (800, 700) — all return the same `AXGenericElement` with identical `AXActivationPoint = (916.91, 487.24)` (window center). `AXPress` fires at that fixed AXActivationPoint, NOT at the (x, y) passed to `CopyElementAtPosition`. `AXActivationPoint` is **read-only** (verified via `--ax-set-point` mode: `AXUIElementIsAttributeSettable` returned false). The parameterized attribute list contains only `AXReplaceRangeWithText` — no hit-test-by-point parameterized attribute exists. **AX hierarchy walk is not viable** because there are no per-control nodes to walk.
+
+### Bug 2: Catalyst Bridge auto-raises RoK on any synthetic UITouch — no Mode 1 click path satisfies all constraints
+
+After ruling out AX repair, researched and tested every reasonable click-delivery mechanism. Six paths tested against the user's hard constraints (works when covered, doesn't move cursor, doesn't raise RoK, fires castle):
+
+| Path | Cursor | Cover OK | RoK stays back | Castle fires |
+|---|---|---|---|---|
+| AX press (v0.1.5 current) | ✅ | ✅ | ✅ | ❌ wrong target |
+| HID + osascript activate | ❌ warps | ✅ | ❌ raises | ✅ |
+| Stealth HID + osascript activate | ✅ | ✅ | ❌ raises | ✅ |
+| cua-driver default (FocusWithoutRaise + auth-signed SkyLight) | ✅ | ✅ | ❌ raises | ✅ |
+| cua-driver count:3 (no FocusWithoutRaise) | ✅ | ✅ | ❌ raises | ✅ |
+| Bare `SLEventPostToPid` only (p5-spike `--skylight`) | ✅ | ✅ | ✅ | ❌ ignored |
+
+**No row satisfies all four constraints.** The bare `SLEventPostToPid`-only test was the cleanest minimal recipe (no activation, no focus dance) and RoK simply did not react — meaning RoK requires SOMETHING that wakes its event pipeline before it accepts UITouch input, and **that wake is what triggers the visible raise**. Catalyst's UIKit-on-Mac translation layer auto-raises any window receiving a touch because iOS apps don't have a "stay in background while receiving touch" concept. This is not fixable from outside the process.
+
+The cua-driver recipe (SkyLight private FFI: `SLEventPostToPid`, `SLPSPostEventRecordTo`, yabai-style `_SLPSGetFrontProcess` focus-without-raise) is technically real and correct — confirmed via source review of `Sources/CuaDriverCore/Input/{SkyLightEventPost,FocusWithoutRaise,MouseInput}.swift`. It works against Chromium/AppKit. It does NOT defeat Catalyst's auto-raise.
+
+### Why this slipped past existing defenses
+
+- **Unit tests (140 debug / 141 release):** validate FFI signatures, error mapping, RAII Drop, TOCTOU 4-check, reason-tag string-of-truth. None validate that the press semantically targets the intended UI element on a real RoK install. The AX layer is correct at every layer the tests reach.
+- **p5-spike:** verified `AXUIElementPerformAction` returned success and that observable response happened in RoK. Did not verify which UI element fired. Update `spikes/p5-spike/README.md` to record this scope gap (same pattern as p3/p4: "delivery works" ≠ "intended target fires").
+- **Pixel-diff verify:** trivially exceeded by ANY popup or view change. Cannot distinguish "right button fired" from "wrong action triggered."
+- **Post-click re-match diagnostic:** finds the castle button still in the backing store at the same coords — because Catalyst auxiliary windows (the popup) live outside RoK's main backing, and the castle button is genuinely still on screen, just unpressed.
+
+### Resolution: v0.2 Mode 2 (BetterDisplay virtual display)
+
+Mode 2 was always the planned v0.2 milestone. With Mode 1 click delivery ruled out across 6 paths, Mode 2 is now the **only** viable resolution. Structural fix: RoK on a BetterDisplay virtual display means the auto-raise still happens, but on a display the user can't see, with no user cursor present, and no other apps competing. All four constraints become trivially satisfied because the constraints themselves are observability-driven.
+
+**Permissions are not the gate.** Accessibility + Screen Recording were already granted to terminal and cua-driver throughout. No code-signing or entitlement work required for v0.2.
+
+### What survives from v0.1.5
+
+- `2fe892b` C1 — CGWindowList centralization. Independent of click mechanism. Correct.
+- `e4b0f68` C2 — 4-check TOCTOU + hidden-Space detection. Confirmed working by `/qa` test 2 (exit 19 `not_visible` clean). Independent of click mechanism. Correct.
+- The expanded `spikes/p5-spike/src/main.rs` diagnostic modes (`--inspect`, `--app-tree`, `--stealth`, `--ax-set-point`, `--skylight`) are the most useful surviving artifacts for v0.2 work. Port pieces into rok-bot proper if needed.
+
+### What needs reframing
+
+- `43b259b` C3, `611bc8a` C4, `1ac228e` C5, `5110f6a` C6 describe AX as v0.1.5's working click delivery. C4 doesn't deliver the user-facing contract; C3 / C5 / C6 inherit that vocabulary. Two options:
+  - **Pin commits as `v0.1.5-rc, ship-blocked`**, leave unpushed on `main`, branch v0.2 from there. Cheapest, preserves the AX investigation as a project-record artifact.
+  - **Revert C3-C6.** Keep C1-C2. Rewrite docs + error vocabulary for whatever v0.2's click delivery layer ends up being (likely the AX press path, since on a virtual display its targeting bug becomes a non-issue — the popup that opens at AXActivationPoint is invisible to the user; what matters is "did RoK observably do something" and the matcher can re-orient from the new state).
+- `~/.gstack/projects/emulatalk1-rok-bot/hbchuc-main-test-outcome-20260511-222219.md` needs an appendix noting the cua-driver / SkyLight Mode 1 dead-end discovered after the report was written.
+- README, CLAUDE.md, `docs/setup.md` currently describe the AX path as v0.1.5's working behavior. Either reword as "experimental, ship-blocked" or wait until v0.2 lands and write fresh.
+
+### Crucial context for resume
+
+- **Unit tests pass but the bot doesn't click the intended button.** Don't trust unit tests as evidence the bot works end-to-end — visual verification against real RoK is the only way. p3, p4, p5 spikes all had false-positive scope ("delivery works" not "intended target fires"). For v0.2, every spike verdict must include intended-target verification, not just "RoK reacted."
+- **`screencapture -l <wid>` captures RoK's backing store regardless of on-screen overlays** — confirmed during `/qa` test 3 (covered castle button with iTerm; matcher still found it at 0.9951). This is a robustness win, not a bug. Exit 15 (TargetNotFound) cannot be triggered by external overlays.
+- **RoK pid changes per launch.** Across this session: 75094, 75838, 78028, 81777. Always re-query via `pgrep -if "rise.*kingdoms"` or `cua-driver call list_windows`.
+- **Window frame across launches: (391, 61, 1051, 820).** Stable while RoK on the built-in display. Castle button at screen (441.5, 827.5); image-pixel center (101, 1533) in the 2x Retina capture (2102×1640); window-local logical (50.5, 766.5).
+- **cua-driver is installed at `~/.local/bin/cua-driver` → `/Applications/CuaDriver.app/Contents/MacOS/cua-driver`** and registered as an MCP server. May be useful for v0.2 high-level automation but probably not load-bearing.
+- **AX dump utilities live in `spikes/p5-spike --inspect | --app-tree | --ax-set-point`** for future Catalyst app investigations.
+
+---
+
 ## ❌ DEAD — `CGEventPostToPid` migration for screen-position-independent clicks
 
 **Source:** live-smoke 2026-05-11 (exit 19 `not_topmost_at_click` whenever RoK
@@ -21,19 +99,22 @@ NOT screen-routed to iTerm either), zero observable change inside RoK
 above the ambient animation noise floor.
 
 Implication: the screen-pixel dependency of v0.1.3's click-delivery is
-NOT fixable at the click-delivery layer for iOS-on-Mac apps. The two
-viable paths are:
+NOT fixable at the click-delivery layer for iOS-on-Mac apps. Path forward:
 
-1. **Mode 1 production model:** activate RoK before each click. Bot
-   keeps grabbing foreground; user can't do other work in parallel. Add
-   a `NSRunningApplication::activate` (or equivalent) call to `click_at`
-   immediately before posting. Documented behavior; matches existing
-   exit-19 guidance ("re-run when RoK is foreground and stable").
-2. **Mode 2 (deferred to v0.2):** virtual-display isolation. RoK on a
-   BetterDisplay virtual display where no other windows ever live. Screen
-   dispatch and z-order topmost both become trivially correct because
-   nothing can occlude RoK. This is what Mode 2 was always going to do
-   and the spike result confirms it's the right path.
+1. ~~**Mode 1 production model:** activate RoK before each click.~~
+   **RULED OUT by 2026-05-11 click-delivery research** (see P0 above):
+   any synthetic UITouch that wakes RoK's event pipeline also triggers
+   Catalyst's auto-raise. Tested across 6 distinct delivery paths
+   (HID+osascript, stealth HID, cua-driver default, cua-driver count:3,
+   bare SLEventPostToPid, AX press) — every path that fires the castle
+   also raises RoK. No "click while RoK stays back" mechanism exists
+   from outside the process on Catalyst Bridge.
+2. **Mode 2 (v0.2):** virtual-display isolation. RoK on a BetterDisplay
+   virtual display where no other windows ever live and the user never
+   sees RoK's surface. Screen dispatch, z-order topmost, AND auto-raise
+   all become trivially correct because nothing observes RoK. This is
+   what Mode 2 was always going to do and the spike + 6-path research
+   confirm it's the **only** viable path.
 
 Do not re-investigate `CGEventPostToPid` without first reading the spike
 README — there's no second pass that produces a different result on
@@ -278,14 +359,14 @@ Future RoK automation (map panning, troop movement, context menus, multi-action 
 
 ---
 
-## ✅ DONE — v0.1.3+ Mode 1 terminal/IDE occlusion blocks click (resolved by v0.1.5 AX switch)
+## ❌ SUPERSEDED — v0.1.3+ Mode 1 terminal/IDE occlusion blocks click
 
 **Source:** v0.1.3 smoke test post-commit. `validate_at_click_site` refused to click 4/4 runs because iTerm2's window frame contained the click point.
-**Resolved by:** v0.1.5 commits 611bc8a (AX press) + e4b0f68 (drop topmost walk).
+**Originally "Resolved" by:** v0.1.5 commits 611bc8a (AX press) + e4b0f68 (drop topmost walk). **That resolution was a false positive** — see P0 above.
 
-p5-spike empirically proved AX press delivers to Catalyst Bridge apps (RoK) even when another window is z-order topmost at the click point — see `learnings/ax-press-works-catalyst`. The v0.1.3 `REASON_NOT_TOPMOST` exit existed to protect against a privileged HID-tap click landing on the wrong window; with AX press scoped to the target PID's accessibility tree, z-order overlap is no longer load-bearing for safety. v0.1.5 deletes the topmost walk from `validate_inner` and adds the explicit `point_outside_frame` bounds check to preserve the accidental bounds invariant.
+p5-spike claimed AX press delivers to Catalyst Bridge apps regardless of z-order. /qa 2026-05-11 proved AX press delivers to a positionless canvas, NOT to the coord-targeted button — the z-order finding was real but irrelevant because the click semantics were wrong. The `learnings/ax-press-works-catalyst` entry is misleading and should be annotated.
 
-The `--activate-rok` flag and "Mode 1 operating notes" docs paragraph are no longer needed — overlapping terminals/IDEs are now a non-issue for Mode 1.
+In v0.2 Mode 2, occlusion stops mattering because RoK lives on a virtual display nothing can occlude. The v0.1.3 `REASON_NOT_TOPMOST` exit was never the right diagnostic for Catalyst Bridge — auto-raise behavior means "topmost-at-click" is structurally tautological once any click delivery wakes the event pipeline. Defer the topmost-check decision to whatever v0.2 click path lands.
 
 ---
 
