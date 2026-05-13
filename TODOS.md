@@ -4,81 +4,59 @@ Items deferred from planning sessions. Each entry should be self-contained enoug
 
 ---
 
-## 🚨 P0: v0.1.5 SHIP BLOCKER — Mode 1 click delivery structurally non-viable on Catalyst Bridge; pivot to v0.2 Mode 2
+## ✅ DONE — v0.1.6 SHIPPED: Mode 2 click delivery via stealth HID + osascript activation
 
-**Source:** `/qa` 2026-05-11 live click-target verification (3 end-to-end runs against running RoK) + same-day click-delivery research across 6 distinct paths.
-**Status:** Blocks `/ship` of v0.1.5. 8 commits sit on local `main` (carryover `5b56906` + `b1ab9ac`, then v0.1.5 chain `2fe892b`..`5110f6a`), unpushed. **Do not push until v0.2 Mode 2 lands.**
-**Effort:** RESOLVED — Mode 1 ruled out. Remaining work is v0.2 Mode 2 (BetterDisplay virtual display) scope, tracked in the P2 v0.2 entries below.
+**Resolved 2026-05-13** by commit `2c96790` (live-confirmed with RoK on a BetterDisplay virtual display: exit 0, pixel_diff 3.19M, castle press observable in pre/post captures, cursor stayed put, RoK didn't visibly raise on built-in).
 
-### Bug 1: AX press fires the wrong UI element
+### What v0.1.6 ships
 
-`src/ax.rs::press_at` calls `AXUIElementCopyElementAtPosition(app_ref, x, y)` then `AXUIElementPerformAction(element, kAXPressAction)`. Every unit test passes. FFI signatures verified against Apple SDK. p5-spike showed "AX press works on Catalyst Bridge." Live runs show exit 0 with pixel_diff well above threshold.
+- `src/click.rs` rewritten: probe cursor → disassociate visible cursor → `osascript` activate (System Events, pid-targeted) → 50ms settle → `CGEvent::post(HID)` `LeftMouseDown` → 80ms gap → `LeftMouseUp` → warp logical cursor back → reassociate. RAII `CursorStealth` guard ensures reassociation on panic/early-return.
+- `src/ax.rs` deleted. AX TCC preflight kept in `permissions.rs` (CGEventPost(HID) still requires Accessibility on macOS 10.14+).
+- `src/main.rs:142` Mode 2 exit-12 gate dropped. Both `Mode::Visible` and `Mode::Virtual` branch to logging and proceed through the same pipeline.
+- `src/display.rs::mode_to_result` + its 2 arm-mapping tests deleted.
+- `src/error.rs::RokNotOnPrimary` variant deleted; exit code 12 left unused (not reassigned). New `ClickFailed` reason tags: `activation_failed`, `probe`, `disassociate`, `source`, `down`, `up`.
+- Tag `v0.1.5-rc` at commit `5110f6a` marks the ship-blocked AX-press attempt for historical record.
 
-**But the bot has never actually pressed the intended button.** Three runs targeted the castle/world toggle button at screen (441.5, 827.5) — the matcher correctly located it at score >0.99. The AX press FFI succeeded. The screen changed substantially (pixel_diff 580k-680k). And what RoK actually did was open a center-screen governor profile popup for the game-map entity at coord X:851 Y:271. The castle button is visible in the post-click capture, untouched, no press highlight. Three runs, three identical wrong outcomes. Full QA report at `~/.gstack/projects/emulatalk1-rok-bot/hbchuc-main-test-outcome-20260511-222219.md`.
+### Why v0.1.5 was ship-blocked (preserved for future Catalyst-Bridge work)
 
-**Root cause (confirmed via `spikes/p5-spike/ ... --inspect | --app-tree | --ax-set-point`).** Mac Catalyst Bridge maps RoK's entire game canvas to a single `AXGenericElement` covering the full window content area. Tree dump:
+**Bug 1: AX press fires the wrong UI element.** `AXUIElementCopyElementAtPosition` resolves RoK's entire game canvas to a single `AXGenericElement` whose `AXActivationPoint` (read-only) sits at the canvas center. Every `AXPress` fires at that fixed center regardless of the (x, y) passed in. AX tree dump from `spikes/p5-spike --app-tree`:
 
-- `AXApplication "RiseOfKingdoms"`
-  - `AXWindow "RiseOfKingdoms" (SceneWindow)` with 5 children:
-    - `AXGroup iOSContentGroup` (frame 391,93 1051x788) — Catalyst Bridge canvas wrapper. NO actions. 1 grandchild `AXGroup` (1051.82×788.48, actions `[AXScrollToVisible, AXCancel, AXShowMenu]`, NO AXPress).
-    - `AXButton AXCloseButton / MinimizeButton / FullScreenButton` — macOS window chrome, not game UI.
-    - `AXStaticText` — title bar.
-  - `AXMenuBar`.
+- `AXApplication "RiseOfKingdoms"` → `AXWindow` → `AXGroup iOSContentGroup` (Catalyst canvas wrapper, NO actions) → single grandchild `AXGroup` (actions `[AXScrollToVisible, AXCancel, AXShowMenu]`, NO AXPress).
+- `AXButton` close/minimize/fullscreen + `AXStaticText` title bar — macOS chrome only, not game UI.
+- `AXActivationPoint` is **read-only** (verified via `--ax-set-point`: `AXUIElementIsAttributeSettable` returned false).
 
-`AXUIElementCopyElementAtPosition` at three different game-canvas coords — lower-left (441.5, 827.5), center (916, 471), mid-bottom (800, 700) — all return the same `AXGenericElement` with identical `AXActivationPoint = (916.91, 487.24)` (window center). `AXPress` fires at that fixed AXActivationPoint, NOT at the (x, y) passed to `CopyElementAtPosition`. `AXActivationPoint` is **read-only** (verified via `--ax-set-point` mode: `AXUIElementIsAttributeSettable` returned false). The parameterized attribute list contains only `AXReplaceRangeWithText` — no hit-test-by-point parameterized attribute exists. **AX hierarchy walk is not viable** because there are no per-control nodes to walk.
+`/qa` 2026-05-11 confirmed across three live runs: matcher located castle at (441.5, 827.5) score >0.99, AX press FFI succeeded, pixel_diff 580k-680k — but RoK opened a center-screen governor popup at game coord (X:851, Y:271), NOT the castle. Full QA report at `~/.gstack/projects/emulatalk1-rok-bot/hbchuc-main-test-outcome-20260511-222219.md`.
 
-### Bug 2: Catalyst Bridge auto-raises RoK on any synthetic UITouch — no Mode 1 click path satisfies all constraints
-
-After ruling out AX repair, researched and tested every reasonable click-delivery mechanism. Six paths tested against the user's hard constraints (works when covered, doesn't move cursor, doesn't raise RoK, fires castle):
+**Bug 2: Catalyst Bridge auto-raises RoK on any synthetic UITouch.** Six click-delivery paths tested against Mode 1 constraints (works when covered, doesn't move cursor, doesn't raise RoK, fires castle):
 
 | Path | Cursor | Cover OK | RoK stays back | Castle fires |
 |---|---|---|---|---|
-| AX press (v0.1.5 current) | ✅ | ✅ | ✅ | ❌ wrong target |
+| AX press (v0.1.5) | ✅ | ✅ | ✅ | ❌ wrong target |
 | HID + osascript activate | ❌ warps | ✅ | ❌ raises | ✅ |
 | Stealth HID + osascript activate | ✅ | ✅ | ❌ raises | ✅ |
-| cua-driver default (FocusWithoutRaise + auth-signed SkyLight) | ✅ | ✅ | ❌ raises | ✅ |
+| cua-driver default (FocusWithoutRaise + SkyLight) | ✅ | ✅ | ❌ raises | ✅ |
 | cua-driver count:3 (no FocusWithoutRaise) | ✅ | ✅ | ❌ raises | ✅ |
 | Bare `SLEventPostToPid` only (p5-spike `--skylight`) | ✅ | ✅ | ✅ | ❌ ignored |
 
-**No row satisfies all four constraints.** The bare `SLEventPostToPid`-only test was the cleanest minimal recipe (no activation, no focus dance) and RoK simply did not react — meaning RoK requires SOMETHING that wakes its event pipeline before it accepts UITouch input, and **that wake is what triggers the visible raise**. Catalyst's UIKit-on-Mac translation layer auto-raises any window receiving a touch because iOS apps don't have a "stay in background while receiving touch" concept. This is not fixable from outside the process.
+**No row satisfies all four constraints on Mode 1.** RoK requires SOMETHING that wakes its event pipeline before it accepts UITouch input, and that wake is what triggers the visible raise. Catalyst's UIKit-on-Mac translation layer auto-raises any window receiving a touch because iOS apps don't have a "stay in background while receiving touch" concept. Not fixable from outside the process.
 
-The cua-driver recipe (SkyLight private FFI: `SLEventPostToPid`, `SLPSPostEventRecordTo`, yabai-style `_SLPSGetFrontProcess` focus-without-raise) is technically real and correct — confirmed via source review of `Sources/CuaDriverCore/Input/{SkyLightEventPost,FocusWithoutRaise,MouseInput}.swift`. It works against Chromium/AppKit. It does NOT defeat Catalyst's auto-raise.
+**v0.1.6 resolution** — flip "Stealth HID + osascript activate" from ❌ to ✅ by moving observability constraints out of scope. On a BetterDisplay virtual display the cursor isn't there, the raise is invisible, and the click is coord-targeted (the AX-press positionless bug doesn't apply because we're not using AX press). p5-spike `--inspect` on the virtual display confirmed `AXPosition` and `AXActivationPoint` update per-display, so even if AX press were used it would target the correct (invisible) display — but the HID + activation path is the cleaner solution since it preserves coord targeting.
 
-### Why this slipped past existing defenses
+### Why this slipped past v0.1.5 defenses
 
-- **Unit tests (140 debug / 141 release):** validate FFI signatures, error mapping, RAII Drop, TOCTOU 4-check, reason-tag string-of-truth. None validate that the press semantically targets the intended UI element on a real RoK install. The AX layer is correct at every layer the tests reach.
-- **p5-spike:** verified `AXUIElementPerformAction` returned success and that observable response happened in RoK. Did not verify which UI element fired. Update `spikes/p5-spike/README.md` to record this scope gap (same pattern as p3/p4: "delivery works" ≠ "intended target fires").
+- **Unit tests (140 debug / 141 release):** validate FFI signatures, error mapping, RAII Drop, TOCTOU 4-check, reason-tag string-of-truth. None validate that the press semantically targets the intended UI element on a real RoK install. The AX layer was correct at every layer the tests reached.
+- **p5-spike:** verified `AXUIElementPerformAction` returned success and that observable response happened in RoK. Did not verify which UI element fired. The `spikes/p5-spike/README.md` false-positive addendum (commit `60c3ab6`) records this scope gap.
 - **Pixel-diff verify:** trivially exceeded by ANY popup or view change. Cannot distinguish "right button fired" from "wrong action triggered."
 - **Post-click re-match diagnostic:** finds the castle button still in the backing store at the same coords — because Catalyst auxiliary windows (the popup) live outside RoK's main backing, and the castle button is genuinely still on screen, just unpressed.
 
-### Resolution: v0.2 Mode 2 (BetterDisplay virtual display)
+### Lessons logged for future work
 
-Mode 2 was always the planned v0.2 milestone. With Mode 1 click delivery ruled out across 6 paths, Mode 2 is now the **only** viable resolution. Structural fix: RoK on a BetterDisplay virtual display means the auto-raise still happens, but on a display the user can't see, with no user cursor present, and no other apps competing. All four constraints become trivially satisfied because the constraints themselves are observability-driven.
-
-**Permissions are not the gate.** Accessibility + Screen Recording were already granted to terminal and cua-driver throughout. No code-signing or entitlement work required for v0.2.
-
-### What survives from v0.1.5
-
-- `2fe892b` C1 — CGWindowList centralization. Independent of click mechanism. Correct.
-- `e4b0f68` C2 — 4-check TOCTOU + hidden-Space detection. Confirmed working by `/qa` test 2 (exit 19 `not_visible` clean). Independent of click mechanism. Correct.
-- The expanded `spikes/p5-spike/src/main.rs` diagnostic modes (`--inspect`, `--app-tree`, `--stealth`, `--ax-set-point`, `--skylight`) are the most useful surviving artifacts for v0.2 work. Port pieces into rok-bot proper if needed.
-
-### What needs reframing
-
-- `43b259b` C3, `611bc8a` C4, `1ac228e` C5, `5110f6a` C6 describe AX as v0.1.5's working click delivery. C4 doesn't deliver the user-facing contract; C3 / C5 / C6 inherit that vocabulary. Two options:
-  - **Pin commits as `v0.1.5-rc, ship-blocked`**, leave unpushed on `main`, branch v0.2 from there. Cheapest, preserves the AX investigation as a project-record artifact.
-  - **Revert C3-C6.** Keep C1-C2. Rewrite docs + error vocabulary for whatever v0.2's click delivery layer ends up being (likely the AX press path, since on a virtual display its targeting bug becomes a non-issue — the popup that opens at AXActivationPoint is invisible to the user; what matters is "did RoK observably do something" and the matcher can re-orient from the new state).
-- `~/.gstack/projects/emulatalk1-rok-bot/hbchuc-main-test-outcome-20260511-222219.md` needs an appendix noting the cua-driver / SkyLight Mode 1 dead-end discovered after the report was written.
-- README, CLAUDE.md, `docs/setup.md` currently describe the AX path as v0.1.5's working behavior. Either reword as "experimental, ship-blocked" or wait until v0.2 lands and write fresh.
-
-### Crucial context for resume
-
-- **Unit tests pass but the bot doesn't click the intended button.** Don't trust unit tests as evidence the bot works end-to-end — visual verification against real RoK is the only way. p3, p4, p5 spikes all had false-positive scope ("delivery works" not "intended target fires"). For v0.2, every spike verdict must include intended-target verification, not just "RoK reacted."
-- **`screencapture -l <wid>` captures RoK's backing store regardless of on-screen overlays** — confirmed during `/qa` test 3 (covered castle button with iTerm; matcher still found it at 0.9951). This is a robustness win, not a bug. Exit 15 (TargetNotFound) cannot be triggered by external overlays.
-- **RoK pid changes per launch.** Across this session: 75094, 75838, 78028, 81777. Always re-query via `pgrep -if "rise.*kingdoms"` or `cua-driver call list_windows`.
-- **Window frame across launches: (391, 61, 1051, 820).** Stable while RoK on the built-in display. Castle button at screen (441.5, 827.5); image-pixel center (101, 1533) in the 2x Retina capture (2102×1640); window-local logical (50.5, 766.5).
-- **cua-driver is installed at `~/.local/bin/cua-driver` → `/Applications/CuaDriver.app/Contents/MacOS/cua-driver`** and registered as an MCP server. May be useful for v0.2 high-level automation but probably not load-bearing.
-- **AX dump utilities live in `spikes/p5-spike --inspect | --app-tree | --ax-set-point`** for future Catalyst app investigations.
+- **Spike verdicts must verify intended-target outcomes, not just "delivery works."** p3, p4, p5 all conflated the two. Any future click-delivery spike on Catalyst Bridge apps must explicitly press a known coord-bound target and confirm the right action fired.
+- **`screencapture -l <wid>` captures RoK's backing store regardless of on-screen overlays** — confirmed via `/qa` test 3. Robustness win for the matcher: exit 15 cannot be triggered by external z-order occluders.
+- **Catalyst Bridge AX tree has no per-control nodes** for game UI. Walk-by-identifier is structurally impossible. Coord-based clicks are the only path.
+- **`AXPosition` / `AXSize` / `AXActivationPoint` update per-display.** AX bridge is not display-cached; moving RoK to a virtual display correctly updates the canvas geometry. v0.2 procedure in `spikes/p5-spike/README.md` documents the runbook.
+- **AX dump utilities at `spikes/p5-spike --inspect | --app-tree | --ax-set-point`** stay as project-record diagnostic tools for future Catalyst app investigations.
+- **cua-driver** installed at `~/.local/bin/cua-driver` → `/Applications/CuaDriver.app/Contents/MacOS/cua-driver`, registered as MCP server. SkyLight FFI recipe (`SLEventPostToPid`, `SLPSPostEventRecordTo`, yabai-style `_SLPSGetFrontProcess` focus-without-raise) works against Chromium/AppKit but does NOT defeat Catalyst's auto-raise. Potentially useful for higher-level Mode 2 automation but not load-bearing.
 
 ---
 
@@ -479,20 +457,19 @@ v0.1.4 saves `rok-capture-pre.png` + `rok-capture-post.png` at project root; ope
 
 ---
 
-## P2: v0.2 prerequisite — verify AX press tolerates negative-origin CG coords
+## ✅ DONE — Verify AX press tolerates negative-origin CG coords
 
-**Source:** v0.1.5 ship checkpoint. The v0.1.5 unit tests prove `validate_inner` handles negative-origin CG coords (BetterDisplay virtual displays land at `x = -1051` per P3 spike); the AX press path was only smoke-tested on positive coords during p5-spike (RoK on the built-in display).
-**Effort:** human ~10 min / CC ~5 min spike rebuild
-**Depends on:** v0.1.5 landed; BetterDisplay virtual display attached and RoK migrated to it (v0.2 setup work — currently exits 12).
+**Resolved 2026-05-13** via `spikes/p5-spike --inspect` against RoK on a BetterDisplay virtual display (frame `(-1125, 92, 1051, 820)`).
 
-`AXUIElementCopyElementAtPosition` takes `float x, float y` and the AX framework's coordinate system is documented as "top-left relative screen coordinates." Whether that means *global* CG screen space (which spans negative coords across virtual displays) or *the displayed Space's own origin-anchored coords* is not explicit in Apple's docs. p5-spike validated positive coords on the built-in display only. Before v0.2 enables Mode 2, smoke-test:
+Outcome at canvas-center probe `(-599.5, 502)`:
+- `AXPosition = (-1125, 124)` — bridge updates to new display origin (was `(391, 93)` on built-in).
+- `AXSize = (1051.82, 788.48)` — unchanged.
+- `AXActivationPoint = (-599.09, 518.24)` — bridge updates to new canvas center (was `(916.91, 487.24)` on built-in).
+- `AXChildren = ()` — still no per-control nodes (Catalyst Bridge structural).
 
-1. Attach a BetterDisplay virtual display in `System Settings → Displays`.
-2. Drag RoK to the virtual display.
-3. Run `cargo run --release -- spike-mode-2-stub` (or hand-call `ax::press_at` from a tiny binary with the virtual-display window coords). Expected: press lands.
-4. If it doesn't land: AX coord space is per-Space, and v0.2 needs to translate global CG → Space-local before passing to AX.
+Conclusion: the AX bridge is **not** display-cached; coord-bound AX queries work correctly across negative-origin displays. The v0.1.5 AX-press positionless bug remains (`AXPress` fires at `AXActivationPoint`, not the caller's coords) but it's no longer a Mode 2 blocker because v0.1.6 reverted from AX press to HID + activation, which IS coord-targeted. The result also unblocks any future AX-based work on Mode 2 — global CG coords are the right input.
 
-**Why deferred:** v0.1.5 explicitly fails at `Mode::Virtual` with exit 12. Until v0.2 is in progress, the negative-coord scenario can't actually reach the AX path. Spike now would be hypothetical; spike during v0.2 is real-cost-vs-real-value.
+Procedure runbook preserved at `spikes/p5-spike/README.md` "v0.2 procedure — verify AX behavior with RoK on a BetterDisplay virtual display" for future Catalyst-Bridge investigations.
 
 ---
 
@@ -513,17 +490,22 @@ v0.1 single-shot tolerates 23s per run (operator waits, sees verify success/fail
 
 ---
 
-## P3: v0.1.5+ — AX messaging timeout calibration
+## ❌ DEAD — AX messaging timeout calibration
 
-**Source:** v0.1.5 C4 implementation (`src/ax.rs::AX_MESSAGING_TIMEOUT_SECONDS = 2.0`). The 2.0s value came from /plan-eng-review codex outside-voice recommendation, not empirical RoK measurement.
-**Effort:** human ~10 min / CC ~10 min
-**Depends on:** v0.1.5 landed; ≥20 real runs where the operator observed AX response latency under variable RoK state (idle, mid-animation, mid-loading-screen, server-bound action).
+**Verdict 2026-05-13:** `src/ax.rs` deleted in v0.1.6 along with its `AX_MESSAGING_TIMEOUT_SECONDS` constant. v0.1.6 click delivery is `CGEvent::post(HID)`, not AX press, so there is no AX RPC to time out. If a future revision re-introduces AX for some other purpose, calibrate then.
 
-Too tight: a busy-but-not-hung RoK (mid-loading-screen, server-bound click) would false-fail with `ax_timeout` exit 18 even though the press would have eventually succeeded. Too loose: a truly hung target wedges the bot for the full timeout window per click. 2.0s is a conservative initial guess covering "RoK is responsive" without making "RoK is wedged" too patient.
+## P3: v0.1.6+ — `ACTIVATION_SETTLE_MS` / `CLICK_GAP_MS` empirical calibration
+
+**Source:** v0.1.6 ship checkpoint. The two timing constants in `src/click.rs` (`ACTIVATION_SETTLE_MS = 50`, `CLICK_GAP_MS = 80`) are educated guesses derived from p5-spike behavior, not empirical RoK measurement against the full Mode 2 pipeline.
+**Effort:** human ~20 min run-and-tail / CC ~10 min for the calibration log script
+**Depends on:** ≥20 real Mode 2 runs across game states (city view, world view, mid-loading, server-bound action).
+
+Too tight `ACTIVATION_SETTLE_MS`: RoK ignores the HID tap because the Catalyst Bridge translation layer hasn't applied the foreground change yet. Too tight `CLICK_GAP_MS`: RoK's event loop collapses the down+up pair into a no-op. Too loose either: visible per-click latency that accumulates in v0.2's continuous loop.
 
 **Approach:**
-- v0.1.5's tracing logs already emit AX call timings (the per-step `AXUIElementCopyElementAtPosition failed` / `...PerformAction failed` warn lines, plus the `AX press dispatched` info on success). Add explicit start/end timestamps if needed.
-- Collect ~20 runs across scenarios. Compute p50/p95/p99 of (a) successful press call duration, (b) any `ax_timeout` failure duration.
-- Set `AX_MESSAGING_TIMEOUT_SECONDS = max(p99 success, 1.5) + 0.5s slack` rounded to one decimal. Update the in-range pin test (`ax_messaging_timeout_is_in_practical_range`) range if needed.
+- Add per-run timing logs at the activate/down/up boundaries.
+- Collect 20+ Mode 2 runs covering varied game states; record the success-rate vs. timing relationship.
+- Pick the smallest values that hold ≥95% success.
+- Update the constants + the `in_sane_range` pin tests if needed.
 
-**Why deferred:** no observed timeouts yet (v0.1.5 only smoke-tested without AX-side latency stress). Calibration without real data would be motion.
+**Why deferred:** v0.1.6 ships with conservative initial values that passed a live run on 2026-05-13. Calibration without volume of data would be motion. Re-open when v0.2's continuous loop produces enough samples to differentiate "click landed" from "click missed because of timing."
