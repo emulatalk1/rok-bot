@@ -87,6 +87,7 @@ version = "0.0.1"
 dependencies = [
  "core-foundation",
  "core-graphics",
+ "foreign-types-shared",
 ]
 
 [[package]]

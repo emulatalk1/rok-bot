@@ -4,7 +4,62 @@ Phase 0 spike for v0.1.5. Verifies whether `AXUIElementPerformAction`
 with `kAXPressAction` delivers clicks to RoK (an iOS-on-Mac Catalyst
 Bridge app) **regardless of window z-order at the click point**.
 
-## TL;DR
+## ⚠️ FALSE POSITIVE — Verdict superseded by /qa 2026-05-11
+
+The original verdict below ("PASS for z-order overlap") was correct at
+the **delivery layer** but wrong at the **targeting layer**. The 2026-05-11
+`/qa` end-to-end test against running RoK revealed:
+
+- AX press FFI calls succeed (`AXError 0`).
+- RoK observably responds (info panel opens; pixel_diff 500k+).
+- But the response is at `AXActivationPoint = (916.91, 487.24)` (window
+  center), NOT at the (x, y) passed to `AXUIElementCopyElementAtPosition`.
+
+Catalyst Bridge exposes RoK's entire game canvas as a single
+positionless `AXGenericElement`. The (x, y) arguments to
+`CopyElementAtPosition` are used to walk the AX tree — but RoK's tree
+has no per-control children to walk, so it always resolves to the same
+root element with a fixed activation point. `AXPress` fires at that
+fixed center, not at the caller's coords. `AXActivationPoint` is
+read-only (verified via the `--ax-set-point` mode added to this spike's
+`src/main.rs`).
+
+Subsequent research (same day) tested 5 other click delivery paths
+(HID+osascript, stealth HID, cua-driver default + count:3, bare
+SLEventPostToPid). All paths that fire the castle also auto-raise RoK
+— Catalyst Bridge auto-raises on any synthetic UITouch that wakes its
+event pipeline. **No Mode 1 click-delivery mechanism satisfies "works
+when covered + doesn't move cursor + doesn't raise RoK + fires castle"
+simultaneously.** See `TODOS.md` P0 entry for the full 6-path matrix.
+
+**Implication for this spike's verdict:** "AX press works on Catalyst
+Bridge" is true at the delivery layer (the FFI returns success and RoK
+reacts) and false at the targeting layer (the reaction happens at the
+wrong coord). The v0.1.5 production code at `src/ax.rs::press_at`
+inherits the targeting bug.
+
+**Scope lesson for future spikes:** "delivery works" is necessary but
+not sufficient. A spike's PASS verdict must include "the intended UI
+element fired," not just "RoK reacted." p3-spike (HID), p4-spike
+(`CGEventPostToPid`), and this spike all conflated the two. For v0.2
+work, every click-path spike must end with a visually-verified
+INTENDED-target press, not just "something happened in RoK."
+
+**Path forward:** v0.2 Mode 2 (BetterDisplay virtual display). On a
+virtual display, the AX targeting bug becomes invisible because nothing
+observes RoK's surface — the off-target popup that opens at the canvas
+center is acceptable as long as it produces a state change the matcher
+can re-orient from. See `TODOS.md` P2 v0.2 entries.
+
+The `--inspect`, `--app-tree`, `--stealth`, `--ax-set-point`, and
+`--skylight` modes added to `src/main.rs` on 2026-05-11 are the
+diagnostic artifacts that proved the canvas-positionless behavior. They
+should be preserved as project record for future Catalyst-Bridge
+investigations.
+
+---
+
+## TL;DR (original — see addendum above)
 
 **PASS for z-order overlap on the same Space.** AX press at a screen
 point covered by iTerm (overlapping RoK on the same Space) still reached
