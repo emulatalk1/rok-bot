@@ -50,7 +50,7 @@ use crate::capture::capture_window;
 use crate::click::click_at;
 use crate::display::{Mode, detect_mode};
 use crate::error::{BotError, Result};
-use crate::matcher::{find_target, screen_point, validate_match_dims};
+use crate::matcher::{find_target_in_castle_roi, screen_point, validate_match_dims};
 use crate::permissions::{
     ACCESSIBILITY, check_accessibility, check_screen_recording, peek_accessibility,
 };
@@ -163,10 +163,13 @@ fn run() -> Result<()> {
     }
 
     let pre_capture_path = PathBuf::from(CAPTURE_PRE_PATH);
+    let t_pre_capture = std::time::Instant::now();
     capture_window(window.id, &pre_capture_path)?;
+    let pre_capture_ms = u64::try_from(t_pre_capture.elapsed().as_millis()).unwrap_or(u64::MAX);
     tracing::info!(
         target: "rok_bot",
         path = %pre_capture_path.display(),
+        capture_ms = pre_capture_ms,
         "captured RoK window (pre-click)"
     );
 
@@ -176,7 +179,7 @@ fn run() -> Result<()> {
     // typed BotError so the exit-code contract stays uniform — shell users
     // distinguish "target absent" (15) from "image broken" (16) from
     // "needle too big" (17) without parsing log lines.
-    let m = find_target(&pre_capture_path)?.ok_or(BotError::TargetNotFound)?;
+    let m = find_target_in_castle_roi(&pre_capture_path)?.ok_or(BotError::TargetNotFound)?;
 
     // Design A16 zero-dim hard-fail: catch malformed Match at the boundary
     // before screen_point produces NaN/Inf coords. The check lives in
@@ -242,10 +245,13 @@ fn run() -> Result<()> {
     verify::sleep_verify_delay();
     validate_window_present(&window)?;
     let post_capture_path = PathBuf::from(CAPTURE_POST_PATH);
+    let t_post_capture = std::time::Instant::now();
     capture_window(window.id, &post_capture_path)?;
+    let post_capture_ms = u64::try_from(t_post_capture.elapsed().as_millis()).unwrap_or(u64::MAX);
     tracing::info!(
         target: "rok_bot",
         path = %post_capture_path.display(),
+        capture_ms = post_capture_ms,
         "captured RoK window (post-click)"
     );
     verify::after_state(&pre_capture_path, &post_capture_path, &m)?;

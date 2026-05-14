@@ -70,7 +70,7 @@ use std::time::Duration;
 use image::GrayImage;
 
 use crate::error::{BotError, Result};
-use crate::matcher::{Match, find_target, load_haystack};
+use crate::matcher::{Match, find_target_in_castle_roi, load_haystack};
 
 /// Wall-clock sleep between `click::click_at` returning and the post-click
 /// capture. Long enough to let RoK render typical UI-local transitions
@@ -229,7 +229,7 @@ pub fn after_state(pre_path: &Path, post_path: &Path, pre_match: &Match) -> Resu
 /// Diagnostic-only: re-match on the post haystack and log the outcome
 /// vs the pre-match. Best-effort; errors do not propagate.
 fn log_post_match_diagnostic(post_path: &Path, pre_match: &Match) {
-    match find_target(post_path) {
+    match find_target_in_castle_roi(post_path) {
         Ok(Some(m)) => {
             // Use abs_diff to avoid u32 underflow when post.x < pre.x
             // (Outside Voice F7 / /plan-eng-review D9). Neither delta
