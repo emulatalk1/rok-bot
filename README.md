@@ -2,15 +2,15 @@
 
 Rust-based macOS automation experiment for **Rise of Kingdoms** on Apple Silicon. Personal/learning project. Public so others can read the design choices, not because it's polished or supported.
 
-## Status: v0.1.6 — Mode 1 + Mode 2 end-to-end pipeline with stealth HID click delivery
+## Status: v0.1.7 — ROI-cropped NCC cuts match latency ~22s → ~440ms (50×)
 
-What works today (v0.1.6):
+What works today (v0.1.7):
 - Find the RoK main window via `CGWindowListCopyWindowInfo` (filtered by `owner == title == "RiseOfKingdoms"` plus a bundle-ID anti-spoof check against `com.rok.ios.*`).
 - **Hidden-Space distinction at boot.** If RoK is running but its window isn't on a currently-displayed Space (another app went fullscreen, RoK is minimized to Dock), exit 19 `WindowChanged { not_visible }` with an actionable message — distinct from exit 10 `WindowNotFound` (RoK not running). Detected by falling back to `kCGWindowListOptionAll` when `OnScreenOnly` doesn't match.
 - Classify which display RoK is on via `CGDisplayIsBuiltin`. Both built-in (`Mode::Visible`) and non-built-in (`Mode::Virtual` — BetterDisplay virtual, external monitor, Sidecar) proceed through the same pipeline. v0.1.5's exit-12 Mode 2 gate was dropped in v0.1.6.
 - Screen Recording **and** Accessibility TCC preflights with first-install `request()` fallback so brand-new Macs aren't trapped in a permission dead-end.
 - **Capture the RoK window to `rok-capture-pre.png`** via Apple's `screencapture -l <wid> -x -o` CLI — silent, no shadow, ~50-100ms per call. Captures RoK's backing store regardless of on-screen overlays OR which display the window lives on.
-- **Template-match a known UI element** via `imageproc::match_template_parallel` (rayon-parallel NCC sliding window). Embedded needle, configurable `MATCH_THRESHOLD` (default `0.85`). ~21s on M-series for the standard 2102×1640 Retina haystack (v0.2 FFT-NCC migration tracked in TODOS).
+- **Template-match a known UI element** via `imageproc::match_template_parallel` (rayon-parallel NCC sliding window), restricted to a castle-button ROI. `find_target_in_castle_roi` crops the haystack to the bottom-left quadrant (20% × 25% of the capture) before NCC, dropping the heatmap from 2.81M to 56K positions. Live-confirmed v0.1.7: ~442ms per match on the 2102×1640 Retina haystack, down from ~22s in v0.1.6 (50× speedup). Match coords are restored to full-capture space inside `find_target_impl`, so `screen_point` math is unchanged. Configurable `MATCH_THRESHOLD` (default `0.85`); ROI dims pinned via `CASTLE_BUTTON_ROI_FRACTION_*` constants. FFT-NCC was the original v0.2 plan; ROI alone hit the target, so FFT is now indefinitely deferred.
 - **Placeholder-sentinel safety brake.** The shipped needle has a structural sentinel (`[255, 0, 255, 0]` top-left luma + xorshift32 noise body); `matcher::needle_has_placeholder_sentinel` fail-closes BEFORE NCC runs so the bot can never synthetically click against a falsely-matched placeholder. /qa caught a real placeholder false-match at 0.93 NCC; this brake prevents the class.
 - **4-check pre-click TOCTOU validation** (v0.1.5, anchored on WID+PID, runs BEFORE the AX TCC prompt so a hidden-Space exit doesn't waste an Accessibility grant). Maps to four `WindowChanged` reasons: `window_id_gone`, `not_visible`, `frame_moved`, `point_outside_frame`.
 - **Click delivery via stealth HID tap + osascript activation** (v0.1.6 — reverts v0.1.5 AX press, which was structurally broken on Mac Catalyst Bridge; see TODOS for the full 6-path investigation). Sequence: `osascript` activate RoK by pid via System Events → 50ms settle → probe + disassociate cursor → `CGEvent::post(HID)` `LeftMouseDown` → 80ms gap → `LeftMouseUp` → warp logical cursor back → reassociate. RAII `CursorStealth` guard restores the cursor on panic/early-return.
@@ -20,7 +20,7 @@ What works today (v0.1.6):
 - Structured exit codes (10–11, 13–20; slot 12 left unused after v0.1.5's `RokNotOnPrimary` was deleted) for shell consumers; tracing logs to stderr with `error_kind` + `exit_code` fields.
 
 Not yet built (see [TODOS.md](TODOS.md)):
-- **Continuous capture+match+click+verify loop** — v0.1.6 is single-shot. v0.2 wraps the v0.1.4 verify primitive per-click and migrates from the `screencapture` CLI to `objc2-screen-capture-kit` for zero subprocess overhead. NCC → FFT-NCC migration becomes load-bearing at that point (the current ~21s match latency is the v0.2 blocker).
+- **Continuous capture+match+click+verify loop** — v0.1.7 is single-shot. v0.2 wraps the v0.1.4 verify primitive per-click and migrates from the `screencapture` CLI to `objc2-screen-capture-kit` for zero subprocess overhead. v0.2 also adds **last-position ROI** (search a ±50px window around the last known match) for near-zero per-tick NCC cost, and a **full-frame fallback** for the edge case where the castle ROI misses (e.g., RoK UI layout drift).
 - **Server-roundtrip click verify** — 500ms covers UI-local transitions (toggle, dropdown, modal). Server-bound clicks (resource spend, troop dispatch) show a 1-3s spinner; retry-and-poll at multiple delay tiers is queued.
 - **Mode 2 lifecycle automation** — v0.1.6 expects the operator to set up the BetterDisplay virtual display manually and drag RoK to it. v0.2 adds RAII lifecycle, panic-safe disconnect, drop-detection, and a state file so a clean exit restores the user's display arrangement.
 - **Multi-instance / "farm" support.**
@@ -54,7 +54,7 @@ Full setup walkthrough: [docs/setup.md](docs/setup.md). Pre-commit hook install 
 ## Repo layout
 
 ```
-src/                     v0.1.6 Rust source (9 modules, 136 unit + integration tests)
+src/                     v0.1.7 Rust source (9 modules, 148 unit + integration tests)
 assets/targets/          embedded matcher needles (placeholder until first real RoK crop)
 docs/setup.md            user-facing setup guide
 docs/rok_rust_bot_research.md   pre-implementation architecture research
@@ -68,7 +68,7 @@ CLAUDE.md                project instructions for Claude Code agent sessions
 
 ```sh
 cargo build --release --locked
-cargo test --locked                                                  # 136 passing
+cargo test --locked                                                  # 148 passing
 cargo clippy --all-targets --all-features --locked -- -D warnings    # mbrain-style strict
 cargo fmt --all -- --check
 ```

@@ -473,20 +473,28 @@ Procedure runbook preserved at `spikes/p5-spike/README.md` "v0.2 procedure — v
 
 ---
 
-## P2: v0.2 blocker — 23-second NCC match latency on Retina 2102×1640 captures
+## ✅ DONE — v0.1.7 SHIPPED: ROI-cropped NCC cuts match latency ~22s → ~440ms (50×)
 
-**Source:** /plan-eng-review for v0.1.5 (2026-05-11). Observed during v0.1.4 smoke test: `imageproc::match_template_parallel` with `CrossCorrelationNormalized` takes ~23s wall on M-series for the standard Retina haystack against the 56,900-byte city-button needle.
-**Effort:** human ~1 hour audit / CC ~4-6 hours for FFT-NCC swap
-**Depends on:** v0.2 continuous-loop scope (P2: FFT-based NCC for continuous-loop matching, line ~146) — same root cause.
+**Resolved 2026-05-14** by commit `7cb1e5a`, tag `v0.1.7`. Live-confirmed against RoK on a BetterDisplay virtual display: match at capture-pixel (129, 1460) score 0.922, screen point (-1015.5, 867), pixel_diff 113K, exit 0, click visually confirmed. NCC dropped from 22,280ms (v0.1.6 baseline) to 442ms — 50× speedup. End-to-end wall: 46s → 2.7s.
 
-v0.1 single-shot tolerates 23s per run (operator waits, sees verify success/failure). v0.2 continuous loop fires every few seconds; 23s per match is fatal — the bot spends 90%+ of wall time inside the matcher, can't catch UI state changes that resolve faster than the match window, and CPU pegs at ~80% sustained.
+### What v0.1.7 ships
 
-**Approach:**
-- Empirical first: profile the current match to confirm 23s is NCC, not capture/decode. `cargo flamegraph --release -- <args>` against a known-input run.
-- Then either: (a) shrink the haystack region (only NCC against the expected bottom-right corner where city-button lives — see P3 "v0.1.3+ multi-match disambiguation" for related cropping work), OR (b) switch to FFT-based NCC (`opencv-rust` cv::matchTemplate with TM_CCOEFF_NORMED via FFT; heavy dep but production-proven), OR (c) custom SIMD path via `wide` / `pulp`.
-- Pick after profiling tells us where the time goes.
+- `src/matcher.rs`: new `Roi` struct, four `CASTLE_BUTTON_ROI_FRACTION_*` consts (X=0.0, Y=0.75, W=0.20, H=0.25), `castle_button_roi(w, h)` constructor with edge clamping, three public entries (`find_target`, `find_target_in_roi`, `find_target_in_castle_roi`) sharing `find_target_impl` via a closure that receives haystack dims and returns the ROI. `match_in` is unchanged (still pure); the offset is restored at the `Match` boundary in `find_target_impl`. `roi_offset_x`/`roi_offset_y` added to the timing log so operators tuning the ROI from the no-match warn always see the full-capture-space translation.
+- `src/main.rs`: live pipeline switched to `find_target_in_castle_roi`. `capture_ms` added to pre/post `screencapture` log lines for v0.2 profiling.
+- `src/verify.rs`: post-click diagnostic re-match uses the same castle-ROI entry. Bounded to the same sub-region as the pre-click match.
+- 12 new tests (148 total): fraction-const pinning, observed-match containment for 2102×1640, bounds across DPI configs, zero-capture degeneracy, full-capture-space offset, capture_dims preservation, ROI exclusion of out-of-ROI needles, OOB ROI rejection, zero-size ROI rejection, end-to-end castle-ROI matching at observed coords, full vs castle-ROI cross-check (both entries agree on coords + capture_dims when needle is in-quadrant).
 
-**Why deferred:** v0.1.5 ships single-shot; 23s is annoying but tolerable. The fix work overlaps significantly with v0.2's continuous-loop matcher rewrite, and doing it twice would be wasted motion.
+### Why ROI not FFT (and why FFT-NCC is now indefinitely deferred)
+
+The original TODO listed three mitigation options: (a) shrink the haystack region, (b) FFT-based NCC via `opencv-rust`, (c) custom SIMD path. Profiled the current match first: 22.28s for NCC, 37ms for haystack decode, ~0ms for needle decode — NCC is 99.7% of match time. Back-of-envelope `O(heatmap_pixels × needle_pixels)` for 2102×1640 vs 180×180 is ~91 billion ops per pass. Heatmap was 2.81M positions.
+
+Picked option (a) "shrink the haystack region" because the castle medallion lives consistently in the bottom-left quadrant across Mode 1 (built-in Retina 2102×1640) and Mode 2 (BD virtual 2102×1640) captures. Cropping to `(0..420, 1230..1640)` (a 20% × 25% ROI of the capture) dropped the heatmap to 56K positions — 50× reduction in NCC work, matching the projected speedup exactly. FFT-NCC (option b) is now indefinitely deferred: ROI alone brings single-shot pipeline to ~2.7s end-to-end and per-tick NCC well under v0.2's continuous-loop budget. opencv-rust dep adds significant build complexity for no remaining latency need.
+
+### Known limitations carried into v0.2
+
+- **ROI < needle on sub-900×720 captures.** Current Mode 2 BD capture is 2102×1640 (well above threshold), so this doesn't fire in practice. v0.2 continuous loop should add a full-frame fallback (search full haystack when ROI returns `TargetTooLarge`).
+- **ROI-local false-positive risk.** Pre-ROI, the full-capture NCC compared every candidate against the whole image; any false positive had to beat the real castle's 0.98 score. Post-ROI, a false positive only has to clear 0.85 inside the ROI. Real-needle distinctive shape + observed live score of 0.92 makes this unlikely in practice. Mitigate empirically: tighten `MATCH_THRESHOLD` from 0.85 toward 0.90 after ≥10 live runs show score distribution.
+- **MATCH_THRESHOLD calibration deferred.** Same as above — need real-data points before tightening.
 
 ---
 
