@@ -1,0 +1,25 @@
+[package]
+name = "p8-spike"
+version = "0.0.1"
+edition = "2024"
+publish = false
+description = "v0.2 Phase 0 spike — verify objc2-screen-capture-kit one-shot CGWindow capture replaces /usr/sbin/screencapture CLI"
+
+# Detach from the parent rok-bot Cargo project so the spike has its own
+# Cargo.lock and doesn't pollute the main crate's dep graph. Same pattern
+# as p3-spike / p5-spike.
+[workspace]
+
+[dependencies]
+objc2                    = "0.6"
+objc2-foundation         = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSError", "NSString"] }
+objc2-core-foundation    = { version = "0.3", default-features = false, features = ["std", "CFCGTypes"] }
+objc2-core-graphics      = { version = "0.3", default-features = false, features = ["std", "CGImage", "CGDataProvider", "CGColorSpace", "CGGeometry"] }
+objc2-screen-capture-kit = { version = "0.3", default-features = false, features = ["std", "SCStream", "SCShareableContent", "SCScreenshotManager", "block2", "objc2-core-graphics", "objc2-core-foundation"] }
+block2                   = "0.6"
+dispatch2                = "0.3"
+image                    = { version = "0.25", default-features = false, features = ["png"] }
+
+[[bin]]
+name = "p8-spike"
+path = "src/main.rs"
