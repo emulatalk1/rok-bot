@@ -1,6 +1,23 @@
 # Setup
 
-> **v0.1.7 status:** Both **Mode 1 (visible)** and **Mode 2 (virtual display)** ship today. Mode 2 is the recommended operating mode — RoK lives on a BetterDisplay virtual display, the bot operates invisibly, you keep using the Mac. v0.1.7 adds ROI-cropped template matching, dropping single-shot end-to-end from ~46s to ~2.7s (50× NCC speedup). The Mode 2 lifecycle automation (shortcuts that connect/disconnect the virtual display per session) is **still deferred to v0.2**; for now you set BD up once manually and the bot uses whatever's there.
+> **v0.1.8 status:** Both **Mode 1 (visible)** and **Mode 2 (virtual display)** ship today. Mode 2 is the recommended operating mode — RoK lives on a BetterDisplay virtual display, the bot operates invisibly, you keep using the Mac. v0.1.8 replaces the v0.1.x `screencapture` CLI subprocess with in-process `objc2-screen-capture-kit`: per-capture latency drops from ~280-1400ms to ~140ms steady-state. **macOS 14.0+ required** (SCScreenshotManager is 14+) and **Screen Recording must be granted to the `rok-bot` binary itself** — see "First-run TCC grant" below. The Mode 2 lifecycle automation (shortcuts that connect/disconnect the virtual display per session) is **still deferred to v0.2**; for now you set BD up once manually and the bot uses whatever's there.
+
+## First-run TCC grant (v0.1.8 UX regression)
+
+v0.1.x's CLI shellout to `/usr/sbin/screencapture` inherited Screen Recording trust from the parent terminal — granting Terminal/iTerm SR was enough.
+
+v0.1.8's in-process SCK requires the `rok-bot` binary itself to be granted SR. On first run after upgrading you'll see:
+
+```
+[ERROR] RoK window capture failed (stage: no_shareable_content, exit code: …)
+[ERROR] ScreenCaptureKit could not enumerate shareable content. Most likely
+        cause: Screen Recording not granted to the rok-bot binary itself.
+        Grant in System Settings → Privacy & Security → Screen Recording
+        (look for 'rok-bot' in the list)…
+```
+
+Grant the binary in **System Settings → Privacy & Security → Screen Recording**, toggle the new `rok-bot` entry on, then re-run. One-time per binary path (re-grant if you `cargo build --release` to a different target).
+
 
 `rok-bot` is designed to run in two modes depending on where Rise of Kingdoms is parked.
 
@@ -15,7 +32,7 @@ The Mode 2 sections below cover setup with **BetterDisplay** (free, no real hard
 
 ---
 
-## Mode 1 — zero setup (v0.1.6 shipped)
+## Mode 1 — zero setup (v0.1.6 shipped, v0.1.8 SCK migration)
 
 Make sure RoK is on your built-in display, then run the bot.
 
@@ -30,7 +47,7 @@ Boot sequence (logged to stderr via `tracing`):
 2. **Accessibility peek (warn-only).** Logs a warning if AX isn't yet granted; the hard check fires later only if we're actually about to deliver a click.
 3. **Find the RoK main window.** Filtered by `kCGWindowOwnerName == kCGWindowName == "RiseOfKingdoms"` AND backed by a process whose bundle ID starts with `com.rok.ios.` (anti-spoof gate). Search `kCGWindowListOptionOnScreenOnly` first; if no match, fall back to `kCGWindowListOptionAll`. Three outcomes: found visible → continue. Found in All but not OnScreenOnly → exit 19 `WindowChanged { not_visible }` (RoK is running but on a hidden Space, minimized, or transient state — switch to its Space or unminimize). No match anywhere → exit 10 `WindowNotFound`.
 4. **Classify display.** `CGDisplayIsBuiltin` test — built-in (laptop Retina panel) → `Mode::Visible`, anything else → `Mode::Virtual`. v0.1.6 lets both modes proceed; v0.1.5's exit-12 gate was removed.
-5. **Pre-click capture.** Capture the RoK window to `./rok-capture-pre.png` via `/usr/sbin/screencapture -l <window_id> -x -o` (silent, no shadow). Works regardless of which display RoK is on or whether other windows overlap RoK's frame on screen. Exit 14 (`CaptureFailed`) if `screencapture` returns non-zero.
+5. **Pre-click capture.** Capture the RoK window to `./rok-capture-pre.png` via in-process `SCScreenshotManager.captureImageWithFilter` (v0.1.8 — replaces the v0.1.x `/usr/sbin/screencapture -l <wid>` CLI shellout). ~191ms cold, ~126ms with `SCShareableContent` cache hit. PNG write via `O_NOFOLLOW + O_EXCL` atomic open (race-free against symlink TOCTOU). Exit 14 (`CaptureFailed { stage: … }`) on failure with one of: `symlink_refused`, `no_shareable_content`, `window_not_found`, `capture_returned_nil`, `cgimage_decode`, `png_write`.
 6. **Template-match the target inside the pre-capture.** Decode the haystack PNG via `image::ImageReader` with `Limits` (`max_image_width`/`max_image_height` = 8192) so a malformed or oversized PNG fails fast as `ImageLoadFailed` (exit 16) instead of OOM-ing. Decode the embedded needle (`assets/targets/city-button.png`). The `needle_has_placeholder_sentinel` gate runs first — if the needle still carries the placeholder sentinel pattern (`[255, 0, 255, 0]` top-left luma), it logs `WARN placeholder sentinel needle detected; refusing to match` and returns exit 15 (`TargetNotFound`) BEFORE any NCC math runs. Otherwise, crop the haystack to the castle-button ROI (bottom-left quadrant, 20% × 25% of the capture per `CASTLE_BUTTON_ROI_FRACTION_*` constants in `matcher.rs`) and run `imageproc::match_template_parallel` with `CrossCorrelationNormalized` against `MATCH_THRESHOLD = 0.85`. Match coords are restored to full-capture space before returning. Exit 15 (`TargetNotFound`) on no match; exit 17 (`TargetTooLarge`) if the needle is strictly larger than the ROI in either dimension. Current latency (v0.1.7): ~440ms on M-series for a 2102×1640 Retina haystack, down from ~22s in v0.1.6 (50× speedup via ROI cropping — FFT-NCC migration is no longer needed and indefinitely deferred).
 7. **4-check pre-click TOCTOU validation.** Anchors on `(WID, PID)` and checks both `OnScreenOnly` and `All` window lists: (a) `(WID, PID)` present in `All` (catches WID reuse), (b) `(WID, PID)` present in `OnScreenOnly` (catches mid-flow hide), (c) frame within tolerance, (d) click point inside expected frame. Maps to `WindowChanged` reasons `window_id_gone` / `not_visible` / `frame_moved` / `point_outside_frame` (all exit 19). **Validation runs BEFORE the Accessibility hard check** so a hidden-Space exit doesn't first trigger the AX TCC prompt.
 8. **Accessibility hard check.** A match was found AND the window is reachable, so we're about to click. Demand Accessibility now — first-run UX is "exit 13, grant in Settings, re-run." Exit 13 (`PermissionsMissing`) if denied. (Required because `CGEvent::post(HID)` silently no-ops without AX trust on macOS 10.14+.)
@@ -44,7 +61,7 @@ Exit codes for shell users:
 - `11` = `WindowScreenUnresolved`
 - (exit `12` unused — was `RokNotOnPrimary` in v0.1.5, deleted in v0.1.6 when the Mode 2 gate opened)
 - `13` = `PermissionsMissing` (grant Screen Recording and/or Accessibility, re-run)
-- `14` = `CaptureFailed` (rare; usually means Screen Recording was revoked between preflight and capture)
+- `14` = `CaptureFailed` (v0.1.8: stage tag in error message — `symlink_refused`, `no_shareable_content`, `window_not_found`, `capture_returned_nil`, `cgimage_decode`, `png_write`. Most common cause: SR not granted to the rok-bot binary itself, see "First-run TCC grant" above.)
 - `15` = `TargetNotFound` (placeholder-sentinel gate fired, OR capture decoded fine but best NCC score below `MATCH_THRESHOLD`; see [the placeholder note](#v014-target-asset-placeholder--sentinel-gate) below)
 - `16` = `ImageLoadFailed` (haystack PNG missing, malformed, or larger than 8192×8192; or embedded needle decode fails — defensive arm for a corrupt asset commit)
 - `17` = `TargetTooLarge` (needle dims strictly greater than haystack dims; rare in practice)

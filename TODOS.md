@@ -109,17 +109,9 @@ P1.
 
 ---
 
-## P1: Migrate from `screencapturekit` Rust crate to `objc2-screen-capture-kit`
+## ✅ DONE — v0.1.8 SHIPPED: In-process ScreenCaptureKit migration
 
-**Source:** P2 spike build failure 2026-05-06
-**Effort:** human ~half day / CC ~1 hour
-**Depends on:** v0.1 implementation phase
-
-The `screencapturekit` Rust crate (1.5.x) wraps an internal Swift package via `swift-bridge`. The build script invokes `xcrun --sdk macosx --show-sdk-platform-path`, which fails on machines with only Xcode Command Line Tools installed (full Xcode required). This makes the dep a hard install-time blocker for any contributor without ~14 GB of Xcode.
-
-`objc2-screen-capture-kit` (0.3.x) is the canonical alternative — direct ObjC2 message-passing bindings, no Swift bridge, no Xcode requirement. v0.1 should use it from day one.
-
-Until then, the spike at `spikes/p2-spike/run.sh` shells out to Apple's `screencapture -l <wid>` CLI for capture, which works fine for verification but is not appropriate for v0.1 (subprocess overhead per frame).
+**Resolved 2026-05-15** via commit `85d79bb` (`feat(v0.1.8): SCK in-process capture migration`). v0.1.8 retires the `/usr/sbin/screencapture` CLI shellout and replaces it with `SCScreenshotManager.captureImageWithFilter` from `objc2-screen-capture-kit` 0.3.x. Live-confirmed on Mode 2 BD virtual display: ~140ms steady-state per capture vs ~280-1400ms via the CLI. New `src/cg_bootstrap.rs` (NSApplicationLoad), full rewrites of `src/capture.rs` and `src/window.rs`, `Arc<*Slot>` UAF fix, `O_NOFOLLOW + O_EXCL` symlink-safe PNG write. Ten locked decisions from `/plan-eng-review` (D1-D10 + T1-T4 cross-model tensions) all implemented; 149 unit tests + 5 `#[ignore]`'d integration tests; pre-landing `/review` caught + fixed 5 critical bugs (2 UAFs, symlink TOCTOU, codex-caught regression in the symlink fix, codex-caught error swallowing in find_rok_window); /qa exit 0 on first try. Originally specced 2026-05-06 as the v0.1 day-one path; deferred to v0.1.8 because the v0.1.x ship needed a working spike first.
 
 ---
 
