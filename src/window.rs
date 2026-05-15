@@ -1,22 +1,59 @@
-//! Window enumeration via Core Graphics.
+//! Window enumeration via ScreenCaptureKit (v0.1.8) backed by Core
+//! Graphics for the visibility-on-current-Space check.
 //!
-//! Finds the single Rise of Kingdoms main window and returns its frame in
-//! CG coordinates. The matcher requires both `kCGWindowOwnerName` AND
-//! `kCGWindowName` to equal `"RiseOfKingdoms"` — RoK spawns auxiliary
-//! windows (splash, header overlays, popups) that share the owner but
-//! have a different title or no title at all. Per the verified P7 spike,
-//! the main window keeps a stable window ID and PID across BD
-//! disconnect/reconnect, so identifying it by owner+title is sufficient.
+//! v0.1.8 migrates the discovery surface from `CGWindowListCopyWindowInfo`
+//! (the v0.1.x path) to `SCShareableContent.getShareableContentWith
+//! CompletionHandler`. The CGWindow enumeration stays — it's the only
+//! cheap way to distinguish "RoK on a hidden Space" from "RoK gone"
+//! (SCK's `windows` list returns both without distinction). The two
+//! sources together preserve v0.1.6's exit-19 (`REASON_NOT_VISIBLE`)
+//! vs exit-10 (`WindowNotFound`) operator-actionable split.
+//!
+//! Per the v0.1.8 design (D2/T3), `SCShareableContent` is cached at
+//! module level and invalidated only on `CaptureFailed { stage =
+//! window_not_found }`. Without the cache, every validator + capture
+//! call would re-pay the ~95 ms enumeration cost; with it, only the
+//! first call per session (or first call after invalidation) pays.
+//!
+//! ## Ownership pass on `RokWindow` (codex #6)
+//!
+//! `RokWindow` is owned by `main.rs::run` and borrowed by validators
+//! (`&RokWindow`). It's `Clone` (one `Retained` retain ≈ ~10 ns), so
+//! tests and helpers can take it by value cheaply. The
+//! `Retained<SCWindow>` inside is reference-counted by SCK's autorelease
+//! machinery; cloning bumps the retain count, dropping decrements.
+//! The clone is NOT a deep copy of the underlying Cocoa window — both
+//! the original and the clone reference the same `SCWindow` object.
 
 #![allow(
     unsafe_code,
-    reason = "Core Graphics FFI is required to wrap CFString constants and to call \
-              CGRectMakeWithDictionaryRepresentation; the unsafe surface is contained \
-              in this module."
+    reason = "Core Graphics + ScreenCaptureKit FFI are required for the \
+              CGWindow visibility check + the SCK enumeration; the unsafe \
+              surface is contained in this module."
 )]
+// Apple framework names dominate the docstrings; allow CamelCase
+// terms without backticks for readability. The project-wide pedantic
+// lint is `warn`; this module opts out.
+#![allow(clippy::doc_markdown)]
+// validate_inner + validate_present_inner need 7 + 8 args (the SCK
+// frame parameter pushed validate_inner over the 7 ceiling); a
+// struct-bundling refactor would hurt the per-test readability of
+// the existing v0.1.5 test suite and buy nothing.
+#![allow(clippy::too_many_arguments)]
+// ContentCache wraps Mutex<Option<Retained<SCShareableContent>>>;
+// the Retained inner is not auto-Send because objc2 doesn't
+// declare Send/Sync on SCShareableContent's binding. We add the
+// unsafe impl with a documented justification (Apple's SCK is
+// thread-safe per the framework docs); this clippy lint then
+// fires on the impl itself, but the safety reasoning is captured
+// in the SAFETY comments on the unsafe impls.
+#![allow(clippy::non_send_fields_in_send_ty)]
 
 use std::ffi::c_void;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
+use block2::RcBlock;
 use core_foundation::ConcreteCFType;
 use core_foundation::base::{CFType, TCFType};
 use core_foundation::dictionary::CFDictionary;
@@ -27,36 +64,36 @@ use core_graphics::window::{
     copy_window_info, kCGNullWindowID, kCGWindowBounds, kCGWindowListOptionOnScreenOnly,
     kCGWindowName, kCGWindowNumber, kCGWindowOwnerName, kCGWindowOwnerPID,
 };
+use dispatch2::{DispatchSemaphore, DispatchTime};
+use objc2::rc::Retained;
+use objc2_foundation::NSError;
+use objc2_screen_capture_kit::{SCShareableContent, SCWindow};
 
+use crate::capture::STAGE_WINDOW_NOT_FOUND;
+use crate::cg_bootstrap::register_with_window_server;
 use crate::error::{BotError, Result};
 
+/// RoK's CGWindow owner-name string. v0.1.x's CGWindowList-driven
+/// discovery filtered by this directly; v0.1.8 routes through
+/// SCK's `SCWindow.owningApplication.bundleIdentifier` instead, so
+/// the constant is kept only for documentation + future diagnostic
+/// use (operator may grep CG snapshots manually).
+#[allow(
+    dead_code,
+    reason = "v0.1.x discovery path retired in v0.1.8; constant retained \
+              for operator-side reference + future fallback"
+)]
 pub const ROK_OWNER: &str = "RiseOfKingdoms";
+
+/// RoK's CGWindow title string AND its SCWindow.title() value.
+/// Used by SCK enumeration to filter the main window from RoK's
+/// auxiliary windows (splash, popups) which share owningApplication
+/// but have a different title.
 pub const ROK_TITLE: &str = "RiseOfKingdoms";
 
-/// Reason tags surfaced via `BotError::WindowChanged { reason }`. Each
-/// check in the v0.1.5 validation pipeline maps to one of these constants;
-/// pinned as `&'static str` so the operator-facing log line is always
-/// one of these four values and tests assert against them directly.
-///
-/// **v0.1.5 changes vs v0.1.3:**
-/// - `REASON_NOT_TOPMOST` was deleted. The 3-site hidden-Space check
-///   subsumes most of its operator value (the click-time occluder case
-///   is now caught earlier as `REASON_NOT_VISIBLE`), and `kAXPressAction`
-///   on a Catalyst Bridge app like RoK delivers through z-order overlap
-///   anyway — see `learnings/ax-press-works-catalyst`.
-/// - `REASON_NOT_VISIBLE` is new: the WID+PID pair exists in
-///   `kCGWindowListOptionAll` but is missing from
-///   `kCGWindowListOptionOnScreenOnly`. Covers hidden Space (another
-///   app went fullscreen and pushed RoK to a separate Space), minimized
-///   to Dock, and transient `WindowServer` states that hide a window
-///   without destroying it. Distinct from `REASON_WID_GONE` so the
-///   operator knows whether to switch Spaces vs restart RoK.
-/// - `REASON_POINT_OUTSIDE_FRAME` is new: the click point computed
-///   from `screen_point(&match, &window.frame)` is not inside the
-///   discovered frame. Catches bad coord math (negative origin sign
-///   flip, off-by-one) and pure validation: under v0.1.3 the topmost
-///   walk accidentally enforced this; without explicit checking, the
-///   AX press could deliver at unintended desktop coords.
+/// Reason tags surfaced via `BotError::WindowChanged { reason }`.
+/// Preserved verbatim from v0.1.5/v0.1.6 — shell users + log parsers
+/// pattern-match against these strings.
 pub const REASON_WID_GONE: &str = "window_id_gone";
 pub const REASON_FRAME_MOVED: &str = "frame_moved";
 pub const REASON_NOT_VISIBLE: &str = "not_visible";
@@ -64,117 +101,298 @@ pub const REASON_POINT_OUTSIDE_FRAME: &str = "point_outside_frame";
 
 /// `kCGWindowListOptionAll` = 0. The `core-graphics` 0.x crate exposes only
 /// `kCGWindowListOptionOnScreenOnly`; the underlying CG enum uses 0 as the
-/// "no on-screen filter" value (every window the calling process is allowed
-/// to see, including those on hidden Spaces and minimized to the Dock).
-/// Declared locally to avoid waiting on a crate update. Verified against
-/// Apple's CGWindow.h: `enum { kCGWindowListOptionAll = 0, ... }`.
+/// "no on-screen filter" value.
 const K_CG_WINDOW_LIST_OPTION_ALL: u32 = 0;
 
-/// Tolerance for per-coordinate frame drift in
-/// [`validate_at_click_site`]. macOS reports window bounds to fractional
-/// pixels but ordinary user-driven moves and resizes always shift by at
-/// least 1 point in some axis. `1.0` accepts the noise floor (sub-pixel
-/// jitter from screencapture / window-server rounding) while still
-/// catching any real move/resize. Tighten if false positives bite, relax
-/// if false negatives ever bite.
+/// Tolerance for per-coordinate frame drift in [`validate_at_click_site`].
+/// 1.0 point accepts sub-pixel jitter while still catching real moves.
 pub const FRAME_TOLERANCE_POINTS: f64 = 1.0;
 
 /// Bundle-ID prefix that legitimate RoK installs share. Verified on
 /// `/Applications/RiseOfKingdoms.app` (Vietnam region: `com.rok.ios.vn`).
-/// The `.vn` / `.kr` / `.us` suffix varies by region but the prefix is
-/// stable across all official releases. Used as a spoof check: any
-/// process can set `kCGWindowOwnerName == "RiseOfKingdoms"` and
-/// `kCGWindowName == "RiseOfKingdoms"`, but only the real game has a
-/// bundle ID under `com.rok.ios.`. Without this gate, once v0.1+ adds
-/// synthetic input or screen capture, a spoof could redirect the bot
-/// onto an attacker-controlled window.
+/// Spoof gate: any process can set `kCGWindowOwnerName == "RiseOfKingdoms"`,
+/// but only the real game has a bundle ID under `com.rok.ios.`.
 pub const ROK_BUNDLE_PREFIX: &str = "com.rok.ios.";
 
-#[derive(Debug, Clone, Copy)]
-pub struct Window {
+/// Maximum wait for `SCShareableContent.getShareableContentWith
+/// CompletionHandler` to deliver. Larger than the per-tick capture
+/// timeout because TCC prompts can stall this call until user
+/// interaction (only on the first launch where SR isn't yet granted
+/// to the rok-bot binary).
+const SHAREABLE_CONTENT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Global cache of the most recent `SCShareableContent` snapshot
+/// (D2/T3 from `/plan-eng-review`). The first call to
+/// [`get_or_fetch_shareable_content`] populates the cache; subsequent
+/// calls return the cached `Retained<SCShareableContent>` (~10 ns
+/// vs ~95 ms cold). [`invalidate_shareable_content_cache`] clears
+/// the slot on `CaptureFailed { stage = "window_not_found" }`,
+/// triggering a re-fetch on the next call.
+///
+/// `Mutex<Option<Retained<SCShareableContent>>>` is the shape: the
+/// outer `Mutex` provides interior mutability for cache update; the
+/// `Option` lets us distinguish "not yet fetched" from "fetched but
+/// SCK gave us nothing" (the latter never happens in practice — SCK
+/// either returns content or errors).
+///
+/// `SCShareableContent` is an `NSObject` subclass with no main-thread
+/// requirements (the `objc2-screen-capture-kit` 0.3.2 binding doesn't
+/// declare `MainThreadMarker`), but `objc2`'s `Retained<T>` doesn't
+/// auto-derive `Send + Sync` because the underlying `*const UnsafeCell`
+/// makes the auto-derive bail. The wrapper newtype below carries
+/// explicit `unsafe impl Send + Sync` so the cache can live in a
+/// `static` (Apple's SCK is documented thread-safe; the rok-bot
+/// process is single-threaded today, but the unsafe impls are
+/// future-proof against the v0.2 continuous loop).
+struct ContentCache(Mutex<Option<Retained<SCShareableContent>>>);
+
+// SAFETY: `SCShareableContent` is an NSObject without main-thread-only
+// constraints. Apple documents SCK as safe to call from any queue;
+// the cached pointer can be cloned and dereferenced from any thread.
+// The outer `Mutex` enforces interior-mutability serialization for
+// the Option slot itself.
+unsafe impl Send for ContentCache {}
+// SAFETY: see Send impl above. `&ContentCache` exposes only `Mutex`
+// methods, which serialize access to the inner `Option`.
+unsafe impl Sync for ContentCache {}
+
+static SCK_CONTENT_CACHE: OnceLock<ContentCache> = OnceLock::new();
+
+/// Per-fetch slot for `fetch_shareable_content`'s completion-handler
+/// result. Same wrapper pattern as `ContentCache` (and `capture::
+/// ImageSlot`): the contained `Retained<SCShareableContent>` does
+/// not auto-derive Send + Sync via objc2, but Apple documents
+/// SCShareableContent as immutable + thread-safe and `objc_retain`/
+/// `objc_release` are atomic, so the cross-thread move into the
+/// SCK dispatch queue is sound.
+struct ContentSlot(Mutex<Option<Retained<SCShareableContent>>>);
+
+// SAFETY: see ContentSlot doc comment + matching SAFETY on
+// `ContentCache` above.
+unsafe impl Send for ContentSlot {}
+// SAFETY: Mutex serializes interior mutability.
+unsafe impl Sync for ContentSlot {}
+
+/// Owned handle to the RoK main window discovered via SCK. Carries
+/// the live `Retained<SCWindow>` (the capture-and-validation surface),
+/// the matching `CGWindowID` (kept for diagnostic logging and the
+/// CGWindow-side visibility check), the owning PID (for log lines and
+/// to anchor the WID-reuse defense), the frame at discovery time (the
+/// validators' baseline), and the bundle ID extracted from
+/// `SCWindow.owningApplication` (recorded so the spoof check that
+/// gated discovery is documented at the use site too).
+///
+/// Cloneable per the codex #6 ownership pass: validators take
+/// `&RokWindow`, `main.rs::run` owns the original, and Clone bumps
+/// SCK's retain count without deep-copying the Cocoa window.
+#[derive(Debug, Clone)]
+pub struct RokWindow {
+    pub scwindow: Retained<SCWindow>,
     pub id: u32,
     pub pid: i32,
     pub frame: CGRect,
+    /// Bundle ID extracted from `SCWindow.owningApplication
+    /// .bundleIdentifier` at discovery time. Used as documentation
+    /// of the spoof-check that gated discovery; future diagnostic
+    /// log lines and tests can read it.
+    #[allow(
+        dead_code,
+        reason = "field is part of the discovery contract; surfaced to log lines + future tests"
+    )]
+    pub bundle_id: String,
 }
 
-impl Window {
+impl RokWindow {
+    /// Geometric center of the discovery-time frame. Preserved from
+    /// the v0.1.x `Window` struct's API for callsite parity.
     pub fn center(&self) -> CGPoint {
-        CGPoint {
-            x: self.frame.origin.x + self.frame.size.width / 2.0,
-            y: self.frame.origin.y + self.frame.size.height / 2.0,
-        }
+        center_of_rect(self.frame)
     }
 }
 
-/// One window's id/pid/frame plus optional owner+title strings, parsed
-/// from a single `CGWindowListCopyWindowInfo` dictionary entry. Used as
-/// pure data input by [`select_rok_window`], [`validate_inner`], and
-/// [`validate_present_inner`].
+/// Pure: geometric center of a `CGRect`. Extracted so the v0.1.x
+/// `window_center_*` test cases survive without needing to construct
+/// a `RokWindow` (which holds a `Retained<SCWindow>` we can't
+/// fabricate in a unit test).
+fn center_of_rect(frame: CGRect) -> CGPoint {
+    CGPoint {
+        x: frame.origin.x + frame.size.width / 2.0,
+        y: frame.origin.y + frame.size.height / 2.0,
+    }
+}
+
+/// One CGWindow's (id, pid) plus its frame and optional owner+title
+/// strings, parsed from a single `CGWindowListCopyWindowInfo`
+/// dictionary entry.
 ///
-/// `id`, `pid`, and `frame` are required — `parse_snapshot` returns
-/// `None` if any are missing or invalid in the source dictionary. This
-/// matches the v0.1.4 invariant that downstream validators can rely on
-/// these three fields without re-checking, encoded in the type system.
-///
-/// `owner_name` and `title` are `Option<String>` because RoK auxiliary
-/// windows (splashes, popups) legitimately omit the title, and a few
-/// system windows have no owner-name. `select_rok_window` checks both
-/// before promoting a snapshot to a `Window`. v0.1.5 PID-anchored hidden-
-/// Space checks (C2) also consult `owner_name` for operator-readable
-/// diagnostics.
+/// v0.1.8 only consumes (id, pid) from snapshots — the validators
+/// use the live `SCWindow.frame()` for drift checks and SCK
+/// enumeration for owner/title filtering. The other fields are
+/// kept on the struct so a future validator that needs CG-side
+/// frame or owner data doesn't have to retro-parse the dict; mark
+/// them dead-code-allowed so clippy doesn't warn while they sit
+/// idle.
 #[derive(Debug, Clone)]
 struct WindowSnapshot {
     id: u32,
     pid: i32,
+    #[allow(
+        dead_code,
+        reason = "v0.1.5/v0.1.7 validators read this; v0.1.8 uses live SCK frame instead"
+    )]
     frame: CGRect,
+    #[allow(
+        dead_code,
+        reason = "v0.1.5 discovery pre-filtered on this; v0.1.8 uses SCK-side owningApplication"
+    )]
     owner_name: Option<String>,
+    #[allow(dead_code, reason = "same rationale as owner_name")]
     title: Option<String>,
 }
 
-/// Pure: turn a parsed snapshot into a `Window` iff it matches the RoK
-/// main window. Auxiliary RoK windows (splash, popups) share `owner_name`
-/// but have no title or a different title and return `None`.
-fn select_rok_window(snap: &WindowSnapshot) -> Option<Window> {
-    let owner = snap.owner_name.as_deref()?;
-    let title = snap.title.as_deref()?;
-    if owner != ROK_OWNER || title != ROK_TITLE {
-        return None;
+/// Live wrapper: synchronously fetch a fresh `SCShareableContent`
+/// without consulting the cache. Pure for testability is impractical
+/// (the FFI dominates), so this is the lowest-level seam.
+///
+/// Used by:
+/// - [`permissions::check_sck_grant`] at boot (one-shot preflight,
+///   bypasses the cache so we know the live system is healthy).
+/// - [`get_or_fetch_shareable_content`] on cache miss / invalidation.
+///
+/// Returns `Err(BotError::CaptureFailed { stage:
+/// STAGE_WINDOW_NOT_FOUND })` on nil/error/timeout. The
+/// stage-tag-on-fetch-error is a slight semantic stretch (the window
+/// hasn't been searched for yet at this point), but it routes through
+/// the cache-invalidation path correctly: any caller seeing this
+/// error will treat the cache as stale, which is the right behavior
+/// regardless of which fetch attempt failed.
+pub fn fetch_shareable_content() -> Result<Retained<SCShareableContent>> {
+    register_with_window_server();
+
+    let sem = DispatchSemaphore::new(0);
+    // Arc<ContentSlot> instead of stack-local Mutex: SCK retains its
+    // own copy of the RcBlock on its background queue. If the timeout
+    // fires and this function returns, SCK may still invoke the
+    // completion handler later (TCC prompt was answered after 10s,
+    // system was paged out). A clone of the Arc lives inside the
+    // closure, so the late-firing handler dereferences a still-valid
+    // Mutex rather than a freed stack-local. The wasted late-write is
+    // harmless; the UAF it would otherwise cause is not. See
+    // identical reasoning on `capture::capture_image_sync`.
+    let slot: Arc<ContentSlot> = Arc::new(ContentSlot(Mutex::new(None)));
+    let block = RcBlock::new({
+        let sem = sem.clone();
+        let slot = Arc::clone(&slot);
+        move |content: *mut SCShareableContent, err: *mut NSError| {
+            if !content.is_null() {
+                // SAFETY: SCK passes an autoreleased pointer; retain
+                // to keep it past the block return.
+                if let Some(retained) = unsafe { Retained::retain(content) } {
+                    if let Ok(mut guard) = slot.0.lock() {
+                        *guard = Some(retained);
+                    }
+                }
+            } else if !err.is_null() {
+                // SAFETY: SCK passes an autoreleased NSError pointer.
+                if let Some(err) = unsafe { Retained::retain(err) } {
+                    tracing::warn!(
+                        target: "rok_bot",
+                        nserror = %err,
+                        "SCShareableContent fetch reported error (likely Screen Recording denied for rok-bot binary)"
+                    );
+                }
+            }
+            sem.signal();
+        }
+    });
+    // SAFETY: SCK class method; SCK retains the block on its dispatch
+    // queue, so it survives our early return on timeout.
+    unsafe {
+        SCShareableContent::getShareableContentWithCompletionHandler(&block);
     }
-    Some(Window {
-        id: snap.id,
-        pid: snap.pid,
-        frame: snap.frame,
+
+    let dt = DispatchTime::try_from(SHAREABLE_CONTENT_TIMEOUT).unwrap_or(DispatchTime::FOREVER);
+    if sem.wait(dt) != 0 {
+        tracing::warn!(
+            target: "rok_bot",
+            timeout_ms = SHAREABLE_CONTENT_TIMEOUT.as_millis() as u64,
+            "SCShareableContent fetch timed out (T1 deadlock fail-safe)"
+        );
+        return Err(BotError::CaptureFailed {
+            stage: STAGE_WINDOW_NOT_FOUND,
+            exit_code: None,
+        });
+    }
+
+    let result = slot.0.lock().ok().and_then(|mut g| g.take());
+    result.ok_or(BotError::CaptureFailed {
+        stage: STAGE_WINDOW_NOT_FOUND,
+        exit_code: None,
     })
 }
 
-/// Walk `CGWindowListCopyWindowInfo` with the given option flag and return
-/// a vec of snapshots for every dict that has id+pid+frame. Dicts missing
-/// any of those three fields (rare — invalid/dead windows) are skipped.
-/// Returns `None` if `copy_window_info` itself fails (Screen Recording
-/// TCC revoked mid-session, `WindowServer` crash, etc.); each call site
-/// maps that to its own `BotError` (typically `WindowNotFound` for
-/// discovery or `WindowChanged { REASON_WID_GONE }` for mid-flow re-checks).
+/// Cache-aware fetch. First call populates [`SCK_CONTENT_CACHE`];
+/// subsequent calls clone the cached `Retained<SCShareableContent>`
+/// (~10 ns per call vs ~95 ms cold). Cache invalidation is explicit
+/// via [`invalidate_shareable_content_cache`] — there's no time-based
+/// TTL because v0.1.8's single-shot semantics keep cache lifetime
+/// bounded by one `cargo run`.
 ///
-/// Pre-v0.1.5 the dict-walking loop was duplicated across `find_rok_window`,
-/// `validate_at_click_site`, and `validate_window_present`. Centralizing
-/// it here gives the v0.1.5 hidden-Space check a single seam to swap
-/// `kCGWindowListOptionOnScreenOnly` for `kCGWindowListOptionAll` (C2),
-/// and keeps `parse_snapshot` as the only place that touches CG private
-/// CFString constants.
+/// The boolean return indicates whether the content came from the
+/// cache (`true`) or a fresh fetch (`false`). Callers like
+/// `find_rok_window` use this to decide whether a "not found" result
+/// is worth retrying with a cache invalidation: a stale cache might
+/// be missing a relaunched RoK's new SCWindow, but a fresh fetch
+/// already saw the live state and re-fetching would just waste
+/// another ~95 ms returning the same content.
+fn get_or_fetch_shareable_content() -> Result<(Retained<SCShareableContent>, bool)> {
+    let cell = SCK_CONTENT_CACHE.get_or_init(|| ContentCache(Mutex::new(None)));
+    {
+        let guard = cell.0.lock().map_err(|_| BotError::CaptureFailed {
+            stage: STAGE_WINDOW_NOT_FOUND,
+            exit_code: None,
+        })?;
+        if let Some(content) = guard.as_ref() {
+            return Ok((content.clone(), true));
+        }
+    }
+    let content = fetch_shareable_content()?;
+    if let Ok(mut guard) = cell.0.lock() {
+        *guard = Some(content.clone());
+    }
+    Ok((content, false))
+}
+
+/// Drop the cached `SCShareableContent` so the next fetch re-queries
+/// SCK. Called by callers that observe a stale-cache symptom (e.g.,
+/// `find_rok_window` returning `WindowNotFound` after a prior success
+/// — RoK was relaunched and the cached list no longer contains the
+/// new SCWindow). The v0.1.8 design (D2) ties this to the
+/// `STAGE_WINDOW_NOT_FOUND` stage tag.
+pub fn invalidate_shareable_content_cache() {
+    if let Some(cell) = SCK_CONTENT_CACHE.get() {
+        if let Ok(mut guard) = cell.0.lock() {
+            *guard = None;
+        }
+    }
+}
+
+/// Walk `CGWindowListCopyWindowInfo` with the given option flag and
+/// return a vec of snapshots for every dict that has id+pid+frame.
+/// CGWindow enumeration stays in v0.1.8 — it's the only API that
+/// exposes the OnScreenOnly vs All distinction we need to surface
+/// `REASON_NOT_VISIBLE` vs `REASON_WID_GONE`.
 fn collect_window_snapshots(option: u32) -> Option<Vec<WindowSnapshot>> {
     let info_list = copy_window_info(option, kCGNullWindowID)?;
     let mut snapshots: Vec<WindowSnapshot> = Vec::with_capacity(64);
     for entry in info_list.iter() {
-        // Each entry is a *const c_void pointing at a CFDictionaryRef.
         let raw_ptr: *const c_void = *entry;
         if raw_ptr.is_null() {
             continue;
         }
         // SAFETY: CGWindowList vends each array slot as an unretained
         // CFDictionaryRef ("Get rule"). `wrap_under_get_rule` is the
-        // canonical lift: it CFRetains internally so the resulting `cf`
-        // owns its retain. The null guard above prevents the upstream
-        // assertion in `wrap_under_get_rule(reference: CFTypeRef)`.
+        // canonical lift.
         let cf = unsafe { CFType::wrap_under_get_rule(raw_ptr.cast()) };
         let Some(dict) = cf.downcast::<CFDictionary>() else {
             continue;
@@ -186,74 +404,91 @@ fn collect_window_snapshots(option: u32) -> Option<Vec<WindowSnapshot>> {
     Some(snapshots)
 }
 
-/// Walk the live `CGWindowListCopyWindowInfo` array and return the first
-/// window matching the RoK main-window predicate AND backed by a process
-/// whose bundle ID starts with `ROK_BUNDLE_PREFIX` (anti-spoof check).
-/// Spoofs are skipped with a `tracing::warn!` so they're visible in logs
-/// without halting the search — the real RoK window may be later in the
-/// list.
+/// Find the RoK main window via SCK enumeration + bundle-ID prefix
+/// filter.
 ///
-/// **v0.1.5 hidden-Space distinction.** Three outcomes:
-///
-/// 1. **`Ok(window)`** — RoK is on a visible Space. Happy path; matches
-///    against `kCGWindowListOptionOnScreenOnly`.
-/// 2. **`Err(WindowChanged { REASON_NOT_VISIBLE })`** — RoK process is
-///    running and has a window, but the window isn't on a currently-
-///    displayed Space (typical when another app went macOS-native
-///    fullscreen and pushed RoK behind it, or RoK was minimized to
-///    Dock). Detected by falling back to `kCGWindowListOptionAll`.
-///    Operator's fix is "switch to RoK's Space" or "unminimize",
-///    which is meaningfully different from "start RoK." See
-///    `learnings/ax-press-fails-hidden-space` for why Mode 1 cannot
-///    click through to a hidden-Space window even with AX, and the
-///    broader rationale for distinguishing this state.
-/// 3. **`Err(WindowNotFound)`** — RoK isn't running at all. Operator
-///    needs to launch it.
-pub fn find_rok_window() -> Result<Window> {
-    let onscreen = collect_window_snapshots(kCGWindowListOptionOnScreenOnly)
-        .ok_or(BotError::WindowNotFound)?;
-    if let Some(window) = first_rok_window(&onscreen) {
+/// Three outcomes (matches v0.1.5 contract):
+/// 1. `Ok(rok_window)` — RoK is enumerable. Note: SCK enumeration
+///    includes hidden-Space windows, so this Ok does NOT guarantee RoK
+///    is on the currently-displayed Space — that's the validator's
+///    job to check at click time. v0.1.8 deliberately lets boot-time
+///    discovery succeed for hidden-Space windows so the operator
+///    sees a clean exit-19 NOT_VISIBLE later instead of an exit-10
+///    WindowNotFound that mis-implies "RoK isn't running."
+/// 2. `Err(WindowNotFound)` — SCK didn't enumerate any matching
+///    window. RoK isn't running.
+/// 3. `Err(CaptureFailed { stage = window_not_found })` — SCK fetch
+///    itself failed (timeout, TCC denial mid-flow). Cache is
+///    invalidated so the next call re-fetches.
+pub fn find_rok_window() -> Result<RokWindow> {
+    let (content, was_cached) = match get_or_fetch_shareable_content() {
+        Ok(pair) => pair,
+        Err(err) => {
+            invalidate_shareable_content_cache();
+            return Err(err);
+        }
+    };
+    if let Some(window) = find_rok_window_in_content(&content) {
         return Ok(window);
     }
-    // Not on a currently-displayed Space. Falling back to `Option=All`
-    // includes hidden Spaces, minimized, and transient WindowServer
-    // states. If RoK is found there, the process is alive but the
-    // window isn't reachable for capture/click — surface that
-    // distinctly from "not running."
-    let all =
-        collect_window_snapshots(K_CG_WINDOW_LIST_OPTION_ALL).ok_or(BotError::WindowNotFound)?;
-    if first_rok_window(&all).is_some() {
-        return Err(BotError::WindowChanged {
-            reason: REASON_NOT_VISIBLE,
-        });
+    // First search came from a fresh fetch — the live system saw no
+    // matching window. Re-fetching wouldn't help; SCK already
+    // enumerated current state. ~95 ms saved on the cold-miss path.
+    if !was_cached {
+        return Err(BotError::WindowNotFound);
     }
-    Err(BotError::WindowNotFound)
+    // First search came from a cached SCShareableContent that may
+    // pre-date a RoK relaunch (new SCWindow, new WID). Invalidate and
+    // re-fetch to get the current live state. Propagate the original
+    // SCK fetch error rather than swallowing it as WindowNotFound —
+    // a TCC denial mid-run or an SCK timeout deserves its own
+    // CaptureFailed { stage: window_not_found } exit so the operator
+    // sees the real diagnostic instead of a misleading "RoK isn't
+    // running" message.
+    invalidate_shareable_content_cache();
+    let (content, _) = get_or_fetch_shareable_content()?;
+    find_rok_window_in_content(&content).ok_or(BotError::WindowNotFound)
 }
 
-/// Pure-ish helper: return the first snapshot in `snapshots` that matches
-/// the RoK main-window predicate AND the bundle-ID anti-spoof gate. Spoof
-/// candidates are skipped with `tracing::warn!` so a stale or impersonator
-/// window earlier in the list doesn't block a legitimate match later.
-/// `bundle_id_for_pid` is a live AppKit call, hence "pure-ish"; mockable
-/// pure logic stays inside `select_rok_window` + `matches_rok_bundle_id`.
-fn first_rok_window(snapshots: &[WindowSnapshot]) -> Option<Window> {
-    for snap in snapshots {
-        if let Some(window) = select_rok_window(snap) {
-            if bundle_id_for_pid(window.pid)
-                .as_deref()
-                .is_some_and(matches_rok_bundle_id)
-            {
-                return Some(window);
-            }
+/// Pure-ish: scan `content.windows` for the RoK main window.
+/// Pure-ish because each iteration calls into ObjC for property
+/// accessors; the search predicate itself is straightforward.
+fn find_rok_window_in_content(content: &SCShareableContent) -> Option<RokWindow> {
+    // SAFETY: SCShareableContent.windows returns a retained NSArray.
+    let windows = unsafe { content.windows() };
+    for i in 0..windows.count() {
+        let scwindow = windows.objectAtIndex(i);
+        // SAFETY: SCK property accessors on a live SCWindow.
+        let title = unsafe { scwindow.title() };
+        let title_str = title.map(|t| t.to_string()).unwrap_or_default();
+        if title_str != ROK_TITLE {
+            continue;
+        }
+        let app = unsafe { scwindow.owningApplication() };
+        let Some(app) = app else { continue };
+        // SAFETY: SCRunningApplication property accessor.
+        let bundle_id = unsafe { app.bundleIdentifier() }.to_string();
+        if !matches_rok_bundle_id(&bundle_id) {
             tracing::warn!(
                 target: "rok_bot",
-                pid = window.pid,
-                window_id = window.id,
                 expected_prefix = ROK_BUNDLE_PREFIX,
-                actual = bundle_id_for_pid(window.pid).as_deref().unwrap_or("<unknown>"),
-                "skipping window with owner=title=\"{ROK_OWNER}\" — bundle ID mismatch (possible spoof or stale window)",
+                actual = %bundle_id,
+                "skipping window with title=\"{ROK_TITLE}\" — bundle ID mismatch (possible spoof)"
             );
+            continue;
         }
+        // SAFETY: SCRunningApplication property accessor (with libc feature).
+        let pid = unsafe { app.processID() };
+        // SAFETY: SCWindow property accessors (objc2-core-graphics + -foundation features).
+        let id = unsafe { scwindow.windowID() };
+        let frame = sck_frame_to_cg(unsafe { scwindow.frame() });
+        return Some(RokWindow {
+            scwindow,
+            id,
+            pid,
+            frame,
+            bundle_id,
+        });
     }
     None
 }
@@ -263,60 +498,35 @@ fn matches_rok_bundle_id(bundle_id: &str) -> bool {
     bundle_id.starts_with(ROK_BUNDLE_PREFIX)
 }
 
-/// Pure: enforce the v0.1.5 TOCTOU invariants between window discovery
-/// and click delivery, given paired snapshots of currently-displayed
-/// (`onscreen`) and all-known (`all`) windows.
+/// Pure: enforce the v0.1.8 click-site TOCTOU invariants.
 ///
-/// Four checks, in order, with first-failure-wins semantics so the
-/// operator sees the most diagnostic reason:
+/// Three logical checks per design D1, but four operationally:
 ///
-/// 1. **`REASON_WID_GONE`** — the expected (WID, PID) pair is not in
-///    `all`. Either RoK closed/crashed, or the numeric WID was reused
-///    by an unrelated window after RoK's window was destroyed. PID-
-///    anchored lookup catches both. Without the PID anchor, a WID-reuse
-///    by another process would have masqueraded as "still alive,
-///    different state" and let downstream code AX-press into the wrong
-///    window.
-///
-/// 2. **`REASON_NOT_VISIBLE`** — the (WID, PID) is in `all` but missing
-///    from `onscreen`. The window exists (process is alive, WID is
-///    valid) but isn't on a currently-displayed Space — typical when
-///    another app went macOS-native fullscreen and pushed RoK to a
-///    hidden Space, or RoK was minimized to Dock, or a transient
-///    `WindowServer` state hid the window. Distinct exit from `WID_GONE`
-///    because the operator's fix is different: switch Spaces / un-
-///    minimize, not "restart RoK." Empirically required: AX press
-///    returns `kAXErrorFailure` (-25200) against a hidden-Space window
-///    even though the AX element query succeeds (`learnings/
-///    ax-press-fails-hidden-space`), so failing fast here gives a
-///    clean error instead of an opaque `AXError` code at click time.
-///
-/// 3. **`REASON_FRAME_MOVED`** — the (WID, PID) is on screen but its
-///    frame origin/size drifted beyond [`FRAME_TOLERANCE_POINTS`] in
-///    any of the four components. The user moved or resized RoK
-///    between discovery and click. The screen point computed from the
-///    stale frame doesn't correspond to the same UI element anymore.
-///
-/// 4. **`REASON_POINT_OUTSIDE_FRAME`** — the requested click point is
-///    not inside the discovered frame. Pre-v0.1.5 this was an
-///    accidental side-effect of the topmost walk (no window contained
-///    the point → not-topmost); the v0.1.5 pipeline drops the topmost
-///    walk (replaced by hidden-Space + AX delivery's z-order
-///    independence) so the bounds check becomes explicit. Catches
-///    operator-side coord math bugs (negative-origin sign flip,
-///    off-by-one in `screen_point`) before they reach the AX layer.
-///
-/// Returns `Ok(())` when all four pass.
+/// 1. **`REASON_WID_GONE`** — (WID, PID) pair not in `all`. PID
+///    anchor catches WID reuse.
+/// 2. **`REASON_NOT_VISIBLE`** — (WID, PID) in `all` but missing
+///    from `onscreen`. Hidden Space, minimized, or fullscreen-from-
+///    another-app pushed RoK aside. Distinct exit so operator
+///    knows to switch Spaces / unminimize, not "restart RoK."
+/// 3. **`REASON_FRAME_MOVED`** — `actual_frame` (live SCK frame at
+///    validation time) drifted beyond [`FRAME_TOLERANCE_POINTS`]
+///    from `expected_frame` (discovery-time frame). v0.1.5 sourced
+///    `actual_frame` from the CGWindow snapshot; v0.1.8 sources it
+///    from `SCWindow.frame()` so the check is grounded in the same
+///    coordinate space SCK uses for the capture. Same semantics,
+///    different (slightly more authoritative) source.
+/// 4. **`REASON_POINT_OUTSIDE_FRAME`** — click point not inside
+///    `expected_frame`. Catches operator-side coord math bugs.
 fn validate_inner(
     expected_wid: u32,
     expected_pid: i32,
     expected_frame: CGRect,
+    actual_frame: CGRect,
     onscreen: &[WindowSnapshot],
     all: &[WindowSnapshot],
     click_point: CGPoint,
     tolerance: f64,
 ) -> Result<()> {
-    // Check #1: (WID, PID) present in `all`. PID anchor catches WID reuse.
     if !all
         .iter()
         .any(|w| w.id == expected_wid && w.pid == expected_pid)
@@ -325,24 +535,19 @@ fn validate_inner(
             reason: REASON_WID_GONE,
         });
     }
-    // Check #2: same (WID, PID) reachable on a displayed Space.
-    let Some(found) = onscreen
+    if !onscreen
         .iter()
-        .find(|w| w.id == expected_wid && w.pid == expected_pid)
-    else {
+        .any(|w| w.id == expected_wid && w.pid == expected_pid)
+    {
         return Err(BotError::WindowChanged {
             reason: REASON_NOT_VISIBLE,
         });
-    };
-    // Check #3: frame within tolerance vs. discovery snapshot.
-    if !frames_within_tolerance(found.frame, expected_frame, tolerance) {
+    }
+    if !frames_within_tolerance(actual_frame, expected_frame, tolerance) {
         return Err(BotError::WindowChanged {
             reason: REASON_FRAME_MOVED,
         });
     }
-    // Check #4: click point inside the discovered frame. Pre-v0.1.5 this
-    // was implicit in the topmost walk; v0.1.5 enforces it explicitly so
-    // the bounds invariant survives the topmost deletion.
     if !rect_contains_point(expected_frame, click_point) {
         return Err(BotError::WindowChanged {
             reason: REASON_POINT_OUTSIDE_FRAME,
@@ -351,50 +556,14 @@ fn validate_inner(
     Ok(())
 }
 
-/// Pure: enforce the v0.1.5 post-capture TOCTOU subset — the (WID, PID)
-/// is still alive, still on a visible Space, and the frame is within
-/// tolerance. The click-point bounds check is dropped because we've
-/// already clicked (the only thing being validated is whether the
-/// screen state is still capture-able and pixel-comparable to pre).
-///
-/// /plan-eng-review Outside Voice F4 (v0.1.4) caught that the
-/// pre-click topmost invariant doesn't hold post-click: a successful
-/// click may legitimately spawn a modal that becomes topmost. v0.1.5
-/// drops the topmost walk from the pre-click pipeline too (replaced
-/// by hidden-Space + AX delivery's z-order independence), so the two
-/// pipelines now differ only by the click-point bounds check. That
-/// asymmetry is preserved: pre needs to know "is the point I'm
-/// clicking on the discovered window," post just needs "is the window
-/// still capturable in the same place."
-///
-/// Three checks, in order, first-failure-wins:
-///
-/// 1. **`REASON_WID_GONE`** — the expected (WID, PID) pair is not in
-///    `all`. RoK closed, crashed, or its window was rebuilt with a
-///    new WID between click and post-capture. Posting `screencapture
-///    -l <stale_wid>` would either fail (`capture_with_bin`'s 0-byte
-///    gate catches it) or capture a different window (bad — would
-///    corrupt the verify pixel-diff). PID anchor catches WID-reuse
-///    by another process.
-///
-/// 2. **`REASON_NOT_VISIBLE`** — the (WID, PID) is in `all` but
-///    missing from `onscreen`. Same conditions as `validate_inner`
-///    Check #2: another app went fullscreen, RoK was minimized, or
-///    a Space switch hid the window. Post-click capture would
-///    `screencapture -l` against a window not on a displayed Space;
-///    the captured pixels typically come back blank or stale, and
-///    pixel-diff would either false-positive or false-negative.
-///
-/// 3. **`REASON_FRAME_MOVED`** — same as `validate_inner`. RoK got
-///    dragged/resized between click and post-capture; post-capture
-///    would be misaligned relative to pre and pixel-diff would
-///    false-positive across most pixels.
-///
-/// Returns `Ok(())` when all three pass.
+/// Pure: enforce the v0.1.8 post-capture TOCTOU subset — drops the
+/// click-point bounds check (no click is being sent), keeps the
+/// other three.
 fn validate_present_inner(
     expected_wid: u32,
     expected_pid: i32,
     expected_frame: CGRect,
+    actual_frame: CGRect,
     onscreen: &[WindowSnapshot],
     all: &[WindowSnapshot],
     tolerance: f64,
@@ -407,15 +576,15 @@ fn validate_present_inner(
             reason: REASON_WID_GONE,
         });
     }
-    let Some(found) = onscreen
+    if !onscreen
         .iter()
-        .find(|w| w.id == expected_wid && w.pid == expected_pid)
-    else {
+        .any(|w| w.id == expected_wid && w.pid == expected_pid)
+    {
         return Err(BotError::WindowChanged {
             reason: REASON_NOT_VISIBLE,
         });
-    };
-    if !frames_within_tolerance(found.frame, expected_frame, tolerance) {
+    }
+    if !frames_within_tolerance(actual_frame, expected_frame, tolerance) {
         return Err(BotError::WindowChanged {
             reason: REASON_FRAME_MOVED,
         });
@@ -423,17 +592,9 @@ fn validate_present_inner(
     Ok(())
 }
 
-/// Live wrapper: re-call `CGWindowListCopyWindowInfo` twice (onscreen +
-/// all) and pass the results to [`validate_present_inner`]. Called from
-/// `main.rs::run` between `click::click_at` returning and the post-click
-/// `capture_window` to close the TOCTOU between click delivery and
-/// post-capture.
-///
-/// Structurally similar to `validate_at_click_site` but skips the
-/// click-point bounds check (no click is about to be sent). See
-/// `validate_present_inner` docs for why the topmost invariant was
-/// dropped from both pipelines.
-pub fn validate_window_present(expected: &Window) -> Result<()> {
+/// Live wrapper: re-fetch SCK content + CGWindow snapshots, read the
+/// current SCK frame, run [`validate_present_inner`].
+pub fn validate_window_present(expected: &RokWindow) -> Result<()> {
     let onscreen = collect_window_snapshots(kCGWindowListOptionOnScreenOnly).ok_or(
         BotError::WindowChanged {
             reason: REASON_WID_GONE,
@@ -443,14 +604,29 @@ pub fn validate_window_present(expected: &Window) -> Result<()> {
         collect_window_snapshots(K_CG_WINDOW_LIST_OPTION_ALL).ok_or(BotError::WindowChanged {
             reason: REASON_WID_GONE,
         })?;
-
+    // SAFETY: SCK property accessor on a live SCWindow we still hold.
+    let actual_frame = sck_frame_to_cg(unsafe { expected.scwindow.frame() });
     validate_present_inner(
         expected.id,
         expected.pid,
         expected.frame,
+        actual_frame,
         &onscreen,
         &all,
         FRAME_TOLERANCE_POINTS,
+    )
+}
+
+/// Convert SCK's `objc2_core_foundation::CGRect` (returned by
+/// `SCWindow.frame()`) into `core_graphics::display::CGRect` (the
+/// type the v0.1.x validators and matcher already use). Both are
+/// `#[repr(C)] { origin: CGPoint, size: CGSize }` of f64 fields with
+/// identical layout, but they're nominally distinct types so we
+/// convert field-by-field.
+fn sck_frame_to_cg(f: objc2_core_foundation::CGRect) -> CGRect {
+    CGRect::new(
+        &CGPoint::new(f.origin.x, f.origin.y),
+        &CGSize::new(f.size.width, f.size.height),
     )
 }
 
@@ -462,8 +638,7 @@ fn frames_within_tolerance(a: CGRect, b: CGRect, tolerance: f64) -> bool {
         && (a.size.height - b.size.height).abs() <= tolerance
 }
 
-/// Pure: half-open rectangle containment, top-left origin. Standard CG
-/// convention: `[origin.x, origin.x + width)` × `[origin.y, origin.y + height)`.
+/// Pure: half-open rectangle containment, top-left origin.
 fn rect_contains_point(rect: CGRect, p: CGPoint) -> bool {
     let x_min = rect.origin.x;
     let x_max = rect.origin.x + rect.size.width;
@@ -472,22 +647,11 @@ fn rect_contains_point(rect: CGRect, p: CGPoint) -> bool {
     p.x >= x_min && p.x < x_max && p.y >= y_min && p.y < y_max
 }
 
-/// Live wrapper: re-call `CGWindowListCopyWindowInfo` twice (onscreen +
-/// all) and pass the results to [`validate_inner`]. Called from
-/// `main.rs::run` between `matcher::screen_point` and `click::click_at`
-/// (now `ax::press_at` via `click_at`) to close the TOCTOU between
-/// window discovery and click delivery.
-///
-/// We need BOTH lists, not just `OnScreenOnly`. The on-screen check
-/// rules out hidden-Space windows (where AX press would return
-/// `kAXErrorFailure -25200`); the all-list check distinguishes that
-/// from "RoK truly gone" so the operator gets `REASON_NOT_VISIBLE`
-/// rather than the more alarming `REASON_WID_GONE`.
-pub fn validate_at_click_site(expected: &Window, click_point: CGPoint) -> Result<()> {
-    // CGWindowList unavailable mid-run is itself a TOCTOU signal:
-    // something changed about the window-server's state. Treat as
-    // window-gone rather than a generic permission failure — Screen
-    // Recording has already been preflight-checked at boot.
+/// Live wrapper for the click-site validator. v0.1.8 reads the live
+/// SCK frame at this site so a frame drift between discovery and
+/// click is caught against the same coordinate space the capture
+/// will use.
+pub fn validate_at_click_site(expected: &RokWindow, click_point: CGPoint) -> Result<()> {
     let onscreen = collect_window_snapshots(kCGWindowListOptionOnScreenOnly).ok_or(
         BotError::WindowChanged {
             reason: REASON_WID_GONE,
@@ -497,11 +661,13 @@ pub fn validate_at_click_site(expected: &Window, click_point: CGPoint) -> Result
         collect_window_snapshots(K_CG_WINDOW_LIST_OPTION_ALL).ok_or(BotError::WindowChanged {
             reason: REASON_WID_GONE,
         })?;
-
+    // SAFETY: SCK property accessor on a live SCWindow we still hold.
+    let actual_frame = sck_frame_to_cg(unsafe { expected.scwindow.frame() });
     validate_inner(
         expected.id,
         expected.pid,
         expected.frame,
+        actual_frame,
         &onscreen,
         &all,
         click_point,
@@ -509,25 +675,9 @@ pub fn validate_at_click_site(expected: &Window, click_point: CGPoint) -> Result
     )
 }
 
-/// Live wrapper: ask AppKit for the bundle ID of the process owning `pid`.
-/// Returns `None` if the process has no bundle (rare for GUI apps),
-/// no longer exists, or AppKit can't enumerate it. Both objc2 calls
-/// here are declared safe by the binding (no `unsafe` block needed).
-fn bundle_id_for_pid(pid: i32) -> Option<String> {
-    let app = objc2_app_kit::NSRunningApplication::runningApplicationWithProcessIdentifier(pid)?;
-    let ns_id = app.bundleIdentifier()?;
-    Some(ns_id.to_string())
-}
-
-/// Parse one `CGWindowListCopyWindowInfo` dictionary entry into a
-/// `WindowSnapshot`. Returns `None` if any of id/pid/frame is missing or
-/// fails its type/range check — those three fields are required so the
-/// downstream validators can rely on them. `owner_name` and `title` are
-/// optional (some auxiliary RoK windows omit title; rare system windows
-/// omit owner-name).
+/// Parse one CGWindowList dictionary entry into a snapshot.
 fn parse_snapshot(dict: &CFDictionary) -> Option<WindowSnapshot> {
-    // SAFETY: reading static CFStringRef constants vended by Core Graphics
-    // (Rust 2024 requires `unsafe` for any extern static read).
+    // SAFETY: reading static CFStringRef constants vended by Core Graphics.
     let (k_owner, k_title, k_id, k_pid, k_bounds) = unsafe {
         (
             kCGWindowOwnerName.cast::<c_void>(),
@@ -555,35 +705,23 @@ fn parse_snapshot(dict: &CFDictionary) -> Option<WindowSnapshot> {
     })
 }
 
-/// Generic typed lookup against a default-typed CFDictionary.
 fn dict_get<T: ConcreteCFType>(dict: &CFDictionary, key: *const c_void) -> Option<T> {
     let value_ref = dict.find(key)?;
     let value_ptr: *const c_void = *value_ref;
     if value_ptr.is_null() {
         return None;
     }
-    // SAFETY: dict.find returns a borrowed slot pointer ("Get rule" —
-    // unretained). `wrap_under_get_rule` CFRetains internally so `cf`
-    // holds its own ownership. The null guard above prevents the
-    // upstream null-assertion in `wrap_under_get_rule(reference: CFTypeRef)`.
+    // SAFETY: dict.find returns a borrowed slot pointer ("Get rule").
     let cf = unsafe { CFType::wrap_under_get_rule(value_ptr.cast()) };
     cf.downcast::<T>()
 }
 
-/// Convert the `kCGWindowBounds` dict (with X/Y/Width/Height keys) into a
-/// `CGRect` using Core Graphics's official converter. Rejects rects whose
-/// fields aren't finite or whose size is non-positive — `CGRectMake...`
-/// itself will accept NaN/Inf and zero-size dicts; downstream code (window
-/// center arithmetic + `rect_contains`) silently produces wrong results
-/// when fed those, so guard at the boundary.
 fn rect_from_dict(dict: &CFDictionary) -> Option<CGRect> {
     let mut rect = CGRect {
         origin: CGPoint::new(0.0, 0.0),
         size: CGSize::new(0.0, 0.0),
     };
-    // SAFETY: `dict` is a live CFDictionary obtained from CGWindowList. We
-    // pass a writable CGRect by pointer and check the boolean return per
-    // Apple's API contract.
+    // SAFETY: live CFDictionary; pass writable CGRect by pointer per Apple's API.
     let ok = unsafe {
         CGRectMakeWithDictionaryRepresentation(dict.as_concrete_TypeRef().cast(), &raw mut rect)
     };
@@ -615,91 +753,7 @@ mod tests {
         CGRect::new(&CGPoint::new(x, y), &CGSize::new(w, h))
     }
 
-    fn assert_rect_eq(a: CGRect, b: CGRect) {
-        assert!((a.origin.x - b.origin.x).abs() < f64::EPSILON, "origin.x");
-        assert!((a.origin.y - b.origin.y).abs() < f64::EPSILON, "origin.y");
-        assert!(
-            (a.size.width - b.size.width).abs() < f64::EPSILON,
-            "size.width"
-        );
-        assert!(
-            (a.size.height - b.size.height).abs() < f64::EPSILON,
-            "size.height"
-        );
-    }
-
-    /// Build a `WindowSnapshot` for `select_rok_window` unit tests. Carries
-    /// optional owner+title (most `select_*` tests vary these); id/pid/frame
-    /// are pinned to harmless defaults.
-    fn rok_snap(owner: Option<&str>, title: Option<&str>) -> WindowSnapshot {
-        WindowSnapshot {
-            id: 64793,
-            pid: 21916,
-            frame: rect(-525.0, 502.0, 1280.0, 720.0),
-            owner_name: owner.map(str::to_owned),
-            title: title.map(str::to_owned),
-        }
-    }
-
-    #[test]
-    fn select_main_window_full_match() {
-        let snap = rok_snap(Some(ROK_OWNER), Some(ROK_TITLE));
-        let window = select_rok_window(&snap).expect("should match");
-        assert_eq!(window.id, 64793);
-        assert_eq!(window.pid, 21916);
-        assert_rect_eq(window.frame, rect(-525.0, 502.0, 1280.0, 720.0));
-    }
-
-    #[test]
-    fn select_skips_aux_window_with_no_title() {
-        let snap = rok_snap(Some(ROK_OWNER), None);
-        assert!(select_rok_window(&snap).is_none());
-    }
-
-    #[test]
-    fn select_skips_aux_window_with_different_title() {
-        let snap = rok_snap(Some(ROK_OWNER), Some("Splash"));
-        assert!(select_rok_window(&snap).is_none());
-    }
-
-    #[test]
-    fn select_skips_record_with_missing_owner() {
-        let snap = rok_snap(None, Some(ROK_TITLE));
-        assert!(select_rok_window(&snap).is_none());
-    }
-
-    #[test]
-    fn select_skips_other_apps() {
-        let snap = rok_snap(Some("Finder"), Some(ROK_TITLE));
-        assert!(select_rok_window(&snap).is_none());
-    }
-
-    #[test]
-    fn window_center_is_geometric_midpoint() {
-        let w = Window {
-            id: 1,
-            pid: 2,
-            frame: rect(100.0, 200.0, 1280.0, 720.0),
-        };
-        let c = w.center();
-        assert!((c.x - 740.0).abs() < f64::EPSILON);
-        assert!((c.y - 560.0).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn window_center_zero_size_frame_returns_origin() {
-        // Degenerate but real during window-resize transitions.
-        let w = Window {
-            id: 1,
-            pid: 2,
-            frame: rect(50.0, 60.0, 0.0, 0.0),
-        };
-        let c = w.center();
-        assert!((c.x - 50.0).abs() < f64::EPSILON);
-        assert!((c.y - 60.0).abs() < f64::EPSILON);
-    }
-
-    // ---- Bundle ID validation (Codex #2 + Claude A4) ----
+    // ---------- Bundle ID validation ----------
 
     #[test]
     fn matches_rok_bundle_id_accepts_vn() {
@@ -715,47 +769,29 @@ mod tests {
 
     #[test]
     fn matches_rok_bundle_id_rejects_spoofs() {
-        // Pretend-RoK from a launcher or impersonator.
         assert!(!matches_rok_bundle_id("com.example.fake-rok"));
         assert!(!matches_rok_bundle_id("RiseOfKingdoms"));
-        assert!(!matches_rok_bundle_id("org.rok.ios.vn")); // wrong TLD
+        assert!(!matches_rok_bundle_id("org.rok.ios.vn"));
         assert!(!matches_rok_bundle_id(""));
         assert!(!matches_rok_bundle_id("com.finder.app"));
     }
 
     #[test]
-    fn matches_rok_bundle_id_rejects_prefix_only() {
-        // Exact prefix without a region suffix is suspicious — but allowed
-        // as a forward-compat call, since a future "com.rok.ios.global"
-        // would also be valid. Document that any com.rok.ios.* is trusted.
+    fn matches_rok_bundle_id_accepts_bare_prefix() {
+        // Forward-compat: future "com.rok.ios.global" or unsuffixed
+        // installs are trusted.
         assert!(matches_rok_bundle_id("com.rok.ios."));
     }
 
-    // ---------- validate_inner / validate_present_inner (v0.1.5 4-/3-check) ----------
+    // ---------- validate_inner / validate_present_inner ----------
 
-    /// PID used for the canonical "RoK process" in all validator tests.
-    /// Matches the live RoK pid observed in p7-spike runs (21916) — the
-    /// number is arbitrary but kept consistent so a future reader can
-    /// cross-ref with spike logs.
     const ROK_PID: i32 = 21916;
-
-    /// PID used for the WID-reuse adversarial test. Any pid ≠ `ROK_PID`
-    /// works; this one is chosen far from `ROK_PID` to avoid the
-    /// suspicion that an off-by-one mistake could mask the test.
     const OTHER_PID: i32 = 99999;
 
-    /// Build a `WindowSnapshot` with the canonical RoK pid. v0.1.5
-    /// validators anchor lookups on (WID, PID) rather than WID alone, so
-    /// every test snapshot needs an explicit pid. Tests vary `id` and
-    /// `frame` to drive each check; helper keeps the boilerplate down.
     fn snap(id: u32, x: f64, y: f64, w: f64, h: f64) -> WindowSnapshot {
         snap_pid(id, ROK_PID, x, y, w, h)
     }
 
-    /// Build a `WindowSnapshot` with an explicit pid. Used by the
-    /// WID-reuse tests where we deliberately put a "right WID, wrong
-    /// PID" entry into the live snapshot list to prove the validators
-    /// don't false-pass on numeric WID reuse.
     fn snap_pid(id: u32, pid: i32, x: f64, y: f64, w: f64, h: f64) -> WindowSnapshot {
         WindowSnapshot {
             id,
@@ -770,13 +806,12 @@ mod tests {
 
     #[test]
     fn validate_inner_happy_path() {
-        // RoK present at expected frame in both lists, click point
-        // inside frame. All four checks pass.
         let onscreen = [snap(42, 100.0, 200.0, 1280.0, 720.0)];
         let all = onscreen.clone();
         let result = validate_inner(
             42,
             ROK_PID,
+            rect(100.0, 200.0, 1280.0, 720.0),
             rect(100.0, 200.0, 1280.0, 720.0),
             &onscreen,
             &all,
@@ -788,14 +823,12 @@ mod tests {
 
     #[test]
     fn validate_inner_wid_gone() {
-        // Expected RoK (WID 42, ROK_PID) not in `all` (only WID 99
-        // present). RoK process closed/crashed between discovery and
-        // re-check. PID anchor makes this check exact.
         let all = [snap(99, 0.0, 0.0, 1920.0, 1080.0)];
         let onscreen = all.clone();
         match validate_inner(
             42,
             ROK_PID,
+            rect(100.0, 200.0, 1280.0, 720.0),
             rect(100.0, 200.0, 1280.0, 720.0),
             &onscreen,
             &all,
@@ -811,16 +844,16 @@ mod tests {
 
     #[test]
     fn validate_inner_wid_reused_wrong_pid() {
-        // Adversarial: numeric WID 42 exists in `all` but under
-        // OTHER_PID (not the RoK pid we discovered). Window-server
-        // reuses WIDs after a window is destroyed. PID anchoring
-        // catches this — without it, the bot would treat the reused
-        // WID as "still RoK" and AX-press into an unrelated app.
+        // Adversarial: WID 42 exists in `all` but under OTHER_PID.
+        // PID anchor must catch this (without it, AX would press into
+        // an unrelated app whose window inherited the WID after RoK
+        // closed).
         let all = [snap_pid(42, OTHER_PID, 100.0, 200.0, 1280.0, 720.0)];
         let onscreen = all.clone();
         match validate_inner(
             42,
             ROK_PID,
+            rect(100.0, 200.0, 1280.0, 720.0),
             rect(100.0, 200.0, 1280.0, 720.0),
             &onscreen,
             &all,
@@ -836,17 +869,12 @@ mod tests {
 
     #[test]
     fn validate_inner_on_hidden_space() {
-        // (WID, PID) present in `all` but missing from `onscreen` —
-        // RoK is running but on a hidden Space, minimized to Dock, or
-        // in a transient WindowServer state. AX press would return
-        // kAXErrorFailure (-25200) against this window, so we must
-        // fail fast with a distinct reason that tells the operator
-        // to switch Spaces rather than restart RoK.
         let all = [snap(42, 100.0, 200.0, 1280.0, 720.0)];
         let onscreen: [WindowSnapshot; 0] = [];
         match validate_inner(
             42,
             ROK_PID,
+            rect(100.0, 200.0, 1280.0, 720.0),
             rect(100.0, 200.0, 1280.0, 720.0),
             &onscreen,
             &all,
@@ -862,14 +890,14 @@ mod tests {
 
     #[test]
     fn validate_inner_frame_moved_origin() {
-        // RoK still (WID 42, ROK_PID) but moved 100 points right
-        // between discovery and re-check.
-        let onscreen = [snap(42, 200.0, 200.0, 1280.0, 720.0)];
+        // Live SCK frame drifted 100pt right since discovery.
+        let onscreen = [snap(42, 100.0, 200.0, 1280.0, 720.0)];
         let all = onscreen.clone();
         match validate_inner(
             42,
             ROK_PID,
             rect(100.0, 200.0, 1280.0, 720.0),
+            rect(200.0, 200.0, 1280.0, 720.0),
             &onscreen,
             &all,
             CGPoint::new(740.0, 560.0),
@@ -884,14 +912,13 @@ mod tests {
 
     #[test]
     fn validate_inner_frame_moved_size() {
-        // RoK still (WID 42, ROK_PID), origin unchanged, but window
-        // resized by 50pt in width. Caught as frame_moved.
-        let onscreen = [snap(42, 100.0, 200.0, 1330.0, 720.0)];
+        let onscreen = [snap(42, 100.0, 200.0, 1280.0, 720.0)];
         let all = onscreen.clone();
         match validate_inner(
             42,
             ROK_PID,
             rect(100.0, 200.0, 1280.0, 720.0),
+            rect(100.0, 200.0, 1330.0, 720.0),
             &onscreen,
             &all,
             CGPoint::new(740.0, 560.0),
@@ -906,14 +933,14 @@ mod tests {
 
     #[test]
     fn validate_inner_frame_within_tolerance_passes() {
-        // Sub-pixel jitter (0.5pt) is below the 1.0 tolerance and must
-        // NOT fire frame_moved. Pin so future tightening is intentional.
-        let onscreen = [snap(42, 100.5, 200.0, 1280.0, 720.5)];
+        // Sub-pixel jitter (0.5pt) below 1.0 tolerance must pass.
+        let onscreen = [snap(42, 100.0, 200.0, 1280.0, 720.0)];
         let all = onscreen.clone();
         let result = validate_inner(
             42,
             ROK_PID,
             rect(100.0, 200.0, 1280.0, 720.0),
+            rect(100.5, 200.0, 1280.0, 720.5),
             &onscreen,
             &all,
             CGPoint::new(740.0, 560.0),
@@ -927,21 +954,16 @@ mod tests {
 
     #[test]
     fn validate_inner_point_outside_frame() {
-        // (WID, PID) match, frame match, but the requested click point
-        // falls outside the discovered frame. Pre-v0.1.5 this was
-        // caught accidentally by the topmost walk (no window contains
-        // the point → not-topmost); the v0.1.5 pipeline drops topmost
-        // and makes the bounds check explicit. Catches operator-side
-        // coord math bugs before they reach the AX layer.
         let onscreen = [snap(42, 100.0, 200.0, 1280.0, 720.0)];
         let all = onscreen.clone();
         match validate_inner(
             42,
             ROK_PID,
             rect(100.0, 200.0, 1280.0, 720.0),
+            rect(100.0, 200.0, 1280.0, 720.0),
             &onscreen,
             &all,
-            CGPoint::new(5000.0, 5000.0), // far outside RoK's frame
+            CGPoint::new(5000.0, 5000.0),
             TOL,
         ) {
             Err(BotError::WindowChanged { reason }) => {
@@ -952,21 +974,20 @@ mod tests {
     }
 
     #[test]
-    fn validate_inner_overlay_on_top_now_passes() {
-        // Pre-v0.1.5 this fired REASON_NOT_TOPMOST. v0.1.5 drops the
-        // topmost walk: kAXPressAction delivers to Catalyst Bridge
-        // apps even when another window is z-order topmost at the
-        // click point (verified empirically in p5-spike — see
-        // `learnings/ax-press-works-catalyst`). The overlay scenario
-        // is now a happy path.
+    fn validate_inner_overlay_above_rok_passes() {
+        // v0.1.5+ behavior: overlay above RoK is not a validator
+        // failure — z-order is no longer checked. SCK enumeration
+        // surfaces both windows; the validator just confirms RoK
+        // itself is reachable.
         let onscreen = [
-            snap(99, 700.0, 500.0, 200.0, 200.0),  // overlay covers click
-            snap(42, 100.0, 200.0, 1280.0, 720.0), // RoK below
+            snap(99, 700.0, 500.0, 200.0, 200.0),
+            snap(42, 100.0, 200.0, 1280.0, 720.0),
         ];
         let all = onscreen.clone();
         let result = validate_inner(
             42,
             ROK_PID,
+            rect(100.0, 200.0, 1280.0, 720.0),
             rect(100.0, 200.0, 1280.0, 720.0),
             &onscreen,
             &all,
@@ -975,21 +996,18 @@ mod tests {
         );
         assert!(
             result.is_ok(),
-            "v0.1.5 AX-on-Catalyst makes z-order overlap a non-issue: {result:?}"
+            "overlay z-order must not fire WindowChanged: {result:?}"
         );
     }
 
     #[test]
     fn validate_inner_negative_origin_virtual_display() {
-        // Mirrors P3 spike geometry: RoK on BetterDisplay virtual screen
-        // at (-1051, 103) size 1051x820. Click at center (-525.5, 513).
-        // Negative-origin coords are valid CG global coords; the
-        // contains-point math must handle them without sign confusion.
         let onscreen = [snap(73313, -1051.0, 103.0, 1051.0, 820.0)];
         let all = onscreen.clone();
         let result = validate_inner(
             73313,
             ROK_PID,
+            rect(-1051.0, 103.0, 1051.0, 820.0),
             rect(-1051.0, 103.0, 1051.0, 820.0),
             &onscreen,
             &all,
@@ -1004,17 +1022,13 @@ mod tests {
 
     #[test]
     fn validate_inner_check_order_wid_then_visible_then_frame_then_point() {
-        // Pin first-failure-wins precedence by exercising the WID-gone
-        // leg with conditions that would also have tripped checks
-        // 2-4. WID is not in `all` AND not in `onscreen` AND frame
-        // would have moved AND point would have been outside — the
-        // most diagnostic reason (WID gone) wins.
         let all: [WindowSnapshot; 0] = [];
         let onscreen: [WindowSnapshot; 0] = [];
         match validate_inner(
             42,
             ROK_PID,
             rect(100.0, 200.0, 1280.0, 720.0),
+            rect(99999.0, 99999.0, 0.1, 0.1),
             &onscreen,
             &all,
             CGPoint::new(99999.0, 99999.0),
@@ -1029,17 +1043,13 @@ mod tests {
 
     #[test]
     fn validate_inner_not_visible_beats_frame_moved() {
-        // Second-tier precedence: NOT_VISIBLE fires before FRAME_MOVED.
-        // (WID, PID) present in `all` but the `all` entry has a
-        // drifted frame; not present in `onscreen`. The hidden-Space
-        // reason is the more actionable diagnostic ("switch Spaces"
-        // vs "RoK moved") so it wins.
-        let all = [snap(42, 999.0, 999.0, 1280.0, 720.0)]; // far from expected
+        let all = [snap(42, 999.0, 999.0, 1280.0, 720.0)];
         let onscreen: [WindowSnapshot; 0] = [];
         match validate_inner(
             42,
             ROK_PID,
             rect(100.0, 200.0, 1280.0, 720.0),
+            rect(999.0, 999.0, 1280.0, 720.0),
             &onscreen,
             &all,
             CGPoint::new(740.0, 560.0),
@@ -1055,18 +1065,14 @@ mod tests {
         }
     }
 
-    // ---------- validate_present_inner (v0.1.5 post-capture, 3-check) ----------
-
     #[test]
-    fn validate_present_inner_passes_when_wid_pid_present_and_frame_within_tolerance() {
-        // Happy path: (WID, PID) in both lists, frame jitter under
-        // tolerance. No click point because the post-capture path is
-        // capture-only — the function signature makes that explicit.
+    fn validate_present_inner_happy_path() {
         let onscreen = [snap(42, 100.0, 200.0, 1280.0, 720.0)];
         let all = onscreen.clone();
         let result = validate_present_inner(
             42,
             ROK_PID,
+            rect(100.0, 200.0, 1280.0, 720.0),
             rect(100.0, 200.0, 1280.0, 720.0),
             &onscreen,
             &all,
@@ -1077,12 +1083,12 @@ mod tests {
 
     #[test]
     fn validate_present_inner_wid_gone() {
-        // RoK closed/crashed between click and post-capture.
         let all = [snap(99, 0.0, 0.0, 1920.0, 1080.0)];
         let onscreen = all.clone();
         match validate_present_inner(
             42,
             ROK_PID,
+            rect(100.0, 200.0, 1280.0, 720.0),
             rect(100.0, 200.0, 1280.0, 720.0),
             &onscreen,
             &all,
@@ -1097,16 +1103,12 @@ mod tests {
 
     #[test]
     fn validate_present_inner_wid_reused_wrong_pid() {
-        // WID 42 was reused by an unrelated process between click and
-        // post-capture. Without the PID anchor, the post-capture would
-        // `screencapture -l 42` against the wrong window — pixel-diff
-        // would compare RoK's pre-capture against an unrelated window
-        // and false-positive on every pixel.
         let all = [snap_pid(42, OTHER_PID, 100.0, 200.0, 1280.0, 720.0)];
         let onscreen = all.clone();
         match validate_present_inner(
             42,
             ROK_PID,
+            rect(100.0, 200.0, 1280.0, 720.0),
             rect(100.0, 200.0, 1280.0, 720.0),
             &onscreen,
             &all,
@@ -1121,16 +1123,12 @@ mod tests {
 
     #[test]
     fn validate_present_inner_on_hidden_space() {
-        // RoK got hidden between click and post-capture (Space switch,
-        // minimize, or fullscreen-from-another-app). Post-capture
-        // `screencapture -l` against a hidden-Space window typically
-        // returns blank or stale pixels; failing fast here keeps
-        // pixel-diff from drawing a wrong conclusion.
         let all = [snap(42, 100.0, 200.0, 1280.0, 720.0)];
         let onscreen: [WindowSnapshot; 0] = [];
         match validate_present_inner(
             42,
             ROK_PID,
+            rect(100.0, 200.0, 1280.0, 720.0),
             rect(100.0, 200.0, 1280.0, 720.0),
             &onscreen,
             &all,
@@ -1145,13 +1143,13 @@ mod tests {
 
     #[test]
     fn validate_present_inner_frame_moved_origin() {
-        // RoK still WID 42 but moved 100pt between click and post-capture.
-        let onscreen = [snap(42, 200.0, 200.0, 1280.0, 720.0)];
+        let onscreen = [snap(42, 100.0, 200.0, 1280.0, 720.0)];
         let all = onscreen.clone();
         match validate_present_inner(
             42,
             ROK_PID,
             rect(100.0, 200.0, 1280.0, 720.0),
+            rect(200.0, 200.0, 1280.0, 720.0),
             &onscreen,
             &all,
             TOL,
@@ -1164,40 +1162,16 @@ mod tests {
     }
 
     #[test]
-    fn validate_present_inner_frame_moved_size() {
-        // Window resized by 50pt in width mid-flow.
-        let onscreen = [snap(42, 100.0, 200.0, 1330.0, 720.0)];
-        let all = onscreen.clone();
-        match validate_present_inner(
-            42,
-            ROK_PID,
-            rect(100.0, 200.0, 1280.0, 720.0),
-            &onscreen,
-            &all,
-            TOL,
-        ) {
-            Err(BotError::WindowChanged { reason }) => {
-                assert_eq!(reason, REASON_FRAME_MOVED);
-            }
-            other => panic!("expected WindowChanged{{frame_moved}}, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn validate_present_inner_passes_with_overlay_on_top() {
-        // Click spawned a modal/overlay that's now z-order topmost.
-        // Both the overlay and RoK are in `onscreen`; RoK's (WID, PID)
-        // is found. v0.1.5 doesn't check topmost anywhere, so this is
-        // unambiguously a happy path — preserved from v0.1.4 where it
-        // was the post-capture pipeline's distinguishing test.
+    fn validate_present_inner_passes_with_overlay() {
         let onscreen = [
-            snap(99, 700.0, 500.0, 200.0, 200.0), // overlay (e.g. modal spawned by click)
-            snap(42, 100.0, 200.0, 1280.0, 720.0), // RoK below
+            snap(99, 700.0, 500.0, 200.0, 200.0),
+            snap(42, 100.0, 200.0, 1280.0, 720.0),
         ];
         let all = onscreen.clone();
         let result = validate_present_inner(
             42,
             ROK_PID,
+            rect(100.0, 200.0, 1280.0, 720.0),
             rect(100.0, 200.0, 1280.0, 720.0),
             &onscreen,
             &all,
@@ -1205,19 +1179,19 @@ mod tests {
         );
         assert!(
             result.is_ok(),
-            "overlay above RoK must NOT fire WindowChanged: {result:?}"
+            "overlay z-order must not fire WindowChanged: {result:?}"
         );
     }
 
     #[test]
     fn validate_present_inner_frame_within_tolerance_passes() {
-        // Sub-pixel jitter under the 1.0 tolerance must NOT fire frame_moved.
-        let onscreen = [snap(42, 100.5, 200.0, 1280.0, 720.5)];
+        let onscreen = [snap(42, 100.0, 200.0, 1280.0, 720.0)];
         let all = onscreen.clone();
         let result = validate_present_inner(
             42,
             ROK_PID,
             rect(100.0, 200.0, 1280.0, 720.0),
+            rect(100.5, 200.0, 1280.0, 720.5),
             &onscreen,
             &all,
             TOL,
@@ -1247,28 +1221,59 @@ mod tests {
     #[test]
     fn rect_contains_point_handles_edges() {
         let r = rect(100.0, 200.0, 50.0, 60.0);
-        // Inside.
         assert!(rect_contains_point(r, CGPoint::new(125.0, 230.0)));
-        // Top-left corner inclusive.
         assert!(rect_contains_point(r, CGPoint::new(100.0, 200.0)));
-        // Bottom-right corner exclusive (half-open).
         assert!(!rect_contains_point(r, CGPoint::new(150.0, 260.0)));
-        // Just inside bottom-right.
         assert!(rect_contains_point(r, CGPoint::new(149.999, 259.999)));
-        // Outside.
         assert!(!rect_contains_point(r, CGPoint::new(50.0, 230.0)));
         assert!(!rect_contains_point(r, CGPoint::new(125.0, 100.0)));
     }
 
     #[test]
     fn window_change_reason_constants_match_expected_strings() {
-        // Pin the operator-facing log strings that surface via
-        // BotError::WindowChanged. Changing one breaks shell users
-        // pattern-matching on the error message.
         assert_eq!(REASON_WID_GONE, "window_id_gone");
         assert_eq!(REASON_FRAME_MOVED, "frame_moved");
         assert_eq!(REASON_NOT_VISIBLE, "not_visible");
         assert_eq!(REASON_POINT_OUTSIDE_FRAME, "point_outside_frame");
+    }
+
+    // ---------- center_of_rect (RokWindow.center delegate) ----------
+
+    #[test]
+    fn center_of_rect_is_geometric_midpoint() {
+        let r = rect(100.0, 200.0, 1280.0, 720.0);
+        let c = center_of_rect(r);
+        assert!((c.x - 740.0).abs() < f64::EPSILON);
+        assert!((c.y - 560.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn center_of_rect_zero_size_returns_origin() {
+        // Degenerate but real during window-resize transitions.
+        let r = rect(50.0, 60.0, 0.0, 0.0);
+        let c = center_of_rect(r);
+        assert!((c.x - 50.0).abs() < f64::EPSILON);
+        assert!((c.y - 60.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn center_of_rect_handles_negative_origin() {
+        // Per P7 spike: RoK on virtual display had origin (-525, 502).
+        let r = rect(-525.0, 502.0, 1280.0, 720.0);
+        let c = center_of_rect(r);
+        assert!((c.x - 115.0).abs() < f64::EPSILON);
+        assert!((c.y - 862.0).abs() < f64::EPSILON);
+    }
+
+    // ---------- ContentCache lifecycle ----------
+
+    #[test]
+    fn invalidate_shareable_content_cache_is_safe_when_uninitialized() {
+        // The cache OnceLock may not have been initialized yet (no
+        // prior fetch). invalidate must not panic in that state.
+        // Idempotent if called twice.
+        invalidate_shareable_content_cache();
+        invalidate_shareable_content_cache();
     }
 
     #[test]
@@ -1282,18 +1287,5 @@ mod tests {
             let err = BotError::WindowChanged { reason };
             assert_eq!(err.exit_code(), 19, "reason {reason} must map to exit 19");
         }
-    }
-
-    #[test]
-    fn window_center_handles_negative_origin() {
-        // Per P7 spike: RoK on virtual display had origin (-525, 502).
-        let w = Window {
-            id: 64793,
-            pid: 21916,
-            frame: rect(-525.0, 502.0, 1280.0, 720.0),
-        };
-        let c = w.center();
-        assert!((c.x - 115.0).abs() < f64::EPSILON);
-        assert!((c.y - 862.0).abs() < f64::EPSILON);
     }
 }

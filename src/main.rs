@@ -34,6 +34,7 @@
 //! record; v0.1.6 builds Mode 2 on top.
 
 mod capture;
+mod cg_bootstrap;
 mod click;
 mod display;
 mod error;
@@ -47,12 +48,13 @@ use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
 
 use crate::capture::capture_window;
+use crate::cg_bootstrap::register_with_window_server;
 use crate::click::click_at;
 use crate::display::{Mode, detect_mode};
 use crate::error::{BotError, Result};
 use crate::matcher::{find_target_in_castle_roi, screen_point, validate_match_dims};
 use crate::permissions::{
-    ACCESSIBILITY, check_accessibility, check_screen_recording, peek_accessibility,
+    ACCESSIBILITY, check_accessibility, check_sck_grant, check_screen_recording, peek_accessibility,
 };
 use core_graphics::display::CGPoint;
 
@@ -109,8 +111,24 @@ const fn error_kind(err: &BotError) -> &'static str {
 fn run() -> Result<()> {
     tracing::info!(target: "rok_bot", "rok-bot v{} starting", env!("CARGO_PKG_VERSION"));
 
+    // T2 (v0.1.8 design): bootstrap WindowServer registration before
+    // any SCK call so SCStreamConfiguration::new doesn't trip
+    // CGS_REQUIRE_INIT. NSApplicationLoad is idempotent (~1µs after
+    // first call), so the per-SCK-entrypoint defensive calls in
+    // permissions/window/capture are also free.
+    register_with_window_server();
+
     check_screen_recording()?;
     tracing::info!(target: "rok_bot", "Screen Recording permission OK");
+
+    // v0.1.8 D5: SCK-specific TCC preflight. CG-level Screen Recording
+    // (above) is necessary but not sufficient — SCK requires SR granted
+    // to the rok-bot binary itself, not just its parent terminal. A
+    // TCC denial surfaces here as CaptureFailed { stage:
+    // no_shareable_content } (exit 14) with an actionable message
+    // instead of cryptically failing later inside find_rok_window.
+    check_sck_grant()?;
+    tracing::info!(target: "rok_bot", "ScreenCaptureKit shareable-content fetch OK");
 
     // Design A11 boot peek: warn-only at boot. The bot can produce useful
     // capture+match output without click; the hard check fires at the click
@@ -164,7 +182,7 @@ fn run() -> Result<()> {
 
     let pre_capture_path = PathBuf::from(CAPTURE_PRE_PATH);
     let t_pre_capture = std::time::Instant::now();
-    capture_window(window.id, &pre_capture_path)?;
+    capture_window(&window.scwindow, &pre_capture_path)?;
     let pre_capture_ms = u64::try_from(t_pre_capture.elapsed().as_millis()).unwrap_or(u64::MAX);
     tracing::info!(
         target: "rok_bot",
@@ -246,7 +264,7 @@ fn run() -> Result<()> {
     validate_window_present(&window)?;
     let post_capture_path = PathBuf::from(CAPTURE_POST_PATH);
     let t_post_capture = std::time::Instant::now();
-    capture_window(window.id, &post_capture_path)?;
+    capture_window(&window.scwindow, &post_capture_path)?;
     let post_capture_ms = u64::try_from(t_post_capture.elapsed().as_millis()).unwrap_or(u64::MAX);
     tracing::info!(
         target: "rok_bot",

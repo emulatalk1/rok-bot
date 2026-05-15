@@ -3,9 +3,14 @@ name = "rok-bot"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
-description = "macOS automation for Rise of Kingdoms — v0.1 Mode 1 (visible) only"
+description = "macOS automation for Rise of Kingdoms — v0.1.8 in-process ScreenCaptureKit (Mode 1 + Mode 2)"
 license = "MIT"
 publish = false
+# v0.1.8 hard-requires macOS 14.0+. SCScreenshotManager (the in-process
+# capture API that replaces the v0.1.x screencapture CLI shellout) is
+# new in macOS 14. Pre-14 systems surface the requirement at boot
+# through `permissions::check_sck_grant` returning
+# `CaptureFailed { stage: "no_shareable_content" }`.
 
 [profile.release]
 # Required for v0.2 Drop guards to run on panic. Harmless in v0.1 (no Drop guards yet).
@@ -14,11 +19,24 @@ panic = "unwind"
 [dependencies]
 core-graphics      = "0.25"
 core-foundation    = "0.10"
-# objc2-app-kit + objc2-foundation: NSRunningApplication for bundle-ID
-# spoof check on the RoK window owner. Trimmed to just the
-# NSRunningApplication feature to keep the dependency surface small.
-objc2-app-kit      = { version = "0.3", default-features = false, features = ["NSRunningApplication", "libc"] }
-objc2-foundation   = { version = "0.3", default-features = false, features = ["NSString"] }
+objc2              = "0.6"
+# objc2-foundation: NSString (legacy v0.1.x bundle-ID lookup, now driven
+# off SCRunningApplication.bundleIdentifier instead) + NSArray and
+# NSError for SCK enumeration + completion-handler error paths.
+objc2-foundation   = { version = "0.3", default-features = false, features = ["std", "NSString", "NSArray", "NSError"] }
+# v0.1.8 SCK in-process capture (replaces v0.1.x /usr/sbin/screencapture
+# CLI shellout). All five crates spike-validated at version 0.3.x in
+# spikes/p8-spike/Cargo.toml; feature sets transferred verbatim.
+objc2-screen-capture-kit = { version = "0.3", default-features = false, features = ["std", "SCStream", "SCShareableContent", "SCScreenshotManager", "block2", "objc2-core-graphics", "objc2-core-foundation", "libc"] }
+objc2-core-graphics      = { version = "0.3", default-features = false, features = ["std", "CGImage", "CGDataProvider", "CGColorSpace", "CGGeometry"] }
+objc2-core-foundation    = { version = "0.3", default-features = false, features = ["std", "CFCGTypes"] }
+block2                   = "0.6"
+dispatch2                = "0.3"
+# libc: O_NOFOLLOW + symlink-safe file open in src/capture.rs (closes
+# the v0.1.x→v0.1.8 symlink TOCTOU between the pre-check and the PNG
+# write). Already a transitive dep via objc2-screen-capture-kit's
+# libc feature; declared here to make the dependency contract explicit.
+libc                     = "0.2"
 thiserror          = "2"
 anyhow             = "1"
 tracing            = "0.1"

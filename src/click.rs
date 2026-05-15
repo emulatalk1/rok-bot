@@ -73,7 +73,7 @@ use core_graphics::event::{CGEvent, CGEventTapLocation, CGEventType, CGMouseButt
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 
 use crate::error::{BotError, Result};
-use crate::window::Window;
+use crate::window::RokWindow;
 
 /// Sleep gap between `LeftMouseDown` and `LeftMouseUp` posts (milliseconds).
 /// Matches v0.1.3's `CLICK_GAP_MS = 80` — long enough that RoK's event
@@ -254,7 +254,7 @@ impl Drop for CursorStealth {
 /// - verified Accessibility permission via `permissions::check_accessibility()`
 ///   (required for `CGEvent::post(HID)` to deliver),
 /// - re-validated the window state via `window::validate_at_click_site`.
-pub fn click_at(window: &Window, point: CGPoint) -> Result<()> {
+pub fn click_at(window: &RokWindow, point: CGPoint) -> Result<()> {
     activate_rok(window.pid)?;
     sleep(Duration::from_millis(ACTIVATION_SETTLE_MS));
 

@@ -28,7 +28,7 @@ use core_graphics::display::CGDisplay;
 use core_graphics::geometry::{CGPoint, CGRect};
 
 use crate::error::{BotError, Result};
-use crate::window::Window;
+use crate::window::RokWindow;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -97,7 +97,7 @@ fn rect_contains(rect: CGRect, point: CGPoint) -> bool {
 ///
 /// Re-enumerates on every call (no cached `CGDirectDisplayID`) per
 /// Premise 8: the ID is not stable across BD disconnect/reconnect.
-pub fn detect_mode(window: &Window) -> Result<Mode> {
+pub fn detect_mode(window: &RokWindow) -> Result<Mode> {
     let displays = enumerate_displays();
     if displays.is_empty() {
         return Err(BotError::WindowScreenUnresolved);

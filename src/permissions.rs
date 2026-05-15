@@ -42,7 +42,9 @@ use core_foundation::dictionary::{CFDictionary, CFDictionaryRef};
 use core_foundation::string::{CFString, CFStringRef};
 use core_graphics::access::ScreenCaptureAccess;
 
+use crate::cg_bootstrap::register_with_window_server;
 use crate::error::{BotError, Result};
+use crate::window::fetch_shareable_content;
 
 /// Canonical label for the Screen Recording permission. Single source of truth
 /// so the error variant, log lines, and tests can reference one constant
@@ -54,6 +56,16 @@ pub const SCREEN_RECORDING: &str = "Screen Recording";
 /// `BotError::PermissionsMissing` (exit 13) when the click-site hard check
 /// finds AX denied.
 pub const ACCESSIBILITY: &str = "Accessibility";
+
+/// `SCShareableContent.getShareableContentWithCompletionHandler`
+/// returned nil or errored at boot. Mirrors `capture::STAGE_*` so the
+/// `CaptureFailed` error surface stays uniform across the boot
+/// preflight and the per-tick capture path. v0.1.8 introduced this
+/// stage tag because SCK requires Screen Recording grant on the
+/// rok-bot binary itself (not just its parent terminal); a TCC denial
+/// surfaces here as a clear `no_shareable_content` error rather than
+/// the v0.1.x's opaque "screencapture failed."
+pub const STAGE_NO_SHAREABLE_CONTENT: &str = "no_shareable_content";
 
 // Hand-rolled FFI to the Accessibility check.
 //
@@ -156,6 +168,53 @@ pub fn peek_accessibility() -> bool {
     trusted != 0
 }
 
+/// SCK preflight: confirm the rok-bot binary can enumerate shareable
+/// content via `SCShareableContent.getShareableContentWithCompletion
+/// Handler`. v0.1.8 introduces this as a separate boot-time check
+/// because the v0.1.x `check_screen_recording` only guarantees CG-
+/// level Screen Recording trust — SCK needs the rok-bot binary
+/// itself to be granted SR (the v0.1.x screencapture CLI inherited
+/// TCC from its parent terminal; SCK doesn't).
+///
+/// Sequence:
+/// 1. Bootstrap `WindowServer` registration via
+///    [`register_with_window_server`] (T2 — every SCK entrypoint
+///    must call this idempotently).
+/// 2. Call [`fetch_shareable_content`] which parks on a dispatch
+///    semaphore for up to 10 s. Slower than the per-tick capture
+///    timeout because TCC prompts can stall the call until user
+///    interaction.
+/// 3. On nil/error/timeout, return `BotError::CaptureFailed { stage:
+///    STAGE_NO_SHAREABLE_CONTENT }` (exit 14) with an actionable log
+///    line that points at System Settings → Privacy & Security →
+///    Screen Recording AND mentions the macOS 14+ requirement (the
+///    other plausible cause when the call returns nil cleanly).
+///
+/// Called from `main.rs::run` immediately after `check_screen_recording`
+/// — the CG-level check fails fast on missing TCC but doesn't
+/// prove SCK can enumerate. A pass here means `find_rok_window`'s
+/// first `SCShareableContent` fetch (which the cache amortizes for
+/// subsequent calls) will succeed under nominal conditions.
+pub fn check_sck_grant() -> Result<()> {
+    register_with_window_server();
+    if fetch_shareable_content().is_ok() {
+        return Ok(());
+    }
+    tracing::error!(
+        target: "rok_bot",
+        "ScreenCaptureKit could not enumerate shareable content. Most likely \
+         cause: Screen Recording not granted to the rok-bot binary itself. \
+         Grant in System Settings → Privacy & Security → Screen Recording \
+         (look for 'rok-bot' in the list; v0.1.8's per-binary grant is a UX \
+         regression vs v0.1.x's terminal-inherited grant). Less common: \
+         macOS pre-14.0 (SCK requires 14+)."
+    );
+    Err(BotError::CaptureFailed {
+        stage: STAGE_NO_SHAREABLE_CONTENT,
+        exit_code: None,
+    })
+}
+
 /// Live AX trust check, **prompts** if denied. Returns `Ok(())` if trusted,
 /// `Err(PermissionsMissing { which: "Accessibility" })` (exit 13) if denied.
 ///
@@ -253,6 +312,15 @@ mod tests {
             msg.contains("System Settings"),
             "user-facing msg should name the macOS settings panel: {msg}"
         );
+    }
+
+    #[test]
+    fn stage_no_shareable_content_pinned_to_documented_value() {
+        // Shell users + log parsers pattern-match against this string
+        // when SR is denied for the rok-bot binary at boot. Changing
+        // it is a log contract change — pin so the change is
+        // explicit.
+        assert_eq!(STAGE_NO_SHAREABLE_CONTENT, "no_shareable_content");
     }
 
     #[test]

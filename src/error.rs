@@ -18,14 +18,71 @@ pub enum BotError {
     )]
     PermissionsMissing { which: &'static str },
 
-    /// `screencapture` subprocess returned non-zero or failed to spawn.
-    /// `exit_code` is `None` if the process couldn't be spawned (e.g.,
-    /// `/usr/sbin/screencapture` missing) or was killed by signal.
+    /// RoK window capture failed at one of the structured pipeline
+    /// stages. v0.1.8 split the original opaque `CaptureFailed` into
+    /// stage-tagged failures so operators (and shell scripts grepping
+    /// the error message) can branch on which step failed without
+    /// scanning prior log lines.
+    ///
+    /// `stage` values are the `STAGE_*` constants in `capture.rs` and
+    /// `permissions.rs` — pinned as `&'static str` so the operator-
+    /// facing log line is always one of the documented values:
+    ///
+    /// - `"symlink_refused"` — output path was a pre-existing symlink.
+    ///   Refused before invoking SCK to close the local-attacker hazard
+    ///   surfaced by /review F2 (a pre-placed symlink at
+    ///   `rok-capture-pre.png` would let the capture write through to
+    ///   any file the user can write).
+    /// - `"no_shareable_content"` — `SCShareableContent.getShareable
+    ///   ContentWithCompletionHandler` returned nil or errored. Most
+    ///   common cause: Screen Recording TCC denied for the rok-bot
+    ///   binary (v0.1.8 needs SR granted to the binary itself, not
+    ///   just its parent terminal — UX regression vs v0.1.x's
+    ///   screencapture-CLI shellout). Less common: macOS pre-14.0
+    ///   (SCK requires 14+).
+    /// - `"window_not_found"` — `SCShareableContent.windows` did not
+    ///   contain a window with the requested `CGWindowID`. Either
+    ///   RoK closed between discovery and capture, or the cached
+    ///   shareable-content list is stale (cache invalidates on this
+    ///   stage; the next call re-fetches).
+    /// - `"capture_returned_nil"` — `SCScreenshotManager.captureImage
+    ///   WithFilter:configuration:completionHandler:` reported success
+    ///   but the `CGImage` pointer was nil, OR the completion handler
+    ///   never fired before the 5s timeout (T1 deadlock fail-safe). A
+    ///   nil image with no error indicates SCK gave up; the timeout
+    ///   indicates SCK never delivered (rare in production; see
+    ///   `tests/sck_integration.rs::live_capture_times_out_when_
+    ///   disconnected`).
+    /// - `"cgimage_decode"` — pixel-byte read from the returned
+    ///   `CGImage` failed. Either `CFData` length was negative, the
+    ///   buffer was undersized, or the BGRA→RGBA conversion bailed.
+    ///   The ×2 scale canary (codex #10) also surfaces here when the
+    ///   captured dims don't match `frame.width * 2 × frame.height *
+    ///   2` (operator on a non-Retina or scaled display; see TODOS
+    ///   D10 for the proper fix).
+    /// - `"png_write"` — `image::save_buffer` failed to write the
+    ///   captured PNG to disk. Disk full, permission issue on the
+    ///   output dir, or the matcher's PNG round-trip would fail
+    ///   downstream. Write happens AFTER the SCK capture succeeded,
+    ///   so this stage only fires on filesystem-level problems.
+    ///
+    /// `exit_code` is `Option<i32>` for shell-script compat: v0.1.x's
+    /// `screencapture` subprocess sometimes returned a non-zero exit
+    /// that operators branched on. v0.1.8 has no subprocess — the
+    /// field stays `Some(0)` for the v0.1.x 0-byte equivalent
+    /// (`capture_returned_nil` after a successful SCK call) and `None`
+    /// for everything else, so existing shell branches keep working.
+    /// Stage tag is the future-proof discriminator.
     #[error(
-        "screencapture failed (exit code: {exit_code:?}). Ensure Screen Recording is \
-         granted to your terminal app and the RoK window ID is still valid."
+        "RoK window capture failed (stage: {stage}, exit code: {exit_code:?}). \
+         Ensure Screen Recording is granted to the rok-bot binary in \
+         System Settings → Privacy & Security → Screen Recording and \
+         that the RoK window is on a captured display."
     )]
-    CaptureFailed { exit_code: Option<i32> },
+    CaptureFailed {
+        stage: &'static str,
+        exit_code: Option<i32>,
+    },
 
     /// Best-match score below `matcher::MATCH_THRESHOLD`. The matcher already
     /// logged the diagnostic numbers (`best_score`, `threshold`) at warn level
@@ -248,10 +305,15 @@ pub type Result<T> = std::result::Result<T, BotError>;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::capture::{
+        STAGE_CAPTURE_RETURNED_NIL, STAGE_CGIMAGE_DECODE, STAGE_PNG_WRITE, STAGE_SYMLINK_REFUSED,
+        STAGE_WINDOW_NOT_FOUND,
+    };
     use crate::click::{
         REASON_ACTIVATION_FAILED, REASON_DISASSOCIATE, REASON_DOWN, REASON_PROBE, REASON_SOURCE,
         REASON_UP,
     };
+    use crate::permissions::STAGE_NO_SHAREABLE_CONTENT;
     use crate::verify::{REASON_DIM_MISMATCH, REASON_SCREEN_UNCHANGED};
 
     #[test]
@@ -263,7 +325,11 @@ mod tests {
                 which: "Screen Recording",
             }
             .exit_code(),
-            BotError::CaptureFailed { exit_code: Some(1) }.exit_code(),
+            BotError::CaptureFailed {
+                stage: STAGE_CAPTURE_RETURNED_NIL,
+                exit_code: Some(1),
+            }
+            .exit_code(),
             BotError::TargetNotFound.exit_code(),
             BotError::ImageLoadFailed { which: "haystack" }.exit_code(),
             BotError::TargetTooLarge {
@@ -313,11 +379,39 @@ mod tests {
             .exit_code(),
             13
         );
-        assert_eq!(
-            BotError::CaptureFailed { exit_code: Some(1) }.exit_code(),
-            14
-        );
-        assert_eq!(BotError::CaptureFailed { exit_code: None }.exit_code(), 14);
+        // CaptureFailed exit code is stage-independent (always 14) — pin
+        // it across every documented stage so a future per-stage routing
+        // change is forced through the test, AND so codex #14's "match-
+        // arm test pins every stage string" requirement is satisfied at
+        // the exit-code seam. Using the STAGE_* constants keeps the test
+        // in sync with any future rename of a stage tag.
+        for stage in [
+            STAGE_SYMLINK_REFUSED,
+            STAGE_NO_SHAREABLE_CONTENT,
+            STAGE_WINDOW_NOT_FOUND,
+            STAGE_CAPTURE_RETURNED_NIL,
+            STAGE_CGIMAGE_DECODE,
+            STAGE_PNG_WRITE,
+        ] {
+            assert_eq!(
+                BotError::CaptureFailed {
+                    stage,
+                    exit_code: Some(1),
+                }
+                .exit_code(),
+                14,
+                "CaptureFailed({stage}, Some(1)) must map to exit 14"
+            );
+            assert_eq!(
+                BotError::CaptureFailed {
+                    stage,
+                    exit_code: None,
+                }
+                .exit_code(),
+                14,
+                "CaptureFailed({stage}, None) must map to exit 14"
+            );
+        }
         assert_eq!(BotError::TargetNotFound.exit_code(), 15);
         assert_eq!(
             BotError::ImageLoadFailed { which: "haystack" }.exit_code(),
@@ -452,8 +546,14 @@ mod tests {
         // surface the same root-cause hint; the user's first debugging step is
         // the same regardless of which path failed.
         for err in [
-            BotError::CaptureFailed { exit_code: Some(1) },
-            BotError::CaptureFailed { exit_code: None },
+            BotError::CaptureFailed {
+                stage: STAGE_CAPTURE_RETURNED_NIL,
+                exit_code: Some(1),
+            },
+            BotError::CaptureFailed {
+                stage: STAGE_NO_SHAREABLE_CONTENT,
+                exit_code: None,
+            },
         ] {
             let msg = err.to_string();
             assert!(
@@ -461,6 +561,56 @@ mod tests {
                 "capture failure should hint at the most likely root cause: {msg}"
             );
         }
+    }
+
+    /// Pin every documented `stage` value into the Display string so a
+    /// future rename of a stage constant is forced through this test
+    /// (codex #14: "match-arm test pins every stage string"). The
+    /// `which`-style tag scheme uses the value as part of the operator-
+    /// facing log line — silent renames break shell scripts pattern-
+    /// matching against the message.
+    #[test]
+    fn capture_failed_message_includes_every_documented_stage() {
+        for stage in [
+            STAGE_SYMLINK_REFUSED,
+            STAGE_NO_SHAREABLE_CONTENT,
+            STAGE_WINDOW_NOT_FOUND,
+            STAGE_CAPTURE_RETURNED_NIL,
+            STAGE_CGIMAGE_DECODE,
+            STAGE_PNG_WRITE,
+        ] {
+            let err = BotError::CaptureFailed {
+                stage,
+                exit_code: None,
+            };
+            let msg = err.to_string();
+            assert!(
+                msg.contains(stage),
+                "CaptureFailed Display must include the stage tag '{stage}': {msg}"
+            );
+        }
+    }
+
+    /// The six documented stage constants must all be distinct strings.
+    /// A duplicate would silently merge two failure modes in operator
+    /// log parsing — caught here at compile-test time rather than in
+    /// the field.
+    #[test]
+    fn capture_failed_stage_constants_are_unique() {
+        let stages = [
+            STAGE_SYMLINK_REFUSED,
+            STAGE_NO_SHAREABLE_CONTENT,
+            STAGE_WINDOW_NOT_FOUND,
+            STAGE_CAPTURE_RETURNED_NIL,
+            STAGE_CGIMAGE_DECODE,
+            STAGE_PNG_WRITE,
+        ];
+        let unique: std::collections::HashSet<&'static str> = stages.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            stages.len(),
+            "STAGE_* constants must be unique: {stages:?}"
+        );
     }
 
     #[test]
