@@ -202,6 +202,56 @@ Not addressed in v0.1.1 because v0.2's capture-pipeline migration to `objc2-scre
 
 ---
 
+## P2: v0.2.x — Cut PNG round-trip; matcher consumes RGBA bytes directly (deferred from /plan-eng-review 2026-05-15)
+
+**Source:** /plan-eng-review for v0.1.8 SCK migration (D9). Codex outside-voice echoed the deferral as "PNG round-trip is brittle" (codex #10 framing).
+**Effort:** human ~1.5 hours / CC ~30 min
+**Depends on:** v0.1.8 SCK migration lands AND v0.2 continuous loop (the consumer that justifies the matcher API change).
+
+v0.1.8 ships SCK in-process capture but still writes a PNG to disk and reloads it for the matcher. The round-trip is ~30 ms encode + ~37 ms decode = ~67 ms per capture, pure overhead at continuous-loop cadence. v0.1.8 keeps the disk PNG for forensic debugging (operator can `open rok-capture-pre.png` to see what the matcher saw); v0.2.x's continuous loop needs that overhead off the hot path.
+
+**Approach for v0.2.x:**
+- Add a `MatchInput` enum or two parallel `match_in_path` / `match_in_bytes` entries in `matcher.rs`. Continuous-loop callers pass RGBA bytes directly; one-shot callers (still useful for `verify.rs`'s diagnostic re-match) keep the PNG path.
+- `capture.rs` returns `(Vec<u8>, width, height)` for the in-memory path; the PNG-on-disk path becomes an opt-in `--debug-capture-png` CLI flag.
+- Matcher's existing `load_haystack` → `GrayImage` conversion stays; just feed it from in-memory bytes instead of a `Path`.
+- Test: existing matcher tests use synthesized PNGs; add a parallel `match_from_rgba_bytes` test using the same fixtures decoded once at test-setup time.
+
+---
+
+## P3: v0.2.x+ — Discover display backing scale instead of hardcoding ×2 (deferred from /plan-eng-review 2026-05-15)
+
+**Source:** /plan-eng-review for v0.1.8 SCK migration (D10). Codex outside-voice flagged the canary-only approach (codex #10).
+**Effort:** human ~1 hour / CC ~20 min
+**Depends on:** v0.1.8 SCK migration lands AND a real operator hits the canary on a non-Retina or scaled display.
+
+v0.1.8 hardcodes `SCStreamConfiguration::setWidth(frame.width as usize * 2)` because every display in the project's current configs is Retina. A canary asserts that captured dims match `frame * 2`; mismatch fires `BotError::CaptureFailed { stage: "cgimage_decode", ... }` with the expected vs actual dims. Correct behavior, wrong coverage: the bot can't actually run on a non-Retina BD or a scaled external display until this is fixed.
+
+**Approach for v0.2.x+:**
+- At capture time, look up the window's display: `CGWindowListCopyWindowInfo` → `kCGWindowOwnerPID` + `NSScreen.screens` → matching `NSScreen.backingScaleFactor`. Or use SCK-side: `SCDisplay.frame` × `SCDisplay.pixelWidth / SCDisplay.width`.
+- Replace the hardcoded `* 2` with the looked-up scale (typically 1.0 or 2.0).
+- Delete the canary or repurpose it to assert the looked-up scale was applied correctly.
+- Test: parametrize the capture builder by scale; pin behavior at 1x, 2x, and the rare 3x cases.
+
+Low urgency — fires only when an operator runs on a non-Retina display config. The v0.1.8 canary buys us time to capture real data before designing the fix.
+
+---
+
+## P3: v0.3 — SCStream continuous-frame delegate (deferred from /plan-eng-review 2026-05-15)
+
+**Source:** /plan-eng-review for v0.1.8 SCK migration (D8).
+**Effort:** human ~4-6 hours / CC ~1.5 hours
+**Depends on:** v0.2 continuous loop (the consumer that justifies SCStream's frame-delegate complexity).
+
+v0.1.8 uses `SCScreenshotManager.captureImageWithFilter` — SCK's one-shot API. Each capture pays the full setup cost (SCContentFilter init, SCStreamConfiguration build, BGRA pixel-format roundtrip). The streaming API (`SCStream` with a frame delegate via `SCStreamOutput`) delivers frames continuously and amortizes setup across captures.
+
+**Approach for v0.3:**
+- Introduce `trait Captor` (deferred from v0.1.8 D3) with `fn capture(&self) -> Result<Frame>`. Two impls: `OneShotCaptor` (wraps current v0.1.8 code; kept for the post-click `verify.rs` re-match) and `StreamCaptor` (owns an `SCStream`, returns latest frame).
+- StreamCaptor lifecycle: `start()` creates the stream + frame-delegate-driven channel; `capture()` reads the latest frame from the channel (or blocks briefly if no frame yet); `stop()` cleans up. Continuous loop owns one `StreamCaptor` across all ticks.
+- Target: sub-50 ms per-tick capture after warmup. v0.1.8 single-shot is ~141 ms; SCStream should hit ~30-50 ms once warmed up (no per-call filter rebuild, no BGRA encode/decode if we keep bytes hot).
+- Backpressure: SCK delivers frames continuously even if the consumer is slow. Use a single-slot mailbox (latest-wins) rather than a queue; matches the bot's "use newest frame, drop older ones" semantics.
+
+---
+
 ## P2: v0.2 — FFT-based NCC for continuous-loop matching (deferred from /plan-eng-review 2026-05-07)
 
 **Source:** /plan-eng-review for v0.1.2 (CMT-7 + TODO-A) — Codex outside-voice flagged that v0.2's continuous loop will need order-of-magnitude faster matching than v0.1.2's parallel sliding-window.
