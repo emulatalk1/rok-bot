@@ -1,21 +1,23 @@
 //! Template matching against the captured RoK window.
 //!
-//! v0.1.2 surface: locate one known UI element (the city/world toggle) inside
-//! `rok-capture.png` produced by [`crate::capture`]. Output is a confident
-//! best-match `(x, y, score)` in capture pixel space, or `Ok(None)` if no
-//! position cleared `MATCH_THRESHOLD`.
+//! v0.2 surface: [`find_best_needle`] searches a `&[&[u8]]` slice of embedded
+//! needles against a per-tick capture PNG (`rok-capture-pre.png` /
+//! `-post.png`, written by [`crate::capture`]) and returns the single global
+//! best [`NeedleMatch`] — the highest-NCC match across all needles, tagged
+//! with the winning needle's index — or `Ok(None)` if no position cleared
+//! `MATCH_THRESHOLD`. The two embedded needles ([`NEEDLES`]: city-view art =
+//! index 0, world-view art = index 1) let the v0.2 continuous loop's
+//! needle-swap verify tell the city↔world toggle apart.
 //!
 //! Algorithm: normalized cross-correlation (NCC) over a parallel sliding
-//! window via [`imageproc::template_matching::match_template_parallel`].
-//! Sub-second on M-series for our 2102×1640 Retina haystack with ~80×40
-//! needle. v0.2 will swap this for FFT-based NCC once the per-tick capture
-//! loop makes naive O(N²) sliding too slow (see TODOS.md P2).
+//! window via [`imageproc::template_matching::match_template_parallel`],
+//! restricted to a region of interest (see [`Roi`] / [`select_roi`]).
+//! ROI-cropped NCC hit the v0.2 continuous-loop cadence target on its own;
+//! FFT-based NCC is indefinitely deferred (see TODOS.md and CLAUDE.md).
 //!
 //! Coordinate space: returned `Match.{x, y}` are in the **capture's** pixel
-//! space (Retina-doubled). v0.1.3 introduces a sibling helper that maps these
-//! to CG screen coords given the window frame from [`crate::window`]; v0.1.2
-//! intentionally stops at capture-pixel coords so the synthesis step is
-//! isolated to the click milestone.
+//! space (Retina-doubled). [`screen_point`] maps these to CG screen coords
+//! given the window frame from [`crate::window`].
 //!
 //! Color: RGBA → Luma8 via `DynamicImage::to_luma8()` (ITU-R BT.601 weights).
 //! Alpha is silently discarded. v0.1.x targets MUST be opaque rectangular
@@ -32,12 +34,14 @@
 //! needle would correlate ~1.0 with most haystacks via this formula, which
 //! is why `match_in` rejects zero-variance needles before invoking imageproc.
 //!
-//! Asset: the needle is `include_bytes!`-embedded at compile time from
-//! `assets/targets/city-button.png`. As of v0.1.5 the committed bytes are a
-//! 180×180 crop of the bottom-left castle medallion (city ↔ world toggle).
-//! A `needle_has_placeholder_sentinel` safety brake remains in `find_target`
-//! as defense-in-depth against accidental re-introduction of the v0.1.4-era
-//! synthetic placeholder pattern.
+//! Assets: the needles are `include_bytes!`-embedded at compile time from
+//! `assets/targets/`. `city-button.png` is a 180×180 crop of the bottom-left
+//! castle medallion in city view; `world-button.png` is its world-view
+//! counterpart (a sentinel placeholder until an operator crops the real
+//! art). A `needle_has_placeholder_sentinel` safety brake inside
+//! [`find_best_needle`] skips any needle carrying the v0.1.4-era synthetic
+//! placeholder pattern, so a placeholder needle is dormant rather than a
+//! false-match hazard.
 
 use std::path::Path;
 use std::time::Instant;
@@ -63,9 +67,10 @@ use crate::error::{BotError, Result};
 /// false negatives bite.
 const SCALE_DIVERGENCE_WARN_THRESHOLD: f64 = 0.01;
 
-/// Maximum haystack dimension (in pixels) accepted by `find_target`. Decoder-
-/// enforced via `image::Limits`, so a malformed PNG with an oversized IHDR
-/// header is rejected before the matcher allocates anything.
+/// Maximum haystack dimension (in pixels) accepted by `load_haystack` (and
+/// therefore by [`find_best_needle`]). Decoder-enforced via `image::Limits`,
+/// so a malformed PNG with an oversized IHDR header is rejected before the
+/// matcher allocates anything.
 ///
 /// `8192` covers reasonable Retina + 6K-external-monitor captures (RoK at
 /// our standard configuration is `2102×1640`, the largest external displays
@@ -88,21 +93,48 @@ const MAX_HAYSTACK_DIM: u32 = 8192;
 /// so a casual change forces the operator to update both sides intentionally.
 pub const MATCH_THRESHOLD: f32 = 0.85;
 
-/// Compile-time-embedded target needle. Lives under `assets/targets/` for PR
-/// visibility but doesn't get read from disk at runtime — embedding side-steps
-/// the "asset missing at runtime" failure mode. The bytes can still be a
-/// malformed PNG (cargo build doesn't validate PNG structure), which the
-/// needle-decode arm in `find_target` catches as `ImageLoadFailed`. The
+/// Compile-time-embedded city-view needle — index 0 in [`NEEDLES`].
+/// Lives under `assets/targets/` for PR visibility but doesn't get
+/// read from disk at runtime — embedding side-steps the "asset missing
+/// at runtime" failure mode. The bytes can still be a malformed PNG
+/// (cargo build doesn't validate PNG structure), which the needle-
+/// decode arm in `find_best_needle` catches as `ImageLoadFailed`. The
 /// `embedded_needle_decodes` test pins decode-validity at `cargo test` time.
 ///
 /// As of v0.1.5 the committed bytes are a 180×180 crop of the bottom-left
-/// castle medallion (city ↔ world toggle). v0.1.4 shipped with a synthetic
-/// placeholder carrying `PLACEHOLDER_SENTINEL_LUMA` so `find_target` could
+/// castle medallion in **city view**. v0.1.4 shipped with a synthetic
+/// placeholder carrying `PLACEHOLDER_SENTINEL_LUMA` so the matcher could
 /// refuse false-matches via the safety brake; with the real crop, the
 /// sentinel is absent and the brake is dormant defense-in-depth against
 /// accidental re-introduction of the placeholder (see /qa live-smoke
 /// 2026-05-11 for the original false-match incident).
 pub const TARGET_BYTES: &[u8] = include_bytes!("../assets/targets/city-button.png");
+
+/// Compile-time-embedded world-view needle — index 1 in [`NEEDLES`].
+///
+/// v0.2's continuous loop targets the city↔world toggle. Confirming a
+/// click actually toggled the view (design D11 needle-swap verify)
+/// needs a needle for EACH view: `TARGET_BYTES` is the city-view art
+/// of the castle medallion, `WORLD_TARGET_BYTES` is the world-view art
+/// of the same on-screen button.
+///
+/// As of v0.2 the committed bytes are a PLACEHOLDER carrying the
+/// `PLACEHOLDER_SENTINEL_LUMA` pattern. [`find_best_needle`] skips any
+/// needle the sentinel gate flags, so the world needle is dormant —
+/// the loop matches only the city needle and the needle-swap verify
+/// can never confirm a toggle, so every tick fails `ClickNotVerified`
+/// and the loop aborts (`LoopAborted`, exit 21). v0.2 is functionally
+/// gated on an operator replacing this file with a real 180×180
+/// world-view crop. This mirrors the v0.1.4-era city-button
+/// placeholder; the crop procedure is in `docs/setup.md`.
+pub const WORLD_TARGET_BYTES: &[u8] = include_bytes!("../assets/targets/world-button.png");
+
+/// The two needles in canonical index order: 0 = city-view art,
+/// 1 = world-view art. The continuous loop's per-tick match and the
+/// needle-swap verify both key off these indices — a confirmed toggle
+/// is "the post-click best match has a different index than the
+/// pre-click best match did."
+pub const NEEDLES: [&[u8]; 2] = [TARGET_BYTES, WORLD_TARGET_BYTES];
 
 /// Sentinel pattern in the placeholder needle's top-left 4 pixels (Luma8).
 /// Alternating max/min: `[255, 0, 255, 0]`. Detectable by
@@ -142,6 +174,22 @@ pub fn needle_has_placeholder_sentinel(needle: &GrayImage) -> bool {
     true
 }
 
+/// Count how many needles in the slice carry the placeholder sentinel
+/// pattern. Best-effort boot diagnostic for the v0.2 loop: a placeholder
+/// needle is dormant (skipped by [`find_best_needle`]), so the loop runs
+/// but the needle-swap verify can never confirm a toggle. A needle that
+/// fails to decode is NOT counted here — `find_best_needle` surfaces that
+/// as `ImageLoadFailed` on the first tick instead.
+#[must_use]
+pub fn count_placeholder_needles(needles: &[&[u8]]) -> usize {
+    needles
+        .iter()
+        .copied()
+        .filter_map(|bytes| image::load_from_memory(bytes).ok())
+        .filter(|img| needle_has_placeholder_sentinel(&img.to_luma8()))
+        .count()
+}
+
 /// Coordinates and confidence of the best template match in the capture.
 ///
 /// Coordinates are in the **capture's** pixel space (Retina-doubled,
@@ -156,7 +204,7 @@ pub fn needle_has_placeholder_sentinel(needle: &GrayImage) -> bool {
 ///
 /// `capture_dims` and `needle_dims` are carried alongside the position so
 /// downstream coordinate math doesn't have to re-decode either image.
-/// `find_target` already decodes both during matching; throwing the
+/// `find_best_needle` already decodes both during matching; throwing the
 /// dimensions away here would force `screen_point` to either re-decode the
 /// haystack (silent O(N) trap on every click) or accept dims as separate
 /// arguments (silent contract bug if caller and source diverge). Storing
@@ -171,6 +219,24 @@ pub struct Match {
     pub needle_dims: (u32, u32),
 }
 
+/// A [`Match`] tagged with which needle in the searched slice produced
+/// it. [`find_best_needle`] searches a `&[&[u8]]` slice of needles and
+/// returns the single global best match across all of them;
+/// `needle_idx` is that winning needle's position in the slice the
+/// caller passed. For [`NEEDLES`], index 0 is the city-view art and
+/// index 1 is the world-view art.
+///
+/// The v0.2 needle-swap verify (design D11) is built on this index:
+/// the loop records the pre-click match's `needle_idx`, then after the
+/// click re-matches the toggle ROI — a `needle_idx` that flipped means
+/// the city↔world view actually toggled, which is the only
+/// animation-immune proof the click landed.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct NeedleMatch {
+    pub needle_idx: usize,
+    pub m: Match,
+}
+
 /// Open a haystack PNG with decoder-enforced dimension limits, decode, and
 /// convert to grayscale. Returns `BotError::ImageLoadFailed { which: "haystack" }`
 /// for any failure (open, format-detection, decode, or dimensions exceeding
@@ -183,11 +249,11 @@ pub struct Match {
 /// fires inside `.decode()` based on the reader's IHDR, so we never
 /// allocate the pixel buffer for an oversized image.
 ///
-/// `pub(crate)` because v0.1.4's `verify::after_state` reuses the same
-/// dimension-limited Luma8 decode for the pre/post pixel-diff path.
-/// Keeping a single source of truth means the haystack limits apply
-/// uniformly across the matcher and the verify primitive — a future
-/// `MAX_HAYSTACK_DIM` change tightens both paths together.
+/// `pub` so it is reachable as the single dimension-limited Luma8 decode for
+/// every haystack the matcher touches. Both the per-tick ROI search and the
+/// full-frame fallback route through [`find_best_needle`], which calls this —
+/// so a future `MAX_HAYSTACK_DIM` change tightens every capture-decode path
+/// at once.
 pub fn load_haystack(path: &Path) -> Result<GrayImage> {
     let mut reader = ImageReader::open(path).map_err(|err| {
         tracing::warn!(
@@ -226,22 +292,24 @@ pub fn load_haystack(path: &Path) -> Result<GrayImage> {
 
 /// Rectangular region-of-interest inside a capture, in capture-pixel space.
 ///
-/// Used by [`find_target_in_roi`] to restrict NCC's sliding window to a
-/// sub-rectangle of the haystack. The bottleneck the v0.2 milestone needs to
-/// kill is NCC's `O(heatmap_pixels × needle_pixels)` cost — for our 2102×1640
-/// Retina capture vs 180×180 needle that's ~91 billion ops per pass (~22s
-/// live). Shrinking the search region is the cheapest path to a usable
-/// per-tick cadence; FFT-NCC is deferred until ROI alone isn't enough.
+/// [`find_best_needle`] takes a `roi_fn` closure returning a `Roi` to
+/// restrict NCC's sliding window to a sub-rectangle of the haystack
+/// (the live loop builds that closure from [`select_roi`]). The bottleneck
+/// the v0.2 milestone needed to kill is NCC's `O(heatmap_pixels ×
+/// needle_pixels)` cost — for our 2102×1640 Retina capture vs 180×180 needle
+/// that's ~91 billion ops per pass (~22s live). Shrinking the search region
+/// is the cheapest path to a usable per-tick cadence; FFT-NCC is
+/// indefinitely deferred — ROI alone hit the cadence target.
 ///
 /// **Coords are inclusive-of-origin, exclusive-of-end:** a ROI at
 /// `(x=0, y=1230, w=420, h=410)` covers capture columns `0..420` and rows
 /// `1230..1640`. The ROI must lie wholly inside the haystack — out-of-bounds
 /// ROIs surface as [`BotError::ImageLoadFailed`] `which="haystack"` from
-/// `find_target_in_roi`, since the only way to produce one is a caller bug
+/// `find_best_needle`, since the only way to produce one is a caller bug
 /// against a malformed haystack.
 ///
 /// **Match coords returned through ROI are still in full-capture space.**
-/// `find_target_in_roi` adds `(roi.x, roi.y)` back to the local match before
+/// `find_best_needle` adds `(roi.x, roi.y)` back to each local match before
 /// returning, and preserves the full haystack dims in `Match.capture_dims`.
 /// This keeps `screen_point` working unchanged — its scale math is against
 /// the original `window.size` / `capture_dims` ratio, which doesn't care
@@ -283,7 +351,7 @@ pub const CASTLE_BUTTON_ROI_FRACTION_H: f64 = 0.25;
 ///
 /// The fractions are clamped to `[0, 1]` and rounded to nearest pixel.
 /// Returns a ROI whose `x + w <= capture_w` and `y + h <= capture_h` —
-/// `find_target_in_roi` re-validates this invariant defensively, but
+/// `find_best_needle` re-validates this invariant defensively, but
 /// constructing here means the live pipeline never produces an out-of-bounds
 /// ROI from a sane capture.
 ///
@@ -294,7 +362,7 @@ pub fn castle_button_roi(capture_w: u32, capture_h: u32) -> Roi {
     // Compute in f64 then round to nearest pixel. Saturate at capture
     // dims so a malformed (0×0) capture produces a (0, 0, 0, 0) ROI
     // rather than a wraparound u32 — the downstream bounds check in
-    // `find_target_in_roi` rejects this with the usual ImageLoadFailed
+    // `find_best_needle` rejects this with the usual ImageLoadFailed
     // error rather than silently matching on a zero-size buffer.
     let fx = f64::from(capture_w) * CASTLE_BUTTON_ROI_FRACTION_X;
     let fy = f64::from(capture_h) * CASTLE_BUTTON_ROI_FRACTION_Y;
@@ -331,76 +399,150 @@ pub fn castle_button_roi(capture_w: u32, capture_h: u32) -> Roi {
     Roi { x, y, w, h }
 }
 
-/// Live entry: load the haystack PNG from disk, decode the embedded needle,
-/// and locate the best NCC match across the **full** capture.
+/// Padding (capture pixels) added around the last match's footprint to
+/// form the v0.2 last-position ROI. The city↔world toggle is a fixed
+/// on-screen button — its position does not move tick to tick — so a
+/// tight box around where it matched last tick is enough. The margin
+/// only absorbs sub-pixel anti-alias drift between the two view arts.
+/// If the toggle ever drifts further (a popup covers it, RoK re-lays-
+/// out its HUD), the last-position ROI misses and `run_loop::tick`'s
+/// full-frame fallback recovers — so this can be tight without risk.
 ///
-/// Preserved as the no-ROI entry point for tests and any caller that doesn't
-/// yet know where to look. The live pipeline (`main.rs` + `verify.rs`) uses
-/// [`find_target_in_castle_roi`] instead — the castle-button ROI cuts NCC
-/// cost by ~50× (live: ~22s → ~440ms projected).
+/// 20 px → a 220×220 ROI for the 180×180 needle: the NCC heatmap is
+/// ≈41×41 ≈1.7K positions vs the castle ROI's ≈56K. That ~33× cut is
+/// the "per-tick near-zero NCC" the v0.2 continuous loop wants on
+/// tick 2+ (once a first match has seeded `last_match`).
+pub const LAST_POSITION_ROI_MARGIN_PX: u32 = 20;
+
+/// Compute the v0.2 last-position [`Roi`]: the last match's needle
+/// footprint expanded by [`LAST_POSITION_ROI_MARGIN_PX`] on every
+/// side, clamped to the capture bounds.
+///
+/// Clamping at the capture edges means a match near a corner produces
+/// a smaller (but still valid, still ≥ the needle in both dims) ROI
+/// rather than an out-of-bounds one — `find_best_needle`'s bounds
+/// check would otherwise reject it. The result is always ≥ the needle
+/// because a valid `last` Match satisfies `last.x + needle_w <=
+/// capture_w` by construction, so the clamped span never cuts below
+/// the needle footprint.
+#[must_use]
+pub fn last_position_roi(last: Match, capture_w: u32, capture_h: u32) -> Roi {
+    let (needle_w, needle_h) = last.needle_dims;
+    let x = last.x.saturating_sub(LAST_POSITION_ROI_MARGIN_PX);
+    let y = last.y.saturating_sub(LAST_POSITION_ROI_MARGIN_PX);
+    let x_end = last
+        .x
+        .saturating_add(needle_w)
+        .saturating_add(LAST_POSITION_ROI_MARGIN_PX)
+        .min(capture_w);
+    let y_end = last
+        .y
+        .saturating_add(needle_h)
+        .saturating_add(LAST_POSITION_ROI_MARGIN_PX)
+        .min(capture_h);
+    Roi {
+        x,
+        y,
+        w: x_end.saturating_sub(x),
+        h: y_end.saturating_sub(y),
+    }
+}
+
+/// Pure: pick the per-tick search ROI for the v0.2 continuous loop.
+/// `last_match` present → search a tight box around where the toggle
+/// matched last tick ([`last_position_roi`]); absent (tick 1, or after
+/// a failed tick reset `last_match` to `None`) → search the broad
+/// castle-button quadrant ([`castle_button_roi`]).
+#[must_use]
+pub fn select_roi(last_match: Option<Match>, capture_w: u32, capture_h: u32) -> Roi {
+    last_match.map_or_else(
+        || castle_button_roi(capture_w, capture_h),
+        |m| last_position_roi(m, capture_w, capture_h),
+    )
+}
+
+/// Live entry: load the haystack PNG from disk and locate the best NCC
+/// match of the embedded city needle across the **full** capture.
+///
+/// Single-needle convenience wrapper over [`find_best_needle`] —
+/// preserved as the no-ROI entry point for the test suite. The live
+/// v0.2 pipeline (`run_loop` + `verify`) calls `find_best_needle`
+/// directly with the full [`NEEDLES`] slice.
 ///
 /// Returns:
-/// * `Ok(Some(m))` — best match cleared `MATCH_THRESHOLD`. Logs an `info!`
-///   line with `x`/`y`/`score`/`elapsed_ms` for operator visibility.
-/// * `Ok(None)`    — best match below threshold (or all-NaN heatmap on
-///   pathological input). The matcher already logged the diagnostic numbers
-///   at `warn!` before returning. Caller (`main.rs::run`) translates this to
-///   `BotError::TargetNotFound` (exit 15).
-/// * `Err(...)`    — real failure path: haystack open/decode/oversize,
-///   needle decode, or oversized needle. Each maps to a typed `BotError`
-///   variant with structured exit code (16 for image load, 17 for needle
-///   too large vs. haystack).
-// Kept as the no-ROI entry for the test suite + any future caller that
-// genuinely doesn't know where to look. The live pipeline uses
-// `find_target_in_castle_roi`; bin-target clippy reports this as dead since
-// it sees only the bin's call graph.
+/// * `Ok(Some(m))` — best match cleared `MATCH_THRESHOLD`.
+/// * `Ok(None)`    — best match below threshold, or the only needle
+///   was sentinel-gated. Caller translates to `BotError::TargetNotFound`.
+/// * `Err(...)`    — haystack open/decode/oversize, needle decode, or
+///   oversized needle.
 #[allow(dead_code)]
 pub fn find_target(haystack_path: &Path) -> Result<Option<Match>> {
-    find_target_impl(haystack_path, |_, _| None)
+    Ok(find_best_needle(haystack_path, &[TARGET_BYTES], |_, _| None)?.map(|nm| nm.m))
 }
 
-/// Live entry: load the haystack PNG, decode the embedded needle, and locate
-/// the best NCC match constrained to `roi`.
+/// Live entry: load the haystack PNG and locate the best NCC match of
+/// the embedded city needle constrained to `roi`.
 ///
-/// Same return contract as [`find_target`], with two structural extras:
-/// * Match coords are offset back to **full-capture pixel space** before
-///   returning (caller still sees the same coord frame `screen_point` expects).
-/// * `Match.capture_dims` is the full haystack dims, not the ROI dims, so
-///   downstream scale math against the live window frame is unchanged.
-///
-/// An ROI that extends past the haystack bounds surfaces as
-/// `BotError::ImageLoadFailed { which: "haystack" }` — the only way to
-/// produce one in practice is a programmer error in the ROI fraction
-/// constants vs the live capture dims, which is operator-visible-fixable.
-///
-/// `#[allow(dead_code)]` because the live pipeline currently always uses
-/// the castle-button ROI; this explicit entry stays public for the v0.2
-/// continuous-loop "last-position ROI" caller (search ±N px around last
-/// known match coords) and is exercised by tests.
+/// Single-needle convenience wrapper over [`find_best_needle`]. Match
+/// coords are offset back to **full-capture pixel space** and
+/// `Match.capture_dims` is the full haystack dims, not the ROI dims —
+/// see `find_best_needle` for the contract. An ROI past the haystack
+/// bounds surfaces as `BotError::ImageLoadFailed { which: "haystack" }`.
 #[allow(dead_code)]
 pub fn find_target_in_roi(haystack_path: &Path, roi: Roi) -> Result<Option<Match>> {
-    find_target_impl(haystack_path, move |_, _| Some(roi))
+    Ok(find_best_needle(haystack_path, &[TARGET_BYTES], move |_, _| Some(roi))?.map(|nm| nm.m))
 }
 
-/// Live entry: load the haystack, compute the [`castle_button_roi`] from its
-/// dims, and locate the best NCC match in that sub-region.
+/// Live entry: load the haystack, compute the [`castle_button_roi`] from
+/// its dims, and locate the best NCC match of the embedded city needle
+/// in that sub-region.
 ///
-/// This is the entry point the live pipeline (`main.rs::run`) and the
-/// post-click diagnostic (`verify::log_post_match_diagnostic`) use in v0.2.
-/// Folding the ROI compute inside the matcher means callers don't need to
-/// probe haystack dims themselves — and we still only load the haystack once.
+/// Single-needle convenience wrapper over [`find_best_needle`]. Kept
+/// for the test suite (the full vs castle-ROI cross-check); the v0.2
+/// live pipeline calls `find_best_needle` with [`NEEDLES`] + a
+/// [`select_roi`]-driven closure instead.
+#[allow(dead_code)]
 pub fn find_target_in_castle_roi(haystack_path: &Path) -> Result<Option<Match>> {
-    find_target_impl(haystack_path, |w, h| Some(castle_button_roi(w, h)))
+    Ok(find_best_needle(haystack_path, &[TARGET_BYTES], |w, h| {
+        Some(castle_button_roi(w, h))
+    })?
+    .map(|nm| nm.m))
 }
 
-/// Shared implementation for [`find_target`], [`find_target_in_roi`], and
-/// [`find_target_in_castle_roi`]. The closure receives the full haystack
-/// dims and returns the ROI to apply (or `None` for a full-haystack match).
+/// Locate the best NCC match across a slice of needles in one haystack
+/// (D7/CQ1 from the v0.2 `/plan-eng-review`).
 ///
-/// Generic over `FnOnce(u32, u32) -> Option<Roi>` so each public entry can
-/// hand in either a static `None`, a fixed `Some(roi)`, or a dims-aware
-/// builder closure — without forcing the caller to load the haystack twice.
-fn find_target_impl<F>(haystack_path: &Path, roi_fn: F) -> Result<Option<Match>>
+/// The haystack is decoded ONCE and cropped to the ROI ONCE; every
+/// needle then runs `match_in` against that single cropped image. The
+/// return is the single global best [`NeedleMatch`] — the highest NCC
+/// score across all needles, tagged with the winning needle's index in
+/// `needles`. Ties go to the lower index (first encountered), matching
+/// `match_in`'s lexicographic tie-break philosophy.
+///
+/// `roi_fn` receives the full haystack dims (post-decode) and returns
+/// the ROI to search, or `None` for a full-haystack search. Generic
+/// over `FnOnce(u32, u32) -> Option<Roi>` so callers hand in a static
+/// `None`, a fixed `Some(roi)`, or a [`select_roi`]-driven builder
+/// without probing haystack dims themselves.
+///
+/// Per-needle handling:
+/// * A needle carrying the `PLACEHOLDER_SENTINEL_LUMA` pattern is
+///   skipped (logged at warn), not matched — so a placeholder needle
+///   (the v0.2 `WORLD_TARGET_BYTES` until an operator crops it) is
+///   dormant rather than poisoning the result with a false match.
+/// * A needle that fails to decode surfaces as
+///   `BotError::ImageLoadFailed { which: "needle" }`.
+///
+/// Returns `Ok(None)` when no needle cleared `MATCH_THRESHOLD` (or
+/// every needle was sentinel-gated). Match coords are re-anchored to
+/// full-capture pixel space and `Match.capture_dims` is the full
+/// haystack dims, so downstream `screen_point` scale math is unchanged
+/// regardless of which ROI was searched.
+pub fn find_best_needle<F>(
+    haystack_path: &Path,
+    needles: &[&[u8]],
+    roi_fn: F,
+) -> Result<Option<NeedleMatch>>
 where
     F: FnOnce(u32, u32) -> Option<Roi>,
 {
@@ -435,46 +577,11 @@ where
         }
     }
 
-    // Needle decode is technically fallible (include_bytes! embeds bytes but
-    // doesn't validate they parse as PNG — the file could be corrupt at
-    // commit time). In practice this can only fire if the committed asset
-    // is malformed, which `cargo build` won't catch. Defensive arm.
-    let t_needle = Instant::now();
-    let needle = image::load_from_memory(TARGET_BYTES)
-        .map_err(|err| {
-            tracing::warn!(
-                target: "rok_bot",
-                error = %err,
-                "failed to decode embedded needle (assets/targets/city-button.png)"
-            );
-            BotError::ImageLoadFailed { which: "needle" }
-        })?
-        .to_luma8();
-    let needle_decode_ms = u64::try_from(t_needle.elapsed().as_millis()).unwrap_or(u64::MAX);
-
-    // Placeholder sentinel gate. v0.1.5 re-cropped the needle to a real RoK
-    // button, so this branch is dormant defense-in-depth: it fires only if
-    // someone accidentally reintroduces the v0.1.4-era synthetic placeholder
-    // (which carries the sentinel pattern by construction). Without this
-    // gate, the matcher's non-mean-centered NCC scores low-entropy needles
-    // at 0.9+ against arbitrary haystacks — /qa caught a false-match 5ms
-    // from posting a synthetic click in live smoke 2026-05-11.
-    if needle_has_placeholder_sentinel(&needle) {
-        tracing::warn!(
-            target: "rok_bot",
-            "placeholder sentinel needle detected (top-left luma [255,0,255,0]); \
-             refusing to match — replace assets/targets/city-button.png with a \
-             real RoK crop to enable matching"
-        );
-        return Ok(None);
-    }
-
-    // Crop to ROI (or to the full haystack as a no-op when no ROI provided).
-    // Materialize via `to_image()` because `imageproc::match_template_parallel`
-    // takes a concrete `&ImageBuffer`, not a `SubImage` view. The full-
-    // haystack memcpy in the no-ROI path costs ~3.5MB for a Retina capture —
-    // trivial vs the NCC pass it's about to feed, and only exercised by the
-    // no-ROI test entry (`find_target`), not the live pipeline.
+    // Crop to the ROI (or the full haystack when no ROI is given) ONCE,
+    // before the needle loop — every needle searches the same cropped
+    // image (D7: single haystack decode + crop, best-of-N). Materialize
+    // via `to_image()` because `imageproc::match_template_parallel`
+    // takes a concrete `&ImageBuffer`, not a `SubImage` view.
     let t_crop = Instant::now();
     let effective_roi = roi.unwrap_or(Roi {
         x: 0,
@@ -493,42 +600,73 @@ where
     let roi_offset = (effective_roi.x, effective_roi.y);
     let crop_ms = u64::try_from(t_crop.elapsed().as_millis()).unwrap_or(u64::MAX);
 
-    let t_match = Instant::now();
-    let outcome_local = match_in(&search_image, &needle)?;
-    let match_ms = u64::try_from(t_match.elapsed().as_millis()).unwrap_or(u64::MAX);
+    // Per-needle: decode, sentinel-gate, NCC. Track the single global
+    // best across all needles (ties go to the lower index — `is_none_or`
+    // + strict `>`). Needle decode is technically fallible (include_bytes!
+    // embeds bytes but doesn't validate PNG structure); a malformed asset
+    // surfaces as ImageLoadFailed{needle}.
+    let t_needles = Instant::now();
+    let mut best: Option<NeedleMatch> = None;
+    for (needle_idx, bytes) in needles.iter().copied().enumerate() {
+        let needle = image::load_from_memory(bytes)
+            .map_err(|err| {
+                tracing::warn!(
+                    target: "rok_bot",
+                    needle_idx,
+                    error = %err,
+                    "failed to decode embedded needle"
+                );
+                BotError::ImageLoadFailed { which: "needle" }
+            })?
+            .to_luma8();
 
-    // Re-anchor the match to full-capture coords and restore the full
-    // haystack dims. screen_point's scale factor is `window.size /
-    // capture_dims` — substituting ROI dims would silently inflate the
-    // scale and post clicks at the wrong screen point.
-    let outcome = outcome_local.map(|m| Match {
-        x: m.x.saturating_add(roi_offset.0),
-        y: m.y.saturating_add(roi_offset.1),
-        score: m.score,
-        capture_dims: full_dims,
-        needle_dims: m.needle_dims,
-    });
+        // Placeholder sentinel gate. A needle carrying the v0.1.4-era
+        // synthetic placeholder pattern (the v0.2 WORLD_TARGET_BYTES
+        // until an operator crops it) is SKIPPED, not matched: the
+        // matcher's non-mean-centered NCC scores low-entropy needles
+        // 0.9+ against arbitrary haystacks, so matching a placeholder
+        // would post a false-positive click. Skipping (vs aborting the
+        // whole call) leaves the other needles in the slice free to
+        // match — /qa caught the original false-match in live smoke
+        // 2026-05-11.
+        if needle_has_placeholder_sentinel(&needle) {
+            tracing::warn!(
+                target: "rok_bot",
+                needle_idx,
+                "placeholder sentinel needle detected (top-left luma \
+                 [255,0,255,0]); skipping — replace the asset with a real \
+                 RoK crop to enable matching this needle"
+            );
+            continue;
+        }
 
-    // Profiling breakdown — fires for every call (match or no-match) so the
-    // v0.2 FFT-NCC investigation has the numbers regardless of whether the
-    // single-shot pipeline lands a match. Emitted at INFO so it surfaces in
-    // default `cargo run` output without `RUST_LOG=debug`.
-    //
-    // `roi_offset_*` is the key field for no-match operator debugging:
-    // `match_in`'s below-threshold warn emits `best_x`/`best_y` in search-
-    // image space, NOT full-capture space. When `roi_applied = true`,
-    // operators tuning the ROI fractions must add `(roi_offset_x,
-    // roi_offset_y)` to the warn coords to get capture-pixel coords. The
-    // alternative (offset-aware log inside `match_in`) would require
-    // threading the offset through the pure-fn boundary; emitting it
-    // alongside the timing keeps `match_in` unchanged while giving the
-    // operator everything they need in one log surface.
+        // Re-anchor each match to full-capture coords + restore the full
+        // haystack dims. screen_point's scale factor is `window.size /
+        // capture_dims`; substituting ROI dims would inflate the scale
+        // and post clicks at the wrong screen point.
+        if let Some(m_local) = match_in(&search_image, &needle)? {
+            let m = Match {
+                x: m_local.x.saturating_add(roi_offset.0),
+                y: m_local.y.saturating_add(roi_offset.1),
+                score: m_local.score,
+                capture_dims: full_dims,
+                needle_dims: m_local.needle_dims,
+            };
+            if best.is_none_or(|b| m.score > b.m.score) {
+                best = Some(NeedleMatch { needle_idx, m });
+            }
+        }
+    }
+    let needles_ms = u64::try_from(t_needles.elapsed().as_millis()).unwrap_or(u64::MAX);
+
+    // Profiling breakdown — fires for every call (match or no-match).
+    // `roi_offset_*` lets operators translate `match_in`'s search-image-
+    // space below-threshold warn coords back to full-capture pixels.
     tracing::info!(
         target: "rok_bot",
         haystack_load_ms,
-        needle_decode_ms,
         crop_ms,
-        match_ms,
+        needles_ms,
         total_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
         haystack_w = full_dims.0,
         haystack_h = full_dims.1,
@@ -536,24 +674,24 @@ where
         search_h = search_image.height(),
         roi_offset_x = roi_offset.0,
         roi_offset_y = roi_offset.1,
-        needle_w = needle.width(),
-        needle_h = needle.height(),
         roi_applied = roi.is_some(),
-        matched = outcome.is_some(),
-        "find_target timing"
+        needle_count = needles.len(),
+        matched = best.is_some(),
+        "find_best_needle timing"
     );
 
-    if let Some(ref m) = outcome {
+    if let Some(nm) = best {
         tracing::info!(
             target: "rok_bot",
-            x = m.x,
-            y = m.y,
-            score = m.score,
+            needle_idx = nm.needle_idx,
+            x = nm.m.x,
+            y = nm.m.y,
+            score = nm.m.score,
             elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
             "found target"
         );
     }
-    Ok(outcome)
+    Ok(best)
 }
 
 /// Pure: validate that a `Match` carries non-zero `capture_dims` and
@@ -1874,6 +2012,339 @@ mod tests {
             outcome.capture_dims,
             (2102, 1640),
             "capture_dims must reflect full haystack",
+        );
+    }
+
+    // ---------- v0.2: NeedleMatch / find_best_needle ----------
+
+    /// Encode a luma image as RGBA PNG bytes in memory. The round-trip
+    /// through `find_best_needle`'s decode preserves luma exactly
+    /// (BT.601 weights sum to 1, R=G=B). Used to feed synthetic needles
+    /// into `find_best_needle`, which takes `&[&[u8]]` PNG bytes.
+    fn encode_luma_as_png_bytes(img: &GrayImage) -> Vec<u8> {
+        let mut rgba = image::RgbaImage::new(img.width(), img.height());
+        for (x, y, p) in img.enumerate_pixels() {
+            let l = p[0];
+            rgba.put_pixel(x, y, image::Rgba([l, l, l, 255]));
+        }
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(rgba)
+            .write_to(&mut cursor, image::ImageFormat::Png)
+            .expect("encode test needle PNG must succeed");
+        cursor.into_inner()
+    }
+
+    #[test]
+    fn find_best_needle_single_element_slice_matches_find_target() {
+        // Regression-guard parity (the v0.2 plan's explicit ask): a
+        // 1-element needle slice through find_best_needle must produce
+        // the SAME Match the v0.1.7/v0.1.8 single-needle find_target
+        // produced — needle_idx 0, byte-identical `.m`.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("haystack.png");
+        let needle = embedded_needle_luma();
+        let mut haystack = noise_image(800, 600, 0xBEEF_2202);
+        plant_needle_at(&mut haystack, &needle, 220, 140);
+        write_luma_as_rgba_png(&haystack, &path);
+
+        let via_find_target = find_target(&path)
+            .expect("find_target decode")
+            .expect("find_target match");
+        let via_slice = find_best_needle(&path, &[TARGET_BYTES], |_, _| None)
+            .expect("find_best_needle decode")
+            .expect("find_best_needle match");
+        assert_eq!(
+            via_slice.needle_idx, 0,
+            "single-element slice → needle_idx 0"
+        );
+        assert_eq!(
+            via_slice.m, via_find_target,
+            "1-element needle slice must produce a Match identical to find_target",
+        );
+    }
+
+    #[test]
+    fn find_best_needle_returns_global_best_across_needles() {
+        // Two distinct synthetic needles. Plant ONLY needle 1 exactly;
+        // needle 0 is absent (haystack is otherwise noise). The global
+        // best must be needle_idx 1 — find_best_needle returns the
+        // highest-scoring needle, not the first in the slice.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("haystack.png");
+        let needle0 = noise_image(40, 40, 0x1111_2222);
+        let needle1 = noise_image(40, 40, 0x3333_4444);
+        let mut haystack = noise_image(400, 300, 0x5555_6666);
+        plant_needle_at(&mut haystack, &needle1, 100, 80);
+        write_luma_as_rgba_png(&haystack, &path);
+
+        let n0 = encode_luma_as_png_bytes(&needle0);
+        let n1 = encode_luma_as_png_bytes(&needle1);
+        let nm = find_best_needle(&path, &[n0.as_slice(), n1.as_slice()], |_, _| None)
+            .expect("haystack decodes")
+            .expect("needle 1 is planted exactly → clears threshold");
+        assert_eq!(
+            nm.needle_idx, 1,
+            "the planted needle (idx 1) must win best-of-N"
+        );
+        assert_eq!(
+            (nm.m.x, nm.m.y),
+            (100, 80),
+            "match coords at the plant site"
+        );
+    }
+
+    #[test]
+    fn find_best_needle_skips_sentinel_world_placeholder_and_matches_city() {
+        // NEEDLES = [city (real crop), world (sentinel placeholder)].
+        // Plant the city needle: find_best_needle must skip the
+        // sentinel world needle and still return the city match at
+        // needle_idx 0. This is the v0.2 reality until an operator
+        // crops the real world art.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("haystack.png");
+        let needle = embedded_needle_luma();
+        let mut haystack = noise_image(800, 600, 0xC1A7_0001);
+        plant_needle_at(&mut haystack, &needle, 200, 150);
+        write_luma_as_rgba_png(&haystack, &path);
+
+        let nm = find_best_needle(&path, &NEEDLES, |_, _| None)
+            .expect("haystack decodes")
+            .expect("city needle planted exactly → clears threshold");
+        assert_eq!(
+            nm.needle_idx, 0,
+            "city needle (idx 0) must win; the world placeholder is sentinel-skipped",
+        );
+        assert_eq!((nm.m.x, nm.m.y), (200, 150));
+    }
+
+    #[test]
+    fn embedded_world_needle_decodes() {
+        // Compile-time validation that assets/targets/world-button.png
+        // is a valid PNG. `cargo build` only checks the file exists;
+        // this catches a malformed commit before a live run.
+        let needle = image::load_from_memory(WORLD_TARGET_BYTES)
+            .expect("embedded WORLD_TARGET_BYTES must decode as a valid image");
+        assert!(
+            needle.width() > 0 && needle.height() > 0,
+            "embedded world needle has zero dimensions: {}x{}",
+            needle.width(),
+            needle.height()
+        );
+    }
+
+    #[test]
+    fn embedded_world_needle_is_placeholder_until_operator_crops_it() {
+        // v0.2 ships WORLD_TARGET_BYTES as a sentinel placeholder — the
+        // needle-swap verify is dormant until an operator crops the
+        // real world-view art. When that crop lands, this test FAILS:
+        // that is the forcing function. Flip it then to assert NO
+        // sentinel (mirroring `embedded_needle_carries_no_sentinel`).
+        let needle = image::load_from_memory(WORLD_TARGET_BYTES)
+            .expect("embedded world needle must decode")
+            .to_luma8();
+        assert!(
+            needle_has_placeholder_sentinel(&needle),
+            "WORLD_TARGET_BYTES is expected to be the sentinel placeholder in \
+             v0.2. If an operator has cropped the real world-view art into \
+             assets/targets/world-button.png, flip this test to assert \
+             !needle_has_placeholder_sentinel (and update the embedded-asset doc)."
+        );
+    }
+
+    #[test]
+    fn needles_const_is_city_then_world() {
+        // The continuous loop + needle-swap verify key off these
+        // indices: 0 = city art, 1 = world art. Pin the order.
+        let [city, world] = NEEDLES;
+        assert_eq!(city, TARGET_BYTES, "NEEDLES[0] must be the city needle");
+        assert_eq!(
+            world, WORLD_TARGET_BYTES,
+            "NEEDLES[1] must be the world needle"
+        );
+    }
+
+    // ---------- v0.2: last_position_roi / select_roi ----------
+
+    #[test]
+    fn last_position_roi_margin_const_pinned() {
+        // The margin sizes the per-tick fast-path ROI. Changing it is a
+        // latency tuning decision — pin so a casual change is intentional.
+        assert_eq!(LAST_POSITION_ROI_MARGIN_PX, 20);
+    }
+
+    #[test]
+    fn last_position_roi_boxes_needle_with_margin() {
+        // Match at (500, 600), 180×180 needle, 2102×1640 capture. ROI
+        // is the needle footprint padded 20px every side: x=480, y=580,
+        // w=220, h=220.
+        let m = make_match(500, 600, (2102, 1640), (180, 180));
+        let roi = last_position_roi(m, 2102, 1640);
+        assert_eq!(
+            roi,
+            Roi {
+                x: 480,
+                y: 580,
+                w: 220,
+                h: 220,
+            },
+        );
+        // Sanity: the ROI fully contains the needle footprint.
+        assert!(roi.x <= m.x && roi.y <= m.y);
+        assert!(roi.x.saturating_add(roi.w) >= m.x.saturating_add(180));
+        assert!(roi.y.saturating_add(roi.h) >= m.y.saturating_add(180));
+    }
+
+    #[test]
+    fn last_position_roi_clamps_at_top_left_corner() {
+        // Match at (5, 5): the 20px margin would underflow the origin.
+        // saturating_sub clamps x and y to 0; the ROI stays ≥ needle.
+        let m = make_match(5, 5, (2102, 1640), (180, 180));
+        let roi = last_position_roi(m, 2102, 1640);
+        assert_eq!(roi.x, 0, "left margin clamps to 0");
+        assert_eq!(roi.y, 0, "top margin clamps to 0");
+        assert!(
+            roi.w >= 180 && roi.h >= 180,
+            "clamped ROI must still cover the needle: {roi:?}",
+        );
+    }
+
+    #[test]
+    fn last_position_roi_clamps_at_bottom_right_corner() {
+        // Needle flush against the bottom-right edge. The +margin would
+        // overrun the capture; .min() clamps x_end/y_end to the bounds.
+        let m = make_match(2102 - 180, 1640 - 180, (2102, 1640), (180, 180));
+        let roi = last_position_roi(m, 2102, 1640);
+        assert_eq!(
+            roi.x.saturating_add(roi.w),
+            2102,
+            "right edge clamps to capture_w"
+        );
+        assert_eq!(
+            roi.y.saturating_add(roi.h),
+            1640,
+            "bottom edge clamps to capture_h"
+        );
+        assert!(
+            roi.w >= 180 && roi.h >= 180,
+            "clamped ROI must still cover the needle: {roi:?}",
+        );
+    }
+
+    #[test]
+    fn last_position_roi_stays_within_capture_and_at_least_needle() {
+        // Across plausible match positions the ROI must never extend
+        // past the capture (find_best_needle's bounds check would
+        // reject it) and never shrink below the needle (match_in's
+        // size guard would fire TargetTooLarge).
+        for (mx, my) in [(0, 0), (11, 1443), (500, 500), (1922, 1460)] {
+            let m = make_match(mx, my, (2102, 1640), (180, 180));
+            let roi = last_position_roi(m, 2102, 1640);
+            assert!(
+                roi.x.saturating_add(roi.w) <= 2102 && roi.y.saturating_add(roi.h) <= 1640,
+                "ROI {roi:?} extends past capture for match ({mx}, {my})",
+            );
+            assert!(
+                roi.w >= 180 && roi.h >= 180,
+                "ROI {roi:?} smaller than needle for match ({mx}, {my})",
+            );
+        }
+    }
+
+    #[test]
+    fn select_roi_none_returns_castle_roi() {
+        // Tick 1 (or after a failed tick reset last_match): no last
+        // match → broad castle-button quadrant.
+        let got = select_roi(None, 2102, 1640);
+        assert_eq!(got, castle_button_roi(2102, 1640));
+    }
+
+    #[test]
+    fn select_roi_some_returns_last_position_roi() {
+        // Tick 2+: a last match seeds the tight last-position ROI.
+        let m = make_match(500, 600, (2102, 1640), (180, 180));
+        let got = select_roi(Some(m), 2102, 1640);
+        assert_eq!(got, last_position_roi(m, 2102, 1640));
+    }
+
+    // ---------- v0.2: find_best_needle edge cases (from /review) ----------
+
+    #[test]
+    fn find_best_needle_tie_breaks_to_lower_index() {
+        // Two byte-identical needles → both score 1.0 at the plant site.
+        // The documented contract is: a score tie resolves to the lower
+        // needle index (strict `>` in the is_none_or predicate). A future
+        // `>` → `>=` slip would silently flip this — this test catches it.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("haystack.png");
+        let needle = noise_image(40, 40, 0x7777_8888);
+        let mut haystack = noise_image(400, 300, 0x9999_AAAA);
+        plant_needle_at(&mut haystack, &needle, 120, 90);
+        write_luma_as_rgba_png(&haystack, &path);
+        let n = encode_luma_as_png_bytes(&needle);
+        let nm = find_best_needle(&path, &[n.as_slice(), n.as_slice()], |_, _| None)
+            .expect("haystack decodes")
+            .expect("identical needles both clear threshold");
+        assert_eq!(
+            nm.needle_idx, 0,
+            "a score tie must resolve to the lower needle index",
+        );
+    }
+
+    #[test]
+    fn find_best_needle_empty_slice_returns_none() {
+        // An empty needle slice: the per-needle loop never runs → Ok(None).
+        // find_best_needle is pub; run_loop always passes the 2-element
+        // NEEDLES, but the empty-slice path must be a clean no-match.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("haystack.png");
+        write_luma_as_rgba_png(&noise_image(200, 200, 0x1357_2468), &path);
+        let empty: [&[u8]; 0] = [];
+        let got = find_best_needle(&path, &empty, |_, _| None)
+            .expect("an empty needle slice must not error");
+        assert!(got.is_none(), "an empty needle slice yields no match");
+    }
+
+    #[test]
+    fn find_best_needle_malformed_needle_surfaces_image_load_failed() {
+        // Garbage bytes as a needle: the per-needle decode arm must
+        // surface BotError::ImageLoadFailed{which:"needle"} — propagated
+        // as Err, not silently skipped like the sentinel gate.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("haystack.png");
+        write_luma_as_rgba_png(&noise_image(200, 200, 0x2468_1357), &path);
+        let garbage: &[u8] = b"not a png at all";
+        match find_best_needle(&path, &[garbage], |_, _| None) {
+            Err(BotError::ImageLoadFailed { which }) => assert_eq!(which, "needle"),
+            other => {
+                panic!("expected ImageLoadFailed{{needle}} for a malformed needle, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn find_best_needle_all_sentinel_needles_returns_none() {
+        // Every needle sentinel-gated (WORLD_TARGET_BYTES is the v0.2
+        // placeholder) → all skipped → Ok(None): no match, no error.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("haystack.png");
+        write_luma_as_rgba_png(&noise_image(300, 300, 0xABCD_1234), &path);
+        let got = find_best_needle(&path, &[WORLD_TARGET_BYTES, WORLD_TARGET_BYTES], |_, _| {
+            None
+        })
+        .expect("haystack decodes");
+        assert!(got.is_none(), "every needle sentinel-gated → Ok(None)");
+    }
+
+    #[test]
+    fn count_placeholder_needles_counts_sentinel_needles() {
+        // City is a real crop (0 placeholders); world is the v0.2
+        // sentinel placeholder. Drives the run_loop boot warning.
+        assert_eq!(count_placeholder_needles(&[TARGET_BYTES]), 0);
+        assert_eq!(count_placeholder_needles(&[WORLD_TARGET_BYTES]), 1);
+        assert_eq!(count_placeholder_needles(&NEEDLES), 1);
+        assert_eq!(
+            count_placeholder_needles(&[WORLD_TARGET_BYTES, WORLD_TARGET_BYTES]),
+            2,
         );
     }
 }

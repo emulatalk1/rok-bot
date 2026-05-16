@@ -17,17 +17,17 @@
 //!   FFI is hand-rolled here because `core-graphics` does not bind it and no
 //!   maintained Rust crate exists as of 2026-05.
 //!
-//! Two-stage AX preflight pattern (design A11):
+//! AX preflight (v0.2, supersedes design A11's two-stage peek):
 //!
-//! - At boot, `peek_accessibility()` reports the current trusted state
-//!   without prompting. If denied, `main.rs::run` logs a warn and proceeds —
-//!   the bot may still produce useful capture+match output even without click.
-//! - At click site, `check_accessibility()` *prompts* if denied (returns a
-//!   typed `PermissionsMissing` error → exit 13). The prompt is asynchronous,
-//!   so first-run UX is "prompt fires, exit 13, user grants in System
-//!   Settings, user re-runs and it works" — NOT analogous to
-//!   `ScreenCaptureAccess::request()` which blocks. This was Codex review
-//!   CMT-2 correction during /plan-eng-review.
+//! v0.1.x ran a warn-only `peek_accessibility()` at boot, then a hard
+//! `check_accessibility()` at the click site — because a capture-only run
+//! needed no Accessibility grant. The v0.2 continuous loop ALWAYS clicks;
+//! there is no capture-only mode. So `main.rs::run` now calls
+//! `check_accessibility()` ONCE at boot as a hard check (exit 13 if
+//! denied) and the boot peek is gone. The prompt is asynchronous, so
+//! first-run UX is "prompt fires, exit 13, user grants in System
+//! Settings, user re-runs and it works" — NOT analogous to
+//! `ScreenCaptureAccess::request()` which blocks.
 
 #![allow(
     unsafe_code,
@@ -134,8 +134,10 @@ pub fn check_screen_recording() -> Result<()> {
 }
 
 /// Build the options dictionary `{ kAXTrustedCheckOptionPrompt: <prompt> }`.
-/// Factored out so `peek_accessibility` (prompt=false) and
-/// `check_accessibility` (prompt=true) share construction without diverging.
+/// Factored out so the CoreFoundation dictionary construction stays
+/// separate from the trust check itself. `check_accessibility` is the
+/// only caller (always `prompt=true`); the `prompt` parameter is kept
+/// so a future non-prompting probe needn't re-derive the construction.
 fn ax_options(prompt: bool) -> CFDictionary<CFString, CFBoolean> {
     // SAFETY: `kAXTrustedCheckOptionPrompt` is a CFStringRef constant exported
     // statically by ApplicationServices. `wrap_under_get_rule` follows the
@@ -149,23 +151,6 @@ fn ax_options(prompt: bool) -> CFDictionary<CFString, CFBoolean> {
         CFBoolean::false_value()
     };
     CFDictionary::from_CFType_pairs(&[(prompt_key, prompt_val)])
-}
-
-/// Live AX trust check, no prompt. Returns `true` if the calling process
-/// is currently trusted for Accessibility, `false` otherwise. Never side-
-/// effects the system (no dialog, no TCC mutation).
-///
-/// Intended for the boot-time peek per design A11: log a warn if denied,
-/// continue execution — the bot can still produce capture + match output
-/// without click, and the click-site hard check fires when needed.
-pub fn peek_accessibility() -> bool {
-    let opts = ax_options(false);
-    // SAFETY: `AXIsProcessTrustedWithOptions` accepts a `CFDictionaryRef` and
-    // returns a `Boolean`. The dictionary outlives this call; the framework
-    // does not retain past return. Returning `u8` (0 or 1) is per Apple's
-    // documented signature.
-    let trusted = unsafe { AXIsProcessTrustedWithOptions(opts.as_concrete_TypeRef()) };
-    trusted != 0
 }
 
 /// SCK preflight: confirm the rok-bot binary can enumerate shareable
@@ -223,7 +208,7 @@ pub fn check_sck_grant() -> Result<()> {
 /// current (still denied) trusted state. There is no analogue to
 /// `ScreenCaptureAccess::request()`'s blocking behavior. First-run flow is:
 ///
-///   1. Bot reaches click site, calls this fn.
+///   1. Bot reaches the boot Accessibility check, calls this fn.
 ///   2. macOS shows AX prompt (async); fn returns false.
 ///   3. Bot exits with code 13 + user-facing log instructing "grant in
 ///      System Settings, then re-run."
@@ -234,7 +219,10 @@ pub fn check_sck_grant() -> Result<()> {
 /// event loop, which would balloon the dependency surface for marginal UX.
 pub fn check_accessibility() -> Result<()> {
     let opts = ax_options(true);
-    // SAFETY: same contract as `peek_accessibility` — see that comment.
+    // SAFETY: `AXIsProcessTrustedWithOptions` accepts a `CFDictionaryRef` and
+    // returns a `Boolean` (0/1) per Apple's documented signature (see the
+    // `unsafe extern "C"` block above). The dictionary outlives this call;
+    // the framework does not retain it past return.
     let trusted = unsafe { AXIsProcessTrustedWithOptions(opts.as_concrete_TypeRef()) };
     check_accessibility_inner(trusted != 0)
 }

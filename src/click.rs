@@ -246,6 +246,73 @@ impl Drop for CursorStealth {
     }
 }
 
+/// RAII guard that guarantees a posted `LeftMouseDown` is always
+/// followed by a `LeftMouseUp`, even if the thread unwinds between the
+/// two posts (design D6/A4 from the v0.2 `/plan-eng-review`).
+///
+/// `click_at` posts `LeftMouseDown`, sleeps `CLICK_GAP_MS`, then posts
+/// `LeftMouseUp`. If a panic unwinds the thread inside that window the
+/// down event has already reached RoK but the up event has not — RoK
+/// sees a stuck press / drag-start with no recovery until some other
+/// up event arrives from a real click. `panic = "unwind"` (set in
+/// `Cargo.toml`) means `Drop` runs on panic, so this guard's `Drop`
+/// posts the missing up event.
+///
+/// Plain SIGINT (operator Ctrl-C) is NOT this guard's job — v0.2's
+/// `ctrlc` handler flips an `AtomicBool` checked at tick boundaries,
+/// so a Ctrl-C lets the in-flight click finish its normal pair rather
+/// than hard-killing the process mid-post. This guard is purely the
+/// panic-safety net; before v0.2 the same gap was a TODOS P3 item.
+///
+/// Generic over the post action (`F: FnOnce()`) so unit tests can
+/// substitute a counter for the live `CGEvent::post` and verify the
+/// arm/disarm contract without injecting events into the OS.
+struct ClickGuard<F: FnOnce()> {
+    /// `Some` while armed. `release()` and `Drop` both `take()` it, so
+    /// the up event posts exactly once: whichever runs first wins, the
+    /// other sees `None` and no-ops. This structurally rules out a
+    /// double-post (RoK seeing up, up).
+    post_up: Option<F>,
+}
+
+impl<F: FnOnce()> ClickGuard<F> {
+    /// Arm the guard. Call immediately after `LeftMouseDown` is posted.
+    const fn new(post_up: F) -> Self {
+        Self {
+            post_up: Some(post_up),
+        }
+    }
+
+    /// Normal path: post the `LeftMouseUp` now and disarm. After this
+    /// `Drop` is a no-op — the `take()` left `post_up` empty.
+    fn release(&mut self) {
+        if let Some(post_up) = self.post_up.take() {
+            post_up();
+        }
+    }
+}
+
+impl<F: FnOnce()> Drop for ClickGuard<F> {
+    fn drop(&mut self) {
+        // Still armed at Drop time means `release()` never ran — the
+        // thread is unwinding through `click_at` after the down-post.
+        // Post the fallback up FIRST (the load-bearing action), then log.
+        // Doing the post before `tracing::warn!` means that even in the
+        // pathological case of the tracing subscriber panicking, the
+        // up event is already delivered — no double-panic-during-unwind
+        // can strand a LeftMouseDown.
+        if let Some(post_up) = self.post_up.take() {
+            post_up();
+            tracing::warn!(
+                target: "rok_bot",
+                "ClickGuard: posted fallback LeftMouseUp on unwind — click_at \
+                 did not reach its normal up-post; released the button so RoK \
+                 does not see a stuck LeftMouseDown"
+            );
+        }
+    }
+}
+
 /// Synthesize and post a single left-click at `point` (CG global-screen
 /// coords) to the process owning `window.pid`. v0.1.6 path: activate +
 /// stealth-disassociate + HID tap pair + cursor-restore.
@@ -308,10 +375,23 @@ pub fn click_at(window: &RokWindow, point: CGPoint) -> Result<()> {
         "posting HID click pair to RoK (stealth-cursor)"
     );
     down.post(CGEventTapLocation::HID);
+    // `LeftMouseDown` is in flight. Arm the ClickGuard so a panic
+    // between here and the normal up-post still releases the button —
+    // RoK must never be left holding a down event. `ctrlc` neutralizes
+    // plain SIGINT, so this guard is specifically the panic-safety net
+    // (design D6/A4); `up` is moved into the guard's post closure.
+    let mut click_guard = ClickGuard::new(move || up.post(CGEventTapLocation::HID));
     sleep(Duration::from_millis(CLICK_GAP_MS));
-    up.post(CGEventTapLocation::HID);
+    click_guard.release();
 
-    // `_stealth` drops here, restoring the cursor + reassociating.
+    // Drop order is load-bearing — and `_stealth` MUST be declared before
+    // `click_guard` so it drops second. Locals drop in reverse declaration
+    // order, so on BOTH the happy path and a panic-unwind: `click_guard`
+    // drops first (posts the LeftMouseUp — a no-op here, already released
+    // above; the real fallback post happens on the unwind path), then
+    // `_stealth` drops (warps the cursor back + reassociates). The up event
+    // is always posted while the cursor is still detached. Do not reorder
+    // these two bindings.
     Ok(())
 }
 
@@ -427,6 +507,44 @@ mod tests {
             "ACTIVATION_SETTLE_MS = {ACTIVATION_SETTLE_MS}ms drifted outside \
              10..=1000; if intentional, update both this pin and the constant \
              doc."
+        );
+    }
+
+    // ---------- ClickGuard (v0.2 D6/A4) ----------
+
+    #[test]
+    fn click_guard_release_posts_up_once_and_disarms() {
+        // Normal path: release() posts the up action exactly once, and
+        // the subsequent Drop must NOT post again — a double-up would
+        // make RoK see a spurious second mouse-up.
+        let posts = std::cell::Cell::new(0_u32);
+        {
+            let mut guard = ClickGuard::new(|| posts.set(posts.get().saturating_add(1)));
+            guard.release();
+            assert_eq!(posts.get(), 1, "release() posts the up event exactly once");
+        } // guard drops here, already disarmed
+        assert_eq!(
+            posts.get(),
+            1,
+            "Drop after release() must not double-post the up event"
+        );
+    }
+
+    #[test]
+    fn click_guard_drop_without_release_posts_fallback_up() {
+        // Panic-safety path: the guard is armed but release() never
+        // runs (simulating a thread unwind between down.post and the
+        // normal up.post). Drop must post the fallback up exactly once
+        // so RoK does not keep holding the LeftMouseDown.
+        let posts = std::cell::Cell::new(0_u32);
+        {
+            let _guard = ClickGuard::new(|| posts.set(posts.get().saturating_add(1)));
+            // no release() — the guard stays armed through Drop
+        }
+        assert_eq!(
+            posts.get(),
+            1,
+            "Drop of an armed ClickGuard must post the fallback up exactly once"
         );
     }
 }

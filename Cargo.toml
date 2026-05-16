@@ -39,6 +39,12 @@ dispatch2                = "0.3"
 libc                     = "0.2"
 thiserror          = "2"
 anyhow             = "1"
+# ctrlc: v0.2 continuous loop. Installs a SIGINT handler that flips an
+# AtomicBool checked at tick boundaries — Ctrl-C finishes the current
+# tick (including the in-flight click pair) and exits 0 instead of
+# hard-killing the process mid-click and stranding a LeftMouseDown.
+# This is what lets the ClickGuard RAII in click.rs be panic-only.
+ctrlc              = "3"
 tracing            = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # image + imageproc: v0.1.2 template-matching pipeline. `image` is already

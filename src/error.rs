@@ -8,10 +8,12 @@ pub enum BotError {
     #[error("RoK window center is not on any online display")]
     WindowScreenUnresolved,
 
-    /// Returned by `permissions::check_screen_recording` when
-    /// `CGPreflightScreenCaptureAccess` reports the running app lacks the
-    /// permission. v0.1 only checks Screen Recording; Accessibility is added
-    /// when the synthetic-input milestone lands `CGEvent.post`.
+    /// A required macOS permission is denied. The `which` tag is one of
+    /// two values: `"Screen Recording"` (from
+    /// `permissions::check_screen_recording`, needed for `ScreenCaptureKit`)
+    /// or `"Accessibility"` (from `permissions::check_accessibility`, needed
+    /// for `CGEvent::post` to deliver synthetic clicks — checked as a hard
+    /// boot gate in v0.2 since the continuous loop always clicks).
     #[error(
         "Missing macOS permission: {which}. Grant it to your terminal app in \
          System Settings → Privacy & Security → {which}, then re-run."
@@ -90,11 +92,12 @@ pub enum BotError {
     #[error("target not found in capture (best match below confidence threshold)")]
     TargetNotFound,
 
-    /// PNG decode or open failed for the haystack. The underlying
-    /// `image::ImageError` is logged at warn before mapping to this, mirroring
-    /// `capture_with_bin`'s `io::Error` handling. `which` distinguishes
-    /// haystack vs. needle in the log line; v0.1.x only fires for "haystack"
-    /// because the needle is `include_bytes!`-embedded.
+    /// PNG decode or open failed. The underlying `image::ImageError` is
+    /// logged at warn before mapping to this. `which` is two-valued:
+    /// `"haystack"` — the capture PNG failed to open/decode (or exceeded
+    /// `MAX_HAYSTACK_DIM`); `"needle"` — an `include_bytes!`-embedded
+    /// needle asset failed to decode. `find_best_needle` decodes each
+    /// needle per call, so a malformed committed asset surfaces here.
     #[error("failed to load {which} image — see prior warn log for the underlying error")]
     ImageLoadFailed { which: &'static str },
 
@@ -160,13 +163,13 @@ pub enum BotError {
     )]
     ClickFailed { reason: &'static str },
 
-    /// The RoK window's state changed between discovery (top of `run()`)
-    /// and the click site, OR was already in an unreachable state at
-    /// boot, in a way that would let a synthetic AX-privileged click
-    /// land on the wrong window (or no window). v0.1.3 introduced the
-    /// pre-click TOCTOU close; v0.1.5 extends the same check to boot-time
-    /// discovery and post-click re-validation, and adds PID-anchored
-    /// lookups + hidden-Space detection.
+    /// The RoK window's state changed between discovery and a click
+    /// site, OR was already in an unreachable state, in a way that would
+    /// let a synthetic HID click land on the wrong window (or no window).
+    /// v0.1.3 introduced the pre-click TOCTOU close; v0.1.5 extended the
+    /// check to boot-time discovery and post-click re-validation with
+    /// PID-anchored lookups + hidden-Space detection; v0.2 runs this
+    /// check every loop tick.
     ///
     /// `reason` distinguishes which check failed (all map to exit 19):
     /// - `"window_id_gone"` — the (WID, PID) pair from discovery is no
@@ -200,81 +203,79 @@ pub enum BotError {
     )]
     WindowChanged { reason: &'static str },
 
-    /// After-state verification reported no visible change post-click.
-    /// The synthetic click was delivered (v0.1.5's AX press returned
-    /// success, meaning the target's accessibility tree accepted the
-    /// action), but the pre-click and post-click captures of the RoK
-    /// window are pixel-identical within
-    /// `verify::PIXEL_DIFF_REJECT_THRESHOLD`. RoK did not visibly react.
+    /// Post-click needle-swap verification failed (v0.2, design D11).
+    /// The click was delivered, but a re-capture of the toggle ROI did
+    /// not confirm the city-view to world-view (or back) toggle.
     ///
-    /// v0.1.4 ships two reason tags:
+    /// v0.2's continuous loop replaced v0.1.4's pixel-diff verify.
+    /// Pixel-diff trivially passed on ANY view change AND false-passed
+    /// a missed click during RoK's ambient animation (water, troops,
+    /// weather) — it could not tell "the toggle fired" from "the screen
+    /// happened to move." Needle-swap is animation-immune: the bot
+    /// matches against two needles (city-view art = needle index 0,
+    /// world-view art = needle index 1); a confirmed toggle means the
+    /// post-click capture matches a DIFFERENT needle than the pre-click
+    /// capture matched.
     ///
-    /// - `"screen_unchanged"` — the common case. Pre and post captures
-    ///   decoded successfully, dims matched, but pixel-diff fell below
-    ///   `verify::PIXEL_DIFF_REJECT_THRESHOLD`. RoK did not visibly react.
-    ///   Outside Voice F2 from /plan-eng-review forced dropping the
-    ///   originally-planned third tag (`"match_stable"` — post re-match
-    ///   shows target at same coords/score), because it mis-flagged
-    ///   legitimate clicks on RoK buttons that stay visible after click
-    ///   (dropdowns, tabs, selections). Pixel-diff is the gate; the
-    ///   re-match runs inside `verify::after_state` but logs diagnostics
-    ///   only.
-    /// - `"dim_mismatch"` — added in response to adversarial review of
-    ///   v0.1.4. Pre and post captures decoded to `GrayImage`s with
-    ///   different dimensions, so pixel-diff has nothing meaningful to
-    ///   compare. Fires when the capture pipeline state-changed between
-    ///   pre and post (display DPI reconfig, RoK fullscreen-borderless
-    ///   toggle, screencapture padded to a different size). The verify
-    ///   gate fails closed here rather than passing on the `u64::MAX`
-    ///   sentinel from `pixel_diff`.
+    /// v0.2 reason tags (both pinned in `verify.rs`):
     ///
-    /// Common causes by reason tag (operator's diagnostic checklist):
+    /// - `"no_swap"` — the post-click re-match found the SAME needle
+    ///   that matched pre-click. The view did not toggle: the click
+    ///   landed on a non-interactive pixel, RoK was mid-loading-screen,
+    ///   or the click missed the button.
+    /// - `"neither_needle"` — the post-click re-match found NEITHER
+    ///   needle above `matcher::MATCH_THRESHOLD`. Usually a mid-
+    ///   transition frame (the verify delay landed inside the
+    ///   city↔world cross-fade and neither art scored). Treated as an
+    ///   unconfirmed swap, i.e. a failed tick — the loop retries and a
+    ///   real toggle confirms on the next tick.
     ///
-    /// **`screen_unchanged`:**
-    /// - Target image is stale (asset rot — RoK shipped a UI update that
-    ///   shifted the matched element's pixel rendering by more than the
-    ///   matcher's tolerance, so the click landed on empty space).
-    /// - Accessibility permission was silently revoked between
-    ///   `permissions::check_accessibility` and the HID tap (rare;
-    ///   `CGEvent::post` returns `()` and provides no delivery
-    ///   confirmation, so a silent revocation surfaces here, not as
-    ///   `ClickFailed`).
-    /// - The matched UI element is non-interactive (decorative button
-    ///   art, disabled state, or chrome that doesn't respond to input).
-    /// - RoK is frozen, stuttering, or paused (App Nap, system load,
-    ///   game mid-loading-screen).
-    /// - Click landed in the 500ms window between RoK's render frame
-    ///   and the post-capture (rare — `VERIFY_DELAY_MS` gives 2× typical
-    ///   transition margin).
-    ///
-    /// **`dim_mismatch`:**
-    /// - Operator changed display DPI / Scaled-resolution between
-    ///   pre-capture and post-capture.
-    /// - RoK toggled fullscreen-borderless mid-flow (frame stays within
-    ///   tolerance but internal content area changed).
-    /// - Display arrangement reconfig (BetterDisplay reconnect, external
-    ///   monitor hot-plug) altered the capture's backing pixel grid.
-    /// - Capture-pipeline integrity drift (`screencapture` chose a
-    ///   different output mode for the two calls).
-    ///
-    /// **Not** a cause covered by this variant: server-bound clicks
-    /// (resource spend, troop dispatch, server sync) that show a 1-3s UI
-    /// spinner before state changes render. Those fire `screen_unchanged`
-    /// despite the click landing correctly — v0.1.4 scope is UI-local
-    /// only. See TODOS.md P2 "v0.1.4+ — server-roundtrip click verify"
-    /// for the retry-and-poll path that fixes them.
+    /// Both tags are TRANSIENT in the loop's error policy (design D5):
+    /// one failure is noise, `run_loop::LOOP_FAILURE_BUDGET` in a row
+    /// aborts the loop with `LoopAborted`.
     #[error(
-        "synthetic click delivered but post-state verify failed (reason: {reason}). \
-         The activate→stealth→HID-tap pipeline ran to completion. For \
-         reason='screen_unchanged': pre/post pixel-space comparison shows \
-         no change above threshold (stale target, non-interactive element \
-         absorbing the click without visible effect, RoK frozen, or \
-         server-bound click still loading per TODOS P2). For \
-         reason='dim_mismatch': pre/post captures have different \
-         dimensions, indicating capture-pipeline state changed between \
-         calls (display reconfig, fullscreen toggle, etc.)."
+        "post-click needle-swap verify failed (reason: {reason}). \
+         The click was delivered but the city↔world toggle was not \
+         confirmed. For 'no_swap', the post-click capture still matched \
+         the same view's needle — the click did not toggle the view. \
+         For 'neither_needle', neither needle matched the post-click \
+         capture, likely a mid-transition frame; the loop retries."
     )]
     ClickNotVerified { reason: &'static str },
+
+    /// The v0.2 continuous loop aborted. Two paths reach here, both at
+    /// a tick boundary (never mid-click — the loop only checks for
+    /// abort between ticks):
+    ///
+    /// - `"failure_budget_exhausted"` — `run_loop::LOOP_FAILURE_BUDGET`
+    ///   transient failures occurred in a row with no successful tick
+    ///   resetting the counter. A transient failure is `TargetNotFound`,
+    ///   `ClickNotVerified`, `CaptureFailed`, or
+    ///   `WindowChanged{not_visible}` (see `run_loop::classify_error`).
+    ///   One failure is noise (RoK mid-animation, a dropped frame); N
+    ///   in a row means RoK is frozen, the needle asset rotted, or RoK
+    ///   got hidden for good — the loop stops rather than spin forever.
+    ///   The per-tick warn log carries the specific error of each
+    ///   failed tick; this variant carries only the abort trigger.
+    /// - `"signal_handler_install_failed"` — `ctrlc::set_handler`
+    ///   failed at boot. The loop refuses to start: without the SIGINT
+    ///   handler a Ctrl-C would hard-kill the process mid-click and
+    ///   strand a `LeftMouseDown` in RoK's event queue. Aborting before
+    ///   tick 1 is safer than running a loop that cannot shut down
+    ///   cleanly.
+    ///
+    /// Exit code 21 — the first free slot after v0.1.x's 10-20 range
+    /// (12 is the retired `RokNotOnPrimary` gap).
+    #[error(
+        "continuous loop aborted (reason: {reason}). For \
+         'failure_budget_exhausted', check the preceding per-tick warn \
+         logs for the repeated failure — RoK may be frozen, hidden, or \
+         the target needle may have rotted. For \
+         'signal_handler_install_failed', the SIGINT handler could not \
+         be installed; re-run, and if it persists check for another \
+         process holding the handler."
+    )]
+    LoopAborted { reason: &'static str },
 }
 
 impl BotError {
@@ -296,6 +297,7 @@ impl BotError {
             Self::ClickFailed { .. } => 18,
             Self::WindowChanged { .. } => 19,
             Self::ClickNotVerified { .. } => 20,
+            Self::LoopAborted { .. } => 21,
         }
     }
 }
@@ -314,7 +316,8 @@ mod tests {
         REASON_UP,
     };
     use crate::permissions::STAGE_NO_SHAREABLE_CONTENT;
-    use crate::verify::{REASON_DIM_MISMATCH, REASON_SCREEN_UNCHANGED};
+    use crate::run_loop::{REASON_FAILURE_BUDGET_EXHAUSTED, REASON_SIGNAL_INSTALL_FAILED};
+    use crate::verify::{REASON_NEITHER_NEEDLE, REASON_NO_SWAP};
 
     #[test]
     fn exit_codes_are_stable_and_unique() {
@@ -346,7 +349,11 @@ mod tests {
             }
             .exit_code(),
             BotError::ClickNotVerified {
-                reason: REASON_SCREEN_UNCHANGED,
+                reason: REASON_NO_SWAP,
+            }
+            .exit_code(),
+            BotError::LoopAborted {
+                reason: REASON_FAILURE_BUDGET_EXHAUSTED,
             }
             .exit_code(),
         ];
@@ -478,22 +485,32 @@ mod tests {
                 "WindowChanged({reason}) must map to exit 19"
             );
         }
-        // ClickNotVerified has TWO documented reason tags. The first
-        // (screen_unchanged) is the common-case pixel-diff failure;
-        // the second (dim_mismatch) closes a fail-open path adversarial
-        // review caught during /review of v0.1.4 (pixel_diff's u64::MAX
-        // sentinel was passing verdict on capture-pipeline integrity
-        // drift). /plan-eng-review's D7 dropped match_stable; the
-        // dim_mismatch addition is a fail-closed correction, not a
-        // walk-back of that decision (match_stable mis-flagged valid
-        // clicks; dim_mismatch surfaces a real capture-pipeline state
-        // change). Pin via the verify-module constants so a future
-        // rename is forced through both gates (here and verify.rs).
-        for reason in [REASON_SCREEN_UNCHANGED, REASON_DIM_MISMATCH] {
+        // ClickNotVerified has TWO documented reason tags in v0.2's
+        // needle-swap verify (design D11, which retired the v0.1.4
+        // pixel-diff path and its screen_unchanged/dim_mismatch tags):
+        // no_swap (post-click capture matched the same needle — view
+        // didn't toggle) and neither_needle (post-click capture matched
+        // neither needle — mid-transition frame). Pin via the verify-
+        // module constants so a future rename is forced through both
+        // gates (here and verify.rs).
+        for reason in [REASON_NO_SWAP, REASON_NEITHER_NEEDLE] {
             assert_eq!(
                 BotError::ClickNotVerified { reason }.exit_code(),
                 20,
                 "ClickNotVerified({reason}) must map to exit 20"
+            );
+        }
+        // LoopAborted (v0.2) shares no exit code with v0.1.x — slot 21
+        // is the first free code after the 10-20 range. Pin both
+        // documented reasons via the run_loop-module constants.
+        for reason in [
+            REASON_FAILURE_BUDGET_EXHAUSTED,
+            REASON_SIGNAL_INSTALL_FAILED,
+        ] {
+            assert_eq!(
+                BotError::LoopAborted { reason }.exit_code(),
+                21,
+                "LoopAborted({reason}) must map to exit 21"
             );
         }
     }
@@ -635,16 +652,16 @@ mod tests {
     }
 
     #[test]
-    fn click_not_verified_message_includes_reason_and_post_state_phrasing() {
+    fn click_not_verified_message_includes_reason_and_needle_swap_phrasing() {
         // Operator's first instinct on ClickNotVerified is "which gate
         // fired?" The reason tag must surface in Display output so the
         // operator's log line lands on the right diagnostic. The
-        // "post-state verify" phrasing must appear so the message is
+        // "needle-swap verify" phrasing must appear so the message is
         // semantically distinguishable from ClickFailed (creation-time
         // CGEvent failure, different exit code, different fix path).
         // Using the verify-module constants rather than literals pins
         // the test to the same string-of-truth the runtime emits.
-        for reason in [REASON_SCREEN_UNCHANGED, REASON_DIM_MISMATCH] {
+        for reason in [REASON_NO_SWAP, REASON_NEITHER_NEEDLE] {
             let err = BotError::ClickNotVerified { reason };
             let msg = err.to_string();
             assert!(
@@ -653,9 +670,33 @@ mod tests {
             );
             let lower = msg.to_lowercase();
             assert!(
-                lower.contains("post-state verify"),
-                "ClickNotVerified Display must reference 'post-state verify' to \
+                lower.contains("needle-swap verify"),
+                "ClickNotVerified Display must reference 'needle-swap verify' to \
                  distinguish from ClickFailed: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn loop_aborted_message_includes_reason_and_loop_phrasing() {
+        // v0.2 LoopAborted (exit 21). The reason tag must surface so the
+        // operator's log line points at the abort trigger; the "loop
+        // aborted" phrasing must appear so the message is unmistakably
+        // a loop-lifecycle failure, not a single-tick one. Pin via the
+        // run_loop-module constants.
+        for reason in [
+            REASON_FAILURE_BUDGET_EXHAUSTED,
+            REASON_SIGNAL_INSTALL_FAILED,
+        ] {
+            let err = BotError::LoopAborted { reason };
+            let msg = err.to_string();
+            assert!(
+                msg.contains(reason),
+                "LoopAborted Display must include the reason tag '{reason}': {msg}"
+            );
+            assert!(
+                msg.to_lowercase().contains("loop aborted"),
+                "LoopAborted Display must reference 'loop aborted': {msg}"
             );
         }
     }
