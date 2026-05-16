@@ -4,6 +4,16 @@ Items deferred from planning sessions. Each entry should be self-contained enoug
 
 ---
 
+## ✅ DONE — v0.2 SHIPPED: Continuous loop
+
+**Shipped 2026-05-16**, tag `v0.2`. Turns the v0.1.x one-shot `capture→match→click→verify` pipeline into a continuous loop targeting the state-neutral city↔world toggle — a deliberate plumbing milestone (D1 from `/plan-eng-review`): it proves the loop machinery, it does not do a real in-game task.
+
+New `src/run_loop.rs` (loop engine: pure decision core `classify_error`/`next_failure_count`/`should_stop`/`parse_max_ticks` + live `tick()`/`run_loop()`). `ctrlc` SIGINT handler → `AtomicBool` checked at tick boundaries; `ROK_BOT_MAX_TICKS` env cap (default 100; `=1` reproduces the one-shot). Error policy D5/D12: FATAL aborts immediately, TRANSIENT counts toward a 3-consecutive-failure budget → `BotError::LoopAborted` exit 21. `matcher.rs` generalized to `find_best_needle` (2-needle best-of-N, `NEEDLES`, `NeedleMatch`, `select_roi`, `last_position_roi`). `verify.rs` reworked to needle-swap (`confirm_needle_swap`); the pixel-diff path was deleted. `click.rs` gained `ClickGuard` RAII. `main.rs` = boot + delegate; Accessibility promoted to a hard boot check. `assets/targets/world-button.png` ships as a sentinel placeholder (operator crops the real world-view art — see `docs/setup.md` "v0.2 world-needle crop"). 15 locked decisions (D1-D15) from `/plan-eng-review`; 179 unit tests + 6 `#[ignore]`'d integration tests; full `/review` (5 specialists + Claude adversarial); live `/qa` on a Mode 2 BD virtual display confirmed both loop exit paths (`ROK_BOT_MAX_TICKS=1` → 0, `=3` → 21).
+
+The three v0.2.x/v0.3 items D13 (anti-bot cadence jitter), D14 (window re-discovery after RoK relaunch), and D15 (`not_visible` wait-and-retry) added by the v0.2 `/plan-eng-review` are listed under P2/P3 below.
+
+---
+
 ## ✅ DONE — v0.1.6 SHIPPED: Mode 2 click delivery via stealth HID + osascript activation
 
 **Resolved 2026-05-13** by commit `2c96790` (live-confirmed with RoK on a BetterDisplay virtual display: exit 0, pixel_diff 3.19M, castle press observable in pre/post captures, cursor stayed put, RoK didn't visibly raise on built-in).
@@ -559,3 +569,48 @@ Too tight `ACTIVATION_SETTLE_MS`: RoK ignores the HID tap because the Catalyst B
 - Update the constants + the `in_sane_range` pin tests if needed.
 
 **Why deferred:** v0.1.6 ships with conservative initial values that passed a live run on 2026-05-13. Calibration without volume of data would be motion. Re-open when v0.2's continuous loop produces enough samples to differentiate "click landed" from "click missed because of timing."
+
+---
+
+## P3: v0.2+ — anti-bot cadence jitter for the continuous loop (deferred from /plan-eng-review 2026-05-16)
+
+**Source:** /plan-eng-review of the v0.2 continuous loop — outside-voice (Claude subagent) finding #3.
+**Effort:** human ~2 hours / CC ~40 min
+**Depends on:** v0.2 continuous loop landed; becomes load-bearing only when the loop drives a real account (a real in-game task — the D1 option-B/C direction).
+
+The v0.2 loop clicks at a fixed ~500ms+ cadence, at the exact same screen coordinate every tick, with fixed `ACTIVATION_SETTLE_MS` / `CLICK_GAP_MS` internal delays, and re-runs `osascript` activation every tick. Perfectly periodic taps with zero coordinate variance are a textbook automated-clicker signature. v0.2's plumbing milestone targets the state-neutral city/world toggle, so detection stakes are ~zero — but a loop later pointed at a real account inherits the fingerprint.
+
+**Approach:**
+- Make the timing constants ranges, not points: jitter the inter-tick delay, `ACTIVATION_SETTLE_MS`, `CLICK_GAP_MS` by a randomized ± fraction.
+- Jitter the click coordinate within the matched needle's bounds (a few px off the exact match centre) so taps aren't pixel-identical.
+- Skip the per-tick `osascript` activation when RoK is already frontmost (track it) to cut a redundant observable.
+- Inject the RNG (or a seed) so `cargo test` stays reproducible. This is why it was NOT built into v0.2 — it would compromise the pure-function test determinism the v0.2 loop locked in (D9/T1).
+
+---
+
+## P2: v0.2.x — window re-discovery after RoK relaunch mid-loop (deferred from /plan-eng-review 2026-05-16)
+
+**Source:** /plan-eng-review of the v0.2 continuous loop — outside-voice (Claude subagent) finding #4.
+**Effort:** human ~1.5 hours / CC ~40 min
+**Depends on:** v0.2 continuous loop landed. **Design together with** the two existing P2 window items — "re-validate window identity at capture time" and "snapshot retry loop for BD reconfig race" — they are the same window-lifecycle cluster.
+
+The v0.2 loop runs `find_rok_window` once at boot and holds the resulting `RokWindow` (SCWindow handle + WID) for every tick. If RoK crashes and auto-restarts mid-loop, the new instance gets a fresh WID; the cached SCWindow handle is stale. The next captures time out (5s each) and after 3 the loop aborts `LoopAborted` exit 21 — a clean abort, but the loop ends on a RoK crash instead of riding through the restart.
+
+**Approach:**
+- On a stale-window signal (`CaptureFailed{window_not_found}` or repeated capture timeout), re-run `find_rok_window`, refresh the cached `RokWindow`, and resume the loop rather than counting toward the abort budget.
+- Bound re-discovery attempts so a genuinely-gone RoK still aborts.
+- Co-design with the window-identity-revalidation P2 item: SCK's content-filter binds identity at use-time, so revalidation and re-discovery share machinery.
+
+---
+
+## P2: v0.2.x — not_visible wait-and-retry for full screensaver survival (deferred from /plan-eng-review 2026-05-16)
+
+**Source:** /plan-eng-review of the v0.2 continuous loop — decision D12, deferred option B.
+**Effort:** human ~1.5 hours / CC ~40 min
+**Depends on:** v0.2 continuous loop landed. **Design with** the window re-discovery TODO above (same window-lifecycle cluster). **Gated on** an empirical check: does `WindowChanged{not_visible}` actually fire for a window on a BetterDisplay virtual display when the system idles / screensavers? D12 and the outside voice disagreed and neither verified it.
+
+D12 classified `not_visible` as a transient failure: the loop tolerates a brief blip (Space switch, momentary idle) but still aborts after 3 consecutive hidden ticks (~5s). It does NOT survive a multi-minute screensaver or display sleep. Mode 2's value proposition — run RoK on a virtual display while you work elsewhere — implies the system can idle and the loop should survive it.
+
+**Approach:**
+- First, empirically settle whether `not_visible` even fires in Mode 2 under system idle (run the loop, trigger a screensaver, observe). If it never fires, this TODO closes as a non-issue.
+- If it does: on `not_visible`, enter a dedicated wait-and-poll sub-loop that sleeps and re-checks window visibility WITHOUT counting against the abort budget, resuming the main loop when RoK reappears. Bound the total wait so a permanently-gone RoK still aborts.

@@ -1,6 +1,6 @@
 # Setup
 
-> **v0.1.8 status:** Both **Mode 1 (visible)** and **Mode 2 (virtual display)** ship today. Mode 2 is the recommended operating mode — RoK lives on a BetterDisplay virtual display, the bot operates invisibly, you keep using the Mac. v0.1.8 replaces the v0.1.x `screencapture` CLI subprocess with in-process `objc2-screen-capture-kit`: per-capture latency drops from ~280-1400ms to ~140ms steady-state. **macOS 14.0+ required** (SCScreenshotManager is 14+) and **Screen Recording must be granted to the `rok-bot` binary itself** — see "First-run TCC grant" below. The Mode 2 lifecycle automation (shortcuts that connect/disconnect the virtual display per session) is **still deferred to v0.2**; for now you set BD up once manually and the bot uses whatever's there.
+> **v0.2 status:** rok-bot now runs a **continuous loop** — `capture → match → click → verify` per tick, run-until-Ctrl-C, targeting the state-neutral city↔world toggle. This is a plumbing milestone: it proves the loop machinery, it doesn't yet do a real in-game task. `ROK_BOT_MAX_TICKS` caps the run (default 100); `ROK_BOT_MAX_TICKS=1` reproduces the v0.1.x one-shot. Both **Mode 1 (visible)** and **Mode 2 (virtual display)** work; Mode 2 is recommended — RoK lives on a BetterDisplay virtual display, the bot operates invisibly, you keep using the Mac. **macOS 14.0+ required** and **Screen Recording + Accessibility must be granted to the `rok-bot` binary itself** — see "First-run TCC grant" below. v0.2 makes Accessibility a HARD boot check (the loop always clicks). **Before v0.2 is functional you must crop the real world-view needle** — see "v0.2 world-needle crop" below; until then the loop runs as a smoke test and aborts `LoopAborted` (exit 21). Mode 2 lifecycle automation (shortcuts that connect/disconnect the virtual display) is still deferred.
 
 ## First-run TCC grant (v0.1.8 UX regression)
 
@@ -17,6 +17,8 @@ v0.1.8's in-process SCK requires the `rok-bot` binary itself to be granted SR. O
 ```
 
 Grant the binary in **System Settings → Privacy & Security → Screen Recording**, toggle the new `rok-bot` entry on, then re-run. One-time per binary path (re-grant if you `cargo build --release` to a different target).
+
+**v0.2 also hard-requires Accessibility at boot.** v0.1.x peeked Accessibility (warn-only) and only hard-checked it at the click site. The v0.2 loop always clicks, so there is no capture-only mode — `rok-bot` demands Accessibility up front and exits 13 (`PermissionsMissing`) if it's denied. Grant the `rok-bot` binary in **System Settings → Privacy & Security → Accessibility** the same way.
 
 
 `rok-bot` is designed to run in two modes depending on where Rise of Kingdoms is parked.
@@ -42,9 +44,11 @@ cargo run --release
 
 > **Mode 1 caveat:** Catalyst Bridge auto-raises RoK to the foreground on every synthetic UITouch (this is the structural reason Mode 2 exists). You'll see RoK pop forward each click. For unattended use, prefer Mode 2.
 
-Boot sequence (logged to stderr via `tracing`):
-1. **Screen Recording preflight.** First run on a fresh Mac triggers macOS's prompt and registers your terminal in System Settings → Privacy & Security → Screen Recording. Exit 13 (`PermissionsMissing`) if denied.
-2. **Accessibility peek (warn-only).** Logs a warning if AX isn't yet granted; the hard check fires later only if we're actually about to deliver a click.
+**v0.2 — the bot runs a loop.** `cargo run --release` boots once, then loops `capture → match → click → verify` until Ctrl-C (the SIGINT handler finishes the in-flight tick, then exits 0) or the `ROK_BOT_MAX_TICKS` cap (default 100). `ROK_BOT_MAX_TICKS=1` reproduces the v0.1.x one-shot exactly. The numbered steps below are: 1-4 boot once, 5-11 repeat each tick.
+
+Boot + per-tick sequence (logged to stderr via `tracing`):
+1. **Screen Recording preflight.** First run on a fresh Mac triggers macOS's prompt. Exit 13 (`PermissionsMissing`) if denied.
+2. **Accessibility hard check (v0.2).** The loop always clicks, so Accessibility is demanded at boot — not the v0.1.x warn-only peek. Exit 13 (`PermissionsMissing`) if denied. Also: a `ctrlc` SIGINT handler is installed so Ctrl-C stops the loop cleanly; if it fails to install, the loop refuses to start (exit 21 `LoopAborted`, reason `signal_handler_install_failed`).
 3. **Find the RoK main window.** Filtered by `kCGWindowOwnerName == kCGWindowName == "RiseOfKingdoms"` AND backed by a process whose bundle ID starts with `com.rok.ios.` (anti-spoof gate). Search `kCGWindowListOptionOnScreenOnly` first; if no match, fall back to `kCGWindowListOptionAll`. Three outcomes: found visible → continue. Found in All but not OnScreenOnly → exit 19 `WindowChanged { not_visible }` (RoK is running but on a hidden Space, minimized, or transient state — switch to its Space or unminimize). No match anywhere → exit 10 `WindowNotFound`.
 4. **Classify display.** `CGDisplayIsBuiltin` test — built-in (laptop Retina panel) → `Mode::Visible`, anything else → `Mode::Virtual`. v0.1.6 lets both modes proceed; v0.1.5's exit-12 gate was removed.
 5. **Pre-click capture.** Capture the RoK window to `./rok-capture-pre.png` via in-process `SCScreenshotManager.captureImageWithFilter` (v0.1.8 — replaces the v0.1.x `/usr/sbin/screencapture -l <wid>` CLI shellout). ~191ms cold, ~126ms with `SCShareableContent` cache hit. PNG write via `O_NOFOLLOW + O_EXCL` atomic open (race-free against symlink TOCTOU). Exit 14 (`CaptureFailed { stage: … }`) on failure with one of: `symlink_refused`, `no_shareable_content`, `window_not_found`, `capture_returned_nil`, `cgimage_decode`, `png_write`.
@@ -53,7 +57,7 @@ Boot sequence (logged to stderr via `tracing`):
 8. **Accessibility hard check.** A match was found AND the window is reachable, so we're about to click. Demand Accessibility now — first-run UX is "exit 13, grant in Settings, re-run." Exit 13 (`PermissionsMissing`) if denied. (Required because `CGEvent::post(HID)` silently no-ops without AX trust on macOS 10.14+.)
 9. **Deliver the click via stealth HID + osascript activation.** Sequence: (a) shell out to `osascript -e 'tell application "System Events" to set frontmost of (first process whose unix id is N) to true'` to put RoK frontmost — Catalyst Bridge apps require activation before they accept synthetic UITouch input. (b) Sleep 50ms (`ACTIVATION_SETTLE_MS`) for the AppKit→UIKit translation to apply. (c) Probe the user's cursor position via `CGEvent::new(source).location()`, then disassociate the visible cursor via `CGAssociateMouseAndMouseCursorPosition(false)` so the HID tap doesn't visibly warp the user's cursor. (d) Post `LeftMouseDown` at `(x, y)` via `CGEvent::post(kCGHIDEventTap)`, sleep `CLICK_GAP_MS = 80ms`, post `LeftMouseUp` at the same point. (e) `CGDisplay::warp_mouse_cursor_position(saved)` + reassociate. A RAII `CursorStealth` guard handles steps (e) on panic / early-return so the user's cursor is never left disassociated. Exit 18 (`ClickFailed`) with one of `activation_failed`, `probe`, `disassociate`, `source`, `down`, `up` on failure. The v0.1.5 AX-press path was deleted; see [TODOS.md](../TODOS.md) for the 6-path investigation that led to this design.
 10. **Post-click 3-check validation.** Re-check `(WID, PID)` in All, then in OnScreenOnly, then frame within tolerance. No click-point check (we've already clicked). Exit 19 (`WindowChanged`) on `window_id_gone` / `not_visible` / `frame_moved`.
-11. **Verify the click landed visibly.** Sleep `VERIFY_DELAY_MS = 500ms`, re-capture to `./rok-capture-post.png`, decode both captures to Luma8, and pixel-diff. If the differing-pixel count is `< PIXEL_DIFF_REJECT_THRESHOLD = 1000`, exit 20 (`ClickNotVerified`) with reason `screen_unchanged`. Dim mismatch between pre/post captures fail-closes with reason `dim_mismatch` (same exit 20). Otherwise exit 0 with an info log (`x`, `y`, `match_score`, `pixel_diff`, `elapsed_ms`).
+11. **Verify the click via needle-swap (v0.2 — replaces v0.1.4 pixel-diff).** Sleep `VERIFY_DELAY_MS = 500ms`, re-capture to `./rok-capture-post.png`, and re-match the toggle ROI against both needles (`confirm_needle_swap`). A **different** needle winning post-click confirms the city↔world view toggled. The same needle → exit 20 (`ClickNotVerified`, reason `no_swap`). Neither needle → exit 20 (reason `neither_needle` — likely a mid-transition frame). A confirmed tick logs `tick OK`; the loop then returns to step 5 for the next tick. Needle-swap replaced pixel-diff because pixel-diff false-passed a missed click during RoK's ambient water/troop animation. **Tick error policy:** a FATAL error (`PermissionsMissing`, `ClickFailed`, `WindowChanged{window_id_gone}`) aborts the loop immediately with that error's exit code; a TRANSIENT error (`TargetNotFound`, `ClickNotVerified`, `CaptureFailed`, `WindowChanged{not_visible}`) counts toward a 3-consecutive-failure budget — a successful tick resets the streak, three in a row → exit 21 (`LoopAborted`, reason `failure_budget_exhausted`).
 
 Exit codes for shell users:
 - `0` = happy path (pre + post captures written, target located, click posted, change verified). Mode 1 or Mode 2.
@@ -67,26 +71,24 @@ Exit codes for shell users:
 - `17` = `TargetTooLarge` (needle dims strictly greater than haystack dims; rare in practice)
 - `18` = `ClickFailed` (a step in the click pipeline failed; v0.1.6 reason tags `activation_failed`, `probe`, `disassociate`, `source`, `down`, `up`)
 - `19` = `WindowChanged` (window vanished, hidden on a non-displayed Space, moved/resized, or click point outside frame — 4-check TOCTOU defense; reason tags `window_id_gone`, `not_visible`, `frame_moved`, `point_outside_frame`)
-- `20` = `ClickNotVerified` (click delivered but pre/post pixel-diff was below `PIXEL_DIFF_REJECT_THRESHOLD = 1000` pixels; reason tags: `screen_unchanged`, `dim_mismatch`)
+- `20` = `ClickNotVerified` (click delivered but the needle-swap verify did not confirm a toggle; reason tags: `no_swap` — post-click matched the same needle; `neither_needle` — neither needle matched, likely a mid-transition frame)
+- `21` = `LoopAborted` (v0.2 continuous loop aborted; reason tags: `failure_budget_exhausted` — 3 consecutive transient tick failures, the expected outcome while the world needle is a placeholder; `signal_handler_install_failed` — the SIGINT handler could not be installed at boot)
 
-### v0.1.4 target asset placeholder + sentinel gate
+### v0.2 world-needle crop (required before the loop can confirm a toggle)
 
-The committed `assets/targets/city-button.png` is a 80×40 synthetic placeholder, not the real RoK city/world toggle button. **The bot will exit 15 (`TargetNotFound`) on a real RoK capture** until you replace the asset with a real crop. Two things to know:
+v0.2 carries **two** needles: `assets/targets/city-button.png` (the city-view castle medallion — a real RoK crop since v0.1.5) and `assets/targets/world-button.png` (the world-view art of the same on-screen button). The needle-swap verify confirms a click by checking that the post-click capture matches a **different** needle than the pre-click capture — so it genuinely needs one needle per view.
 
-1. **The placeholder carries a structural sentinel pattern** (top-left four pixels luma `[255, 0, 255, 0]` + xorshift32 high-entropy noise body). `matcher::needle_has_placeholder_sentinel` detects this pattern and fail-closes BEFORE running NCC. Without this gate, imageproc's `CrossCorrelationNormalized` scores low-entropy placeholders 0.9+ against arbitrary structured images — a real false-match at 0.9267 was caught against live RoK during /qa, 5ms from posting a synthetic click. With the gate, you get `WARN placeholder sentinel needle detected (top-left luma [255,0,255,0]); refusing to match` followed by exit 15.
+`world-button.png` ships as a **sentinel placeholder** (a magenta-X test image whose top-left four luma pixels are `[255, 0, 255, 0]`). `matcher::needle_has_placeholder_sentinel` detects that pattern and `find_best_needle` **skips** the needle — a placeholder is dormant, never a false-match hazard. With the placeholder in place the loop boots, captures, matches the city needle, clicks, and verify-fails (`no_swap`) every tick — a full plumbing smoke test — then aborts `LoopAborted` (exit 21) once the failure budget is spent. A boot `WARN` names the placeholder so the abort is never a mystery.
 
-2. **Replacing the placeholder removes the sentinel.** Real natural images effectively never contain pixel-perfect `[255, 0, 255, 0]` horizontally-adjacent extremes in the top-left, so the gate goes dormant the moment you commit a real crop. The build-time `embedded_placeholder_carries_sentinel` test will fail at that transition — that's expected; delete the test (it exists specifically to catch accidental sentinel removal).
+**To make v0.2 functional, crop the real world needle:**
 
-Workflow once you have a fresh `rok-capture-pre.png`:
-
-1. Open `rok-capture-pre.png` in Preview.
-2. Crop the bottom-right city/world toggle button (~80×40 pixels — exact dims aren't critical).
-3. Save as `assets/targets/city-button.png` (overwrite the placeholder).
-4. `cargo build --release` to re-embed the new bytes via `include_bytes!`.
-5. Delete the `embedded_placeholder_carries_sentinel` test (it will fail by design).
-6. `cargo run --release` and confirm exit 0 with a high-confidence score (`> 0.95` for an exact crop) and a `pixel_diff` value well above 1000 (the click should produce a visible UI change).
-
-The matcher's logic is identical regardless of which bytes are embedded; the placeholder + sentinel gate exists so the build compiles AND the bot refuses to operate before the first live capture is taken.
+1. Run the loop once (`ROK_BOT_MAX_TICKS=1 cargo run --release`) — it writes `rok-capture-pre.png`. Or capture RoK in world view by hand.
+2. Switch RoK to **world view** and grab a capture of it (`rok-capture-post.png` from a run lands in world view if the click toggled).
+3. Open the world-view capture in Preview, crop the bottom-left castle medallion to **180×180** (match `city-button.png`'s dimensions).
+4. Save as `assets/targets/world-button.png` (overwrite the placeholder).
+5. `cargo build --release` to re-embed the new bytes via `include_bytes!`.
+6. The `embedded_world_needle_is_placeholder_until_operator_crops_it` test will now FAIL by design — that is the forcing function. Flip it to assert `!needle_has_placeholder_sentinel` (mirroring `embedded_needle_carries_no_sentinel` for the city needle).
+7. Run the loop and confirm ticks log `tick OK — toggle confirmed` and the run exits 0 on the tick cap / Ctrl-C instead of 21.
 
 ## Optional — install pre-commit hooks (contributors)
 
