@@ -21,9 +21,11 @@
 //!        the A11 boot peek is intentionally superseded by a hard check
 //!        (exit 13 if denied). Fail fast instead of looping into a
 //!        guaranteed click failure.
-//!     5. Find the RoK main window via ScreenCaptureKit; classify which
-//!        display it lives on (`Mode::Visible` / `Mode::Virtual` — both
-//!        proceed; Mode 2 is recommended).
+//!     5. Find the RoK main window via ScreenCaptureKit and classify
+//!        which display it lives on (`Mode::Visible` / `Mode::Virtual`
+//!        — both proceed; Mode 2 is recommended). The find-window +
+//!        detect-mode pair is retried (v0.2.1 L1) through a transient
+//!        BetterDisplay reconnect race.
 //!     6. Resolve the tick cap from `ROK_BOT_MAX_TICKS` (finite default).
 //!     7. Install a `ctrlc` SIGINT handler that flips an `AtomicBool`.
 //!        The loop checks it at tick boundaries, so Ctrl-C finishes the
@@ -51,6 +53,7 @@ mod window;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use tracing_subscriber::EnvFilter;
 
@@ -58,7 +61,7 @@ use crate::cg_bootstrap::register_with_window_server;
 use crate::display::{Mode, detect_mode};
 use crate::error::{BotError, Result};
 use crate::permissions::{check_accessibility, check_sck_grant, check_screen_recording};
-use crate::window::find_rok_window;
+use crate::window::{RokWindow, find_rok_window, invalidate_shareable_content_cache};
 
 fn main() {
     init_tracing();
@@ -121,7 +124,7 @@ fn run() -> Result<()> {
         "Accessibility permission OK (hard check at boot)"
     );
 
-    let window = find_rok_window()?;
+    let (window, mode) = resolve_window_and_mode()?;
     tracing::info!(
         target: "rok_bot",
         "found RoK window id={} pid={} frame=({:.2},{:.2} {:.2}x{:.2})",
@@ -133,7 +136,6 @@ fn run() -> Result<()> {
         window.frame.size.height,
     );
 
-    let mode = detect_mode(&window)?;
     match mode {
         Mode::Visible => tracing::info!(
             target: "rok_bot",
@@ -184,7 +186,85 @@ fn run() -> Result<()> {
         }
     })?;
 
-    run_loop::run_loop(&window, max_ticks, &stop)
+    run_loop::run_loop(window, max_ticks, &stop)
+}
+
+/// Outcome of [`boot_retry_decision`]: retry the find-window +
+/// detect-mode pair, or give up and surface the error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BootRetry {
+    Retry,
+    GiveUp,
+}
+
+/// Pure: should `main::run`'s boot retry the find-window + detect-mode
+/// pair (v0.2.1 L1 / D3)?
+///
+/// `Retry` only when attempts remain (`attempt < max_attempts`) AND the
+/// error is `WindowScreenUnresolved` — the documented BetterDisplay
+/// reconnect race (the virtual display blinks out, the window center
+/// resolves to no display). Every other error — including
+/// `WindowNotFound`, which means RoK simply is not running — gives up
+/// immediately so the common boot mistake exits fast (D3).
+const fn boot_retry_decision(attempt: u32, max_attempts: u32, err: &BotError) -> BootRetry {
+    if attempt < max_attempts && matches!(err, BotError::WindowScreenUnresolved) {
+        BootRetry::Retry
+    } else {
+        BootRetry::GiveUp
+    }
+}
+
+/// Pure: the backoff before the next boot attempt (v0.2.1 L1). 150 ms
+/// before attempt 2, 400 ms before attempt 3 — short enough that a boot
+/// landing inside a BetterDisplay reconnect storm rides through in well
+/// under a second, long enough to let the display arrangement settle.
+const fn boot_backoff(attempt: u32) -> Duration {
+    if attempt <= 1 {
+        Duration::from_millis(150)
+    } else {
+        Duration::from_millis(400)
+    }
+}
+
+/// Resolve the RoK window and its display [`Mode`], retrying the pair
+/// through a BetterDisplay reconnect race (v0.2.1 L1).
+///
+/// `find_rok_window` and `detect_mode` are two snapshots of different
+/// subsystems (SCK window enumeration, CG display arrangement). During
+/// a BD reconnect / sleep-wake the virtual display can blink out
+/// between them, so `detect_mode` returns `WindowScreenUnresolved` even
+/// though the steady-state setup is valid. This retries the pair (3
+/// attempts, 150 ms / 400 ms backoff) on that error only; the SCK
+/// content cache is invalidated between attempts so each retry
+/// re-fetches RoK's current frame (D8 — RoK can auto-migrate across a
+/// BD reconnect).
+fn resolve_window_and_mode() -> Result<(RokWindow, Mode)> {
+    const MAX_ATTEMPTS: u32 = 3;
+    let mut attempt: u32 = 1;
+    loop {
+        let resolved = find_rok_window().and_then(|w| detect_mode(&w).map(|mode| (w, mode)));
+        match resolved {
+            Ok(pair) => return Ok(pair),
+            Err(err) => match boot_retry_decision(attempt, MAX_ATTEMPTS, &err) {
+                BootRetry::GiveUp => return Err(err),
+                BootRetry::Retry => {
+                    let backoff = boot_backoff(attempt);
+                    tracing::warn!(
+                        target: "rok_bot",
+                        attempt,
+                        max_attempts = MAX_ATTEMPTS,
+                        error = %err,
+                        backoff_ms = backoff.as_millis() as u64,
+                        "boot: window/display unresolved (likely a BetterDisplay \
+                         reconnect race) — invalidating the SCK cache and retrying"
+                    );
+                    invalidate_shareable_content_cache();
+                    std::thread::sleep(backoff);
+                    attempt = attempt.saturating_add(1);
+                }
+            },
+        }
+    }
 }
 
 fn init_tracing() {
@@ -194,4 +274,61 @@ fn init_tracing() {
         .with_target(false)
         .with_writer(std::io::stderr)
         .init();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn boot_retry_decision_retries_window_screen_unresolved_while_attempts_remain() {
+        // The BD-reconnect race surfaces as WindowScreenUnresolved;
+        // retry it while attempts remain (D3).
+        assert_eq!(
+            boot_retry_decision(1, 3, &BotError::WindowScreenUnresolved),
+            BootRetry::Retry
+        );
+        assert_eq!(
+            boot_retry_decision(2, 3, &BotError::WindowScreenUnresolved),
+            BootRetry::Retry
+        );
+    }
+
+    #[test]
+    fn boot_retry_decision_gives_up_on_last_attempt() {
+        // attempt == max_attempts: no retries left, surface the error.
+        assert_eq!(
+            boot_retry_decision(3, 3, &BotError::WindowScreenUnresolved),
+            BootRetry::GiveUp
+        );
+    }
+
+    #[test]
+    fn boot_retry_decision_gives_up_on_non_retryable_errors() {
+        // D3: only WindowScreenUnresolved retries. WindowNotFound (RoK
+        // not running) and every other error exit fast on attempt 1.
+        for err in [
+            BotError::WindowNotFound,
+            BotError::CaptureFailed {
+                stage: "no_shareable_content",
+                exit_code: None,
+            },
+            BotError::PermissionsMissing {
+                which: "Screen Recording",
+            },
+        ] {
+            assert_eq!(
+                boot_retry_decision(1, 3, &err),
+                BootRetry::GiveUp,
+                "{err:?} must not retry"
+            );
+        }
+    }
+
+    #[test]
+    fn boot_backoff_schedule() {
+        // 150 ms before attempt 2, 400 ms before attempt 3.
+        assert_eq!(boot_backoff(1), Duration::from_millis(150));
+        assert_eq!(boot_backoff(2), Duration::from_millis(400));
+    }
 }

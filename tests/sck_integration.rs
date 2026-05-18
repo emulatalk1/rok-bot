@@ -43,6 +43,19 @@
 //! then the cap is reached — a clean stop). Tests that must pass with
 //! the placeholder use `MAX_TICKS=1`; the bounded-run test accepts
 //! either 0 (real needle cropped) or 21 (placeholder).
+//!
+//! ## v0.2.1 window-recovery tests
+//!
+//! The `live_loop_recover*` / `live_loop_logs_pre_capture_probe` /
+//! `live_loop_boot_retry_*` tests cover the v0.2.1 window-lifecycle
+//! work: the pre-capture liveness probe (L4), relaunch + visibility
+//! recovery (L5 / D14 / D15), and the boot retry (L1). They assert on
+//! stderr log lines, not just exit codes — with the sentinel world
+//! needle a recovered loop still ends exit 21, so the recovery log
+//! lines are the proof recovery engaged. Recovery only runs for
+//! `ROK_BOT_MAX_TICKS >= 2` (L10), so those tests spawn with a higher
+//! cap. `live_loop_recovery_handles_hidden_then_gone` doubles as the
+//! AC-D15 empirical check (does `not_visible` fire in Mode 2 at all?).
 
 #![allow(clippy::doc_markdown)]
 // Integration tests use the standard panic/expect idioms.
@@ -226,5 +239,167 @@ fn live_loop_rok_on_hidden_space() {
         exit, 10,
         "SCK must enumerate hidden-Space windows; exit 10 (WindowNotFound) \
          means boot discovery wrongly failed. stderr:\n{stderr}"
+    );
+}
+
+/// Live: the v0.2.1 L4 pre-capture liveness probe runs every tick. A
+/// one-tick run against a healthy RoK must log the probe line — pins
+/// that `tick` opens with `validate_window_present` before the capture
+/// (so a relaunch is caught before SCK touches a dead handle).
+#[test]
+#[ignore = "requires live RoK + Screen Recording + Accessibility grants"]
+fn live_loop_logs_pre_capture_probe() {
+    let (exit, stderr) = run_rok_bot("1");
+    eprintln!("[live_loop_logs_pre_capture_probe] exit={exit}\n--- stderr ---\n{stderr}");
+    assert_eq!(
+        exit, 0,
+        "expected exit 0 (boot OK + 1 tick + clean stop); got {exit}"
+    );
+    assert!(
+        stderr.contains("pre-capture window liveness probe OK"),
+        "v0.2.1 L4: every tick must run the pre-capture probe; its log \
+         line is missing from stderr:\n{stderr}"
+    );
+}
+
+/// Live: the loop rides through a RoK crash-and-relaunch (v0.2.1 D14).
+///
+/// Operator procedure: run this test; within ~2 s of the loop starting,
+/// force-quit RoK (Activity Monitor, or `kill`) and immediately
+/// relaunch it. The pre-capture probe catches `window_id_gone`, the
+/// loop enters relaunch recovery, re-discovers the restarted RoK, and
+/// resumes — instead of aborting exit 19.
+///
+/// Asserts on stderr, not the exit code: with the sentinel world
+/// needle the run still ends exit 21 once the `ClickNotVerified`
+/// failure budget is spent, so the proof recovery worked is the
+/// recovery log lines.
+#[test]
+#[ignore = "requires force-quitting and relaunching RoK within ~2s of loop start"]
+fn live_loop_recovers_from_rok_relaunch() {
+    let (exit, stderr) = run_rok_bot("8");
+    eprintln!("[live_loop_recovers_from_rok_relaunch] exit={exit}\n--- stderr ---\n{stderr}");
+    assert!(
+        stderr.contains("window recovery starting"),
+        "killing RoK mid-loop must trigger window recovery; the recovery \
+         start log line is missing:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("RoK re-discovered — resuming loop"),
+        "relaunch recovery must re-discover the restarted RoK and resume; \
+         the re-discovery log line is missing:\n{stderr}"
+    );
+}
+
+/// Live: relaunch recovery gives up cleanly when RoK never comes back
+/// (v0.2.1 D14). Operator procedure: run this test; within ~2 s of the
+/// loop starting, force-quit RoK and do NOT relaunch it. The loop
+/// enters relaunch recovery, polls for the 60 s deadline, then aborts
+/// `LoopAborted{window_recovery_exhausted}` → exit 21.
+///
+/// Runs ~60 s+ (the relaunch deadline). Relaunch RoK afterward.
+#[test]
+#[ignore = "requires force-quitting RoK mid-loop and NOT relaunching it (~60s run)"]
+fn live_loop_recovery_exhausts_when_rok_stays_dead() {
+    let (exit, stderr) = run_rok_bot("8");
+    eprintln!(
+        "[live_loop_recovery_exhausts_when_rok_stays_dead] exit={exit}\n\
+         --- stderr ---\n{stderr}"
+    );
+    assert_eq!(
+        exit, 21,
+        "a permanently-gone RoK must abort the loop exit 21; got {exit}.\n\
+         stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("window_recovery_exhausted"),
+        "the abort must be window_recovery_exhausted (recovery deadline), \
+         not failure_budget_exhausted:\n{stderr}"
+    );
+}
+
+/// Live: recovery handles a window that goes hidden and THEN gone
+/// (v0.2.1 D2). Operator procedure: run this test; switch to a Space
+/// that does not show RoK (the loop enters visibility recovery), then
+/// force-quit RoK while it is hidden. The shared recovery sub-loop must
+/// re-classify the probe, retarget from visibility to relaunch
+/// re-discovery, and not hang or false-resume.
+///
+/// Also the AC-D15 empirical check: if `WindowChanged{not_visible}`
+/// never fires for a Mode 2 BetterDisplay virtual display under a
+/// hidden Space, the visibility-recovery path is never entered — note
+/// that against the stderr dump.
+#[test]
+#[ignore = "requires hiding RoK's Space then force-quitting RoK during the wait"]
+fn live_loop_recovery_handles_hidden_then_gone() {
+    let (exit, stderr) = run_rok_bot("8");
+    eprintln!(
+        "[live_loop_recovery_handles_hidden_then_gone] exit={exit}\n\
+         --- stderr ---\n{stderr}"
+    );
+    assert!(
+        stderr.contains("window recovery starting"),
+        "hiding RoK then quitting it must engage window recovery:\n{stderr}"
+    );
+    // The run must terminate — recovery must not hang on the transition.
+    assert!(
+        exit == 0 || exit == 21,
+        "a hidden-then-gone recovery must end cleanly (0) or abort (21), \
+         never hang; got {exit}.\nstderr:\n{stderr}"
+    );
+}
+
+/// Live: boot rides through a BetterDisplay reconnect race (v0.2.1 L1).
+///
+/// Operator procedure: trigger a BD virtual-display reconnect (toggle
+/// the display, or sleep/wake) right as this test launches the binary.
+/// `main::run` retries the find-window + detect-mode pair on a
+/// transient `WindowScreenUnresolved`; the retry must absorb the race.
+///
+/// Asserts `exit != 11`: a spurious `WindowScreenUnresolved` (exit 11)
+/// leaking through means the L1 retry failed to ride out the race. On
+/// a clean boot (no reconnect) the run simply exits 0 — the retry is
+/// transparent. If the retry fired, stderr carries the retry log line.
+#[test]
+#[ignore = "requires triggering a BetterDisplay reconnect during boot"]
+fn live_loop_boot_retry_survives_bd_reconnect() {
+    let (exit, stderr) = run_rok_bot("1");
+    eprintln!(
+        "[live_loop_boot_retry_survives_bd_reconnect] exit={exit}\n\
+         --- stderr ---\n{stderr}"
+    );
+    assert_ne!(
+        exit, 11,
+        "a BD reconnect race during boot must be absorbed by the L1 retry; \
+         exit 11 (WindowScreenUnresolved) means it leaked through.\n\
+         stderr:\n{stderr}"
+    );
+}
+
+/// Live: a crash-looping RoK aborts via the recovery budget (v0.2.1 L5
+/// / /review D1). Operator procedure: run this test; each time the
+/// loop logs "window recovered — loop resuming", force-quit RoK again
+/// and relaunch it — do this RECOVERY_BUDGET (3) times in a row so
+/// every recovery succeeds but no tick ever does. After the 3rd
+/// recovery with no successful tick between, the loop aborts
+/// `LoopAborted{recovery_budget_exhausted}` exit 21 rather than
+/// recovering forever.
+#[test]
+#[ignore = "requires force-quitting + relaunching RoK ~3 times in a row"]
+fn live_loop_recovery_budget_aborts_on_crash_loop() {
+    let (exit, stderr) = run_rok_bot("20");
+    eprintln!(
+        "[live_loop_recovery_budget_aborts_on_crash_loop] exit={exit}\n\
+         --- stderr ---\n{stderr}"
+    );
+    assert_eq!(
+        exit, 21,
+        "a crash-looping RoK must abort via the recovery budget; got {exit}.\n\
+         stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("recovery_budget_exhausted"),
+        "the abort must be recovery_budget_exhausted, not failure_budget \
+         or a single recovery deadline:\n{stderr}"
     );
 }

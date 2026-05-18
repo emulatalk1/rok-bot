@@ -243,37 +243,53 @@ pub enum BotError {
     )]
     ClickNotVerified { reason: &'static str },
 
-    /// The v0.2 continuous loop aborted. Two paths reach here, both at
+    /// The continuous loop aborted. Five reason tags reach here, all at
     /// a tick boundary (never mid-click — the loop only checks for
     /// abort between ticks):
     ///
     /// - `"failure_budget_exhausted"` — `run_loop::LOOP_FAILURE_BUDGET`
     ///   transient failures occurred in a row with no successful tick
     ///   resetting the counter. A transient failure is `TargetNotFound`,
-    ///   `ClickNotVerified`, `CaptureFailed`, or
-    ///   `WindowChanged{not_visible}` (see `run_loop::classify_error`).
-    ///   One failure is noise (RoK mid-animation, a dropped frame); N
-    ///   in a row means RoK is frozen, the needle asset rotted, or RoK
-    ///   got hidden for good — the loop stops rather than spin forever.
-    ///   The per-tick warn log carries the specific error of each
-    ///   failed tick; this variant carries only the abort trigger.
+    ///   `ClickNotVerified`, or `CaptureFailed` (see
+    ///   `run_loop::classify_error`). One failure is noise (RoK mid-
+    ///   animation, a dropped frame); N in a row means RoK is frozen or
+    ///   the needle asset rotted — the loop stops rather than spin
+    ///   forever. The per-tick warn log carries the specific error of
+    ///   each failed tick; this variant carries only the abort trigger.
     /// - `"signal_handler_install_failed"` — `ctrlc::set_handler`
     ///   failed at boot. The loop refuses to start: without the SIGINT
     ///   handler a Ctrl-C would hard-kill the process mid-click and
     ///   strand a `LeftMouseDown` in RoK's event queue. Aborting before
     ///   tick 1 is safer than running a loop that cannot shut down
     ///   cleanly.
+    /// - `"window_recovery_exhausted"` — v0.2.1 window recovery (L5): a
+    ///   `WindowChanged{window_id_gone}` tick entered relaunch recovery,
+    ///   which polled out its full deadline without RoK coming back.
+    /// - `"visibility_recovery_exhausted"` — v0.2.1 window recovery
+    ///   (L5): a `WindowChanged{not_visible}` tick entered visibility
+    ///   recovery, which polled out its full deadline without RoK
+    ///   becoming visible again.
+    /// - `"recovery_budget_exhausted"` — v0.2.1 window recovery (L5):
+    ///   `run_loop::RECOVERY_BUDGET` consecutive recoveries succeeded
+    ///   with no successful tick between them. RoK is crash-looping or
+    ///   the display is flapping; the loop stops rather than recover
+    ///   endlessly.
     ///
     /// Exit code 21 — the first free slot after v0.1.x's 10-20 range
     /// (12 is the retired `RokNotOnPrimary` gap).
     #[error(
         "continuous loop aborted (reason: {reason}). For \
          'failure_budget_exhausted', check the preceding per-tick warn \
-         logs for the repeated failure — RoK may be frozen, hidden, or \
-         the target needle may have rotted. For \
+         logs for the repeated failure — RoK may be frozen or the \
+         target needle may have rotted. For \
          'signal_handler_install_failed', the SIGINT handler could not \
          be installed; re-run, and if it persists check for another \
-         process holding the handler."
+         process holding the handler. For 'window_recovery_exhausted' \
+         and 'visibility_recovery_exhausted', RoK did not come back or \
+         stayed hidden past the recovery deadline — relaunch RoK or \
+         switch to its Space. For 'recovery_budget_exhausted', RoK is \
+         crash-looping or the display is flapping; fix the underlying \
+         instability before re-running."
     )]
     LoopAborted { reason: &'static str },
 }
@@ -316,7 +332,11 @@ mod tests {
         REASON_UP,
     };
     use crate::permissions::STAGE_NO_SHAREABLE_CONTENT;
-    use crate::run_loop::{REASON_FAILURE_BUDGET_EXHAUSTED, REASON_SIGNAL_INSTALL_FAILED};
+    use crate::run_loop::{
+        REASON_FAILURE_BUDGET_EXHAUSTED, REASON_RECOVERY_BUDGET_EXHAUSTED,
+        REASON_SIGNAL_INSTALL_FAILED, REASON_VISIBILITY_RECOVERY_EXHAUSTED,
+        REASON_WINDOW_RECOVERY_EXHAUSTED,
+    };
     use crate::verify::{REASON_NEITHER_NEEDLE, REASON_NO_SWAP};
 
     #[test]
@@ -501,11 +521,15 @@ mod tests {
             );
         }
         // LoopAborted (v0.2) shares no exit code with v0.1.x — slot 21
-        // is the first free code after the 10-20 range. Pin both
-        // documented reasons via the run_loop-module constants.
+        // is the first free code after the 10-20 range. Pin all five
+        // documented reasons (v0.2's two + v0.2.1's three recovery
+        // tags) via the run_loop-module constants.
         for reason in [
             REASON_FAILURE_BUDGET_EXHAUSTED,
             REASON_SIGNAL_INSTALL_FAILED,
+            REASON_WINDOW_RECOVERY_EXHAUSTED,
+            REASON_VISIBILITY_RECOVERY_EXHAUSTED,
+            REASON_RECOVERY_BUDGET_EXHAUSTED,
         ] {
             assert_eq!(
                 BotError::LoopAborted { reason }.exit_code(),
@@ -687,6 +711,9 @@ mod tests {
         for reason in [
             REASON_FAILURE_BUDGET_EXHAUSTED,
             REASON_SIGNAL_INSTALL_FAILED,
+            REASON_WINDOW_RECOVERY_EXHAUSTED,
+            REASON_VISIBILITY_RECOVERY_EXHAUSTED,
+            REASON_RECOVERY_BUDGET_EXHAUSTED,
         ] {
             let err = BotError::LoopAborted { reason };
             let msg = err.to_string();
