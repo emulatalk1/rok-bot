@@ -2,17 +2,23 @@
 
 Rust-based macOS automation experiment for **Rise of Kingdoms** on Apple Silicon. Personal/learning project. Public so others can read the design choices, not because it's polished or supported.
 
-## Status: v0.2 — Continuous loop: `capture → match → click → verify` wrapped per-tick, run-until-Ctrl-C
+## Status: v0.2.1 — The continuous loop confirms real city↔world toggles and survives RoK relaunch / hidden-window churn
 
-New in v0.2:
+New in v0.2.1:
+- **The loop is no longer a plumbing smoke test — it confirms real toggles.** A `/investigate` traced why v0.2's needle-swap verify was blind: `world-button.png` was a sentinel placeholder (skipped), and `city-button.png` was a full 180×180 castle-medallion crop that NCC-matched the *other* view's toggle button at 0.96 (the city↔world toggle keeps identical gold-rim/blue-circle chrome in both views — only the inner glyph differs, and `imageproc`'s non-mean-centered NCC let the shared chrome dominate). The fix: both needles re-cropped as **96×96 tight inner-glyph crops** (just the castle-towers glyph, just the folded-map glyph; shared chrome excluded). Cross-view NCC drops 0.96 → 0.88, so `find_best_needle`'s best-of-N picks the correct-view needle each view. No matcher *code* change — two real discriminative assets plus test updates. Live-verified Mode 2: `ROK_BOT_MAX_TICKS=3` now **exits 0 with 3 confirmed toggles** (was exit 21 `LoopAborted`). The operator "crop the placeholder" step is done and gone.
+- **Window-lifecycle resilience** — the v0.2 loop now survives a RoK crash + relaunch mid-loop, a system screensaver / hidden window, and a BetterDisplay virtual-display reconnect race at boot (10 locked decisions L1-L10 from `/plan-eng-review`). `main.rs` retries `find_rok_window` + `detect_mode` at boot (3 attempts, 150/400ms backoff) on a `WindowScreenUnresolved` error, invalidating the SCK cache between attempts. The per-tick error classifier is now four-way — `Fatal` / `Transient` / `WindowGone` / `WindowHidden`.
+- **Per-tick liveness probe + recovery sub-loop** — each tick opens with a `validate_window_present` pre-capture liveness probe (catches a relaunch or hidden window before the ~140ms capture; logs a `probe_ms` line). On a `WindowGone` / `WindowHidden` signal the loop enters a `recover_window` recovery sub-loop — re-discovering a relaunched RoK or waiting out a hidden window, then resuming — instead of aborting. A successful recovery resets the consecutive-failure streak and the last-match position. Recovery is gated to `ROK_BOT_MAX_TICKS >= 2`, so `ROK_BOT_MAX_TICKS=1` still behaves as the exact one-shot. A pre-landing `/review` caught an unbounded-recovery-spin bug (a crash-looping RoK recovering forever) — fixed with a `RECOVERY_BUDGET` of 3 plus a `consecutive_recoveries` counter that only a genuinely successful tick resets.
+- **New `LoopAborted` reason tags** — `window_recovery_exhausted`, `visibility_recovery_exhausted`, `recovery_budget_exhausted`, alongside the existing `failure_budget_exhausted` and `signal_handler_install_failed`.
+
+> **Operator-validation pending:** AC-D15 — the D15 `not_visible` recovery code shipped in v0.2.1, but the empirical check that `WindowChanged{not_visible}` actually fires for a window on a BetterDisplay virtual display when the system screensaver / display sleep kicks in has not yet been run. See [TODOS.md](TODOS.md).
+
+Carried forward from v0.2:
 - **Continuous loop** (`src/run_loop.rs`) — the v0.1.x one-shot pipeline now runs as a loop targeting the state-neutral city↔world toggle. This is a deliberate **plumbing milestone**: it proves the loop machinery (per-tick capture, ROI selection, error budget, clean shutdown), it does not yet do a real in-game task. The one-shot pipeline is retired; `ROK_BOT_MAX_TICKS=1` reproduces it exactly.
 - **Run-until-Ctrl-C** — a `ctrlc` SIGINT handler flips an `AtomicBool` checked at tick boundaries, so Ctrl-C finishes the in-flight tick and exits 0 (never strands a `LeftMouseDown`). `ROK_BOT_MAX_TICKS` caps the run; the default is a finite 100-tick backstop.
 - **Error budget** — each tick's failure is FATAL (abort the loop now) or TRANSIENT (count toward 3 consecutive failures; a successful tick resets the streak). Three transient failures in a row → `LoopAborted` exit 21.
 - **Two-needle matching + needle-swap verify** — the matcher carries two needles (city-view art, world-view art) and `find_best_needle` returns the best across both. A click is *confirmed* when the post-click capture matches a **different** needle than the pre-click capture did. This replaces v0.1.4's pixel-diff verify, which false-passed a missed click during RoK's ambient animation (water, troops, weather).
 - **Last-position ROI** — tick 2+ searches a tight 220×220 box around the previous match instead of the full castle quadrant: live NCC drops from ~514ms to ~13ms per tick. A ROI miss falls back to a full-frame search.
 - **`ClickGuard` RAII** — posts the fallback `LeftMouseUp` on a panic-unwind, so a panic mid-click never leaves RoK holding a pressed button.
-
-> **Operator step before v0.2 is functional:** `assets/targets/world-button.png` ships as a sentinel placeholder. Until you crop the real world-view castle-medallion art into it, the loop runs as an end-to-end plumbing smoke test but cannot confirm a toggle — every tick fails verify and the loop aborts `LoopAborted` (exit 21). A boot `WARN` names the placeholder. See [docs/setup.md](docs/setup.md).
 
 What works today (carried forward from v0.1.x, unchanged):
 - **In-process capture via `objc2-screen-capture-kit` 0.3.x** — replaces v0.1.x's `/usr/sbin/screencapture -l <wid>` CLI shellout with `SCScreenshotManager.captureImageWithFilter` for ~140ms steady-state per capture (vs ~280-1400ms via subprocess). Live-confirmed v0.1.8 on Mode 2 BD virtual display: 191ms cold + 126ms cache-hit = 317ms across both pre/post captures, well under the v0.1.7 baseline.
@@ -26,7 +32,7 @@ What works today (carried forward from v0.1.x, unchanged):
 - **Symlink-safe PNG write via `O_NOFOLLOW + O_EXCL`** — replaces v0.1.x's `symlink_metadata` pre-check (which had a ~141ms-5s TOCTOU window). `open_capture_output_safely` is race-free against a local attacker planting symlinks.
 - **`Arc<*Slot>` cross-thread completion-handler slots** — fixes a use-after-free that the v0.1.8 `/review` caught: the spike's stack-local `Mutex<Option<Retained<T>>>` captured by raw-pointer-as-usize would dangle if the SCK 5s timeout fired while SCK still held the retained block. Wrapped in `Arc<ImageSlot>` / `Arc<ContentSlot>` with newtype + `unsafe Send + Sync` (CG/SCK objects are Apple-documented thread-safe).
 - **Template-match a known UI element** via `imageproc::match_template_parallel` (rayon-parallel NCC sliding window), restricted to a castle-button ROI. `find_target_in_castle_roi` crops the haystack to the bottom-left quadrant (20% × 25% of the capture) before NCC, dropping the heatmap from 2.81M to 56K positions. Live-confirmed v0.1.7: ~442ms per match on the 2102×1640 Retina haystack, down from ~22s in v0.1.6 (50× speedup). Match coords are restored to full-capture space inside `find_best_needle`, so `screen_point` math is unchanged. Configurable `MATCH_THRESHOLD` (default `0.85`); ROI dims pinned via `CASTLE_BUTTON_ROI_FRACTION_*` constants. FFT-NCC was the original v0.2 plan; ROI alone hit the target, so FFT is now indefinitely deferred.
-- **Placeholder-sentinel safety brake.** The shipped needle has a structural sentinel (`[255, 0, 255, 0]` top-left luma + xorshift32 noise body); `matcher::needle_has_placeholder_sentinel` fail-closes BEFORE NCC runs so the bot can never synthetically click against a falsely-matched placeholder. /qa caught a real placeholder false-match at 0.93 NCC; this brake prevents the class.
+- **Placeholder-sentinel safety brake.** `matcher::needle_has_placeholder_sentinel` detects a structural sentinel (`[255, 0, 255, 0]` top-left luma + xorshift32 noise body) and fail-closes BEFORE NCC runs, so the bot can never synthetically click against a falsely-matched placeholder. /qa caught a real placeholder false-match at 0.93 NCC; this brake prevents the class. v0.2.1 ships both needles as real crops so the brake is dormant in practice — it stays as a safety net for any future placeholder asset.
 - **4-check pre-click TOCTOU validation** (v0.1.5, anchored on WID+PID, runs BEFORE the AX TCC prompt so a hidden-Space exit doesn't waste an Accessibility grant). Maps to four `WindowChanged` reasons: `window_id_gone`, `not_visible`, `frame_moved`, `point_outside_frame`.
 - **Click delivery via stealth HID tap + osascript activation** (v0.1.6 — reverts v0.1.5 AX press, which was structurally broken on Mac Catalyst Bridge; see TODOS for the full 6-path investigation). Sequence: `osascript` activate RoK by pid via System Events → 50ms settle → probe + disassociate cursor → `CGEvent::post(HID)` `LeftMouseDown` → 80ms gap → `LeftMouseUp` → warp logical cursor back → reassociate. RAII `CursorStealth` guard restores the cursor on panic/early-return.
 - **Mode 2 (virtual display) is the recommended operating mode.** On a BetterDisplay virtual display the cursor is invisible to the user, RoK's auto-raise is invisible (nothing observes its surface), and the user can keep working on the built-in display. See [docs/setup.md](docs/setup.md) for the walkthrough.
@@ -35,9 +41,7 @@ What works today (carried forward from v0.1.x, unchanged):
 - Structured exit codes (10–11, 13–20; slot 12 left unused after v0.1.5's `RokNotOnPrimary` was deleted) for shell consumers; tracing logs to stderr with `error_kind` + `exit_code` fields.
 
 Not yet built (see [TODOS.md](TODOS.md)):
-- **A real in-game task.** v0.2 is a plumbing milestone — the loop drives the state-neutral city↔world toggle to prove the machinery. Pointing the loop at an actual RoK task (resource collection, troop dispatch) is the next functional milestone, and the one that makes anti-bot cadence jitter (TODOS D13) load-bearing.
-- **Window re-discovery after a RoK relaunch** (TODOS D14) — v0.2 holds the boot-time `SCWindow` for the whole run; if RoK crashes and relaunches mid-loop the loop aborts cleanly rather than re-acquiring the new window.
-- **`not_visible` wait-and-retry** (TODOS D15) — v0.2 survives a brief hide (Space switch) via the transient budget but aborts on a sustained one; surviving a full screensaver / display sleep is deferred.
+- **A real in-game task.** The loop drives the state-neutral city↔world toggle to prove the machinery. Pointing the loop at an actual RoK task (resource collection, troop dispatch) is the next functional milestone, and the one that makes anti-bot cadence jitter (TODOS D13) load-bearing.
 - **Server-roundtrip click verify** — `VERIFY_DELAY_MS = 500ms` covers UI-local transitions. Server-bound clicks (resource spend, troop dispatch) show a 1-3s spinner; retry-and-poll at multiple delay tiers is queued.
 - **Mode 2 lifecycle automation** — the operator still sets up the BetterDisplay virtual display manually and drags RoK to it. RAII display lifecycle (panic-safe disconnect, drop-detection, state file) is deferred.
 - **v0.3 capture work:** SCStream continuous-frame delegate (TODOS D8), cut the PNG round-trip (D9), discover display backing scale (D10).
@@ -58,7 +62,7 @@ ROK_BOT_MAX_TICKS=1 cargo run --release
 
 Expected outputs:
 - Loop runs (Mode 1 or Mode 2) → `[INFO] continuous loop starting … tick: pre-click match located … posting HID click pair … tick OK` per tick, then `[INFO] loop stop condition met — exiting cleanly` exit 0 on Ctrl-C or the tick cap. `rok-capture-pre.png` + `rok-capture-post.png` are rewritten each tick. NOTE: on Mode 1 each click visibly raises RoK (Catalyst Bridge auto-raise); Mode 2 (virtual display) runs invisibly — recommended.
-- Loop aborts after 3 consecutive failed ticks → exit 21 `LoopAborted`. With the world needle still a placeholder this is the expected outcome — see the operator note above.
+- Loop aborts → exit 21 `LoopAborted`. A multi-tick run on a healthy RoK now exits 0 with confirmed toggles; exit 21 means a genuine abort — RoK frozen, crash-looping, or hidden past the recovery budget.
 - RoK not running → `[ERROR] RoK window not found — is the game running?` exit 10
 - RoK window center on no online display → `[ERROR] RoK window center is not on any online display` exit 11
 - (exit 12 unused — was `RokNotOnPrimary` in v0.1.5, removed in v0.1.6 when Mode 2 gate opened)
@@ -70,15 +74,15 @@ Expected outputs:
 - Click pipeline step failed → `[ERROR] synthetic click could not be delivered (reason: …)` exit 18. Reason tags (from `src/click.rs`): `activation_failed`, `probe`, `disassociate`, `source`, `down`, `up`.
 - Window vanished, hidden, moved, or click point outside frame → `[ERROR] RoK window state changed or unreachable (reason: …)` exit 19. Reason tags (from `src/window.rs`): `window_id_gone`, `not_visible`, `frame_moved`, `point_outside_frame`. `not_visible` is the actionable case where RoK is running but on a hidden Space or minimized — switch Spaces / unminimize rather than restart.
 - Click delivered but the view didn't toggle → `[ERROR] post-click needle-swap verify failed (reason: …)` exit 20 (reason tags: `no_swap` — post-click matched the same needle; `neither_needle` — neither needle matched, likely a mid-transition frame).
-- Continuous loop aborted → `[ERROR] continuous loop aborted (reason: …)` exit 21 (`LoopAborted`). Reason tags: `failure_budget_exhausted` (3 consecutive transient failures — RoK frozen/hidden, or the world needle is still a placeholder), `signal_handler_install_failed` (the SIGINT handler could not be installed; the loop refuses to start without a clean-shutdown path).
+- Continuous loop aborted → `[ERROR] continuous loop aborted (reason: …)` exit 21 (`LoopAborted`). Reason tags: `failure_budget_exhausted` (3 consecutive transient failures — RoK frozen), `window_recovery_exhausted` (a relaunched RoK could not be re-discovered within the recovery budget), `visibility_recovery_exhausted` (a hidden window never reappeared within the recovery budget), `recovery_budget_exhausted` (too many recovery cycles without a genuinely successful tick — a crash-looping RoK), `signal_handler_install_failed` (the SIGINT handler could not be installed; the loop refuses to start without a clean-shutdown path).
 
 Full setup walkthrough: [docs/setup.md](docs/setup.md). Pre-commit hook install instructions are in there too.
 
 ## Repo layout
 
 ```
-src/                     v0.2 Rust source (10 modules, 179 unit + 6 integration tests)
-assets/targets/          embedded matcher needles (city-button.png real; world-button.png placeholder)
+src/                     v0.2.1 Rust source (10 modules, 200 unit + 12 integration tests)
+assets/targets/          embedded matcher needles (city-button.png + world-button.png — both real 96×96 tight inner-glyph crops)
 docs/setup.md            user-facing setup guide
 docs/rok_rust_bot_research.md   pre-implementation architecture research
 docs/cargo_dependency_audit.md  pre-implementation dep pin audit
@@ -91,7 +95,7 @@ CLAUDE.md                project instructions for Claude Code agent sessions
 
 ```sh
 cargo build --release --locked
-cargo test --locked                                                  # 179 passing
+cargo test --locked                                                  # 200 passing
 cargo clippy --all-targets --all-features --locked -- -D warnings    # mbrain-style strict
 cargo fmt --all -- --check
 ```

@@ -10,7 +10,19 @@ Items deferred from planning sessions. Each entry should be self-contained enoug
 
 New `src/run_loop.rs` (loop engine: pure decision core `classify_error`/`next_failure_count`/`should_stop`/`parse_max_ticks` + live `tick()`/`run_loop()`). `ctrlc` SIGINT handler → `AtomicBool` checked at tick boundaries; `ROK_BOT_MAX_TICKS` env cap (default 100; `=1` reproduces the one-shot). Error policy D5/D12: FATAL aborts immediately, TRANSIENT counts toward a 3-consecutive-failure budget → `BotError::LoopAborted` exit 21. `matcher.rs` generalized to `find_best_needle` (2-needle best-of-N, `NEEDLES`, `NeedleMatch`, `select_roi`, `last_position_roi`). `verify.rs` reworked to needle-swap (`confirm_needle_swap`); the pixel-diff path was deleted. `click.rs` gained `ClickGuard` RAII. `main.rs` = boot + delegate; Accessibility promoted to a hard boot check. `assets/targets/world-button.png` ships as a sentinel placeholder (operator crops the real world-view art — see `docs/setup.md` "v0.2 world-needle crop"). 15 locked decisions (D1-D15) from `/plan-eng-review`; 179 unit tests + 6 `#[ignore]`'d integration tests; full `/review` (5 specialists + Claude adversarial); live `/qa` on a Mode 2 BD virtual display confirmed both loop exit paths (`ROK_BOT_MAX_TICKS=1` → 0, `=3` → 21).
 
-The three v0.2.x/v0.3 items D13 (anti-bot cadence jitter), D14 (window re-discovery after RoK relaunch), and D15 (`not_visible` wait-and-retry) added by the v0.2 `/plan-eng-review` are listed under P2/P3 below.
+The three v0.2.x/v0.3 items D13 (anti-bot cadence jitter), D14 (window re-discovery after RoK relaunch), and D15 (`not_visible` wait-and-retry) added by the v0.2 `/plan-eng-review` are listed under P2/P3 below. D14 + D15 shipped in v0.2.1 — see the next section.
+
+---
+
+## ✅ DONE — v0.2.1 SHIPPED: Window-lifecycle resilience + needle-swap discrimination fix
+
+**Shipped 2026-05-18**, tag `v0.2.1`. Bundles two things on top of v0.2: the planned window-lifecycle-resilience milestone (Part A) and a needle-swap discrimination fix found via `/investigate` (Part B). 200 unit tests + 12 `#[ignore]`'d integration tests; `cargo clippy --all-targets --all-features --locked -- -D warnings` and `cargo fmt --all -- --check` clean. Exit codes unchanged from v0.2 (10-11, 13-21).
+
+**Part A — window-lifecycle resilience** (10 locked decisions L1-L10 from `/plan-eng-review`). The v0.2 continuous loop now survives (a) a RoK crash + relaunch mid-loop, (b) a system screensaver / hidden window, (c) a BetterDisplay virtual-display reconnect race at boot. `main.rs` retries `find_rok_window` + `detect_mode` at boot (3 attempts, 150/400ms backoff) on a `WindowScreenUnresolved` error, invalidating the SCK cache between attempts. `run_loop` owns the `RokWindow` by value; the per-tick error classifier is now four-way — `Fatal` / `Transient` / `WindowGone` / `WindowHidden`. Each tick opens with a `validate_window_present` pre-capture liveness probe (catches a relaunch or hidden window before the ~140ms capture; logs a `probe_ms` line). On a `WindowGone` / `WindowHidden` signal the loop enters a `recover_window` recovery sub-loop — re-discovering a relaunched RoK or waiting out a hidden window, then resuming — instead of aborting; a successful recovery resets the consecutive-failure streak and the last-match position. Recovery is gated to `ROK_BOT_MAX_TICKS >= 2`, so `ROK_BOT_MAX_TICKS=1` stays an exact one-shot. A pre-landing `/review` caught an unbounded-recovery-spin bug (a crash-looping RoK would recover forever) — fixed with a `RECOVERY_BUDGET` of 3 plus a `consecutive_recoveries` counter that only a genuinely successful tick resets. New `LoopAborted` (exit 21) reason tags: `window_recovery_exhausted`, `visibility_recovery_exhausted`, `recovery_budget_exhausted` (alongside the existing `failure_budget_exhausted` and `signal_handler_install_failed`). This closes the v0.2 P2 window-lifecycle cluster — D14 (window re-discovery after RoK relaunch), D15 (`not_visible` wait-and-retry), the BD reconfig-race snapshot retry loop, and re-validate-window-identity-at-capture-time are all subsumed.
+
+**Caveat — AC-D15 validation pending.** The D15 `not_visible` recovery CODE shipped in v0.2.1, but the empirical check that a `WindowChanged{not_visible}` actually fires for a window on a BetterDisplay virtual display when the system screensaver / display sleep kicks in has NOT been run yet. If `not_visible` never fires in that scenario the recovery path is dead code for the screensaver case. Tracked as a P3 below ("AC-D15: validate not_visible fires under screensaver").
+
+**Part B — needle-swap discrimination fix** (found via `/investigate`). v0.2 shipped `assets/targets/world-button.png` as a magenta-X sentinel placeholder and the docs said an operator had to crop the real world needle before the loop was "functional". `/investigate` proved that wrong: by reading the bot's own `rok-capture-pre.png` / `rok-capture-post.png` it confirmed the click was ALWAYS toggling the city↔world view correctly every tick. Needle-swap verify was blind for two compounding reasons: (1) `world-button.png` was the placeholder, so it was sentinel-skipped; (2) `city-button.png` was a full 180×180 crop of the whole castle-medallion toggle button, and the city↔world toggle keeps an identical gold-rim/blue-circle chrome in both views (only the small inner glyph differs — castle towers vs folded map), so `imageproc`'s non-mean-centered `CrossCorrelationNormalized` let the shared chrome dominate and the city needle NCC-matched the *other* view's button at 0.96 (above the 0.85 threshold). `find_best_needle` therefore returned the same needle index for both views and needle-swap saw idx 0 → idx 0 → `no_swap` every tick. The fix re-cropped BOTH needles as **96×96 tight inner-glyph crops** (castle-towers glyph, folded-map glyph; shared chrome excluded) — cross-view NCC drops 0.96 → 0.88, so `find_best_needle`'s best-of-N picks the correct-view needle each view (correct ≈1.0, wrong ≈0.88). No matcher *code* change — two real discriminative assets plus matcher test updates. The headline consequence: the v0.2 loop is no longer a plumbing smoke test, it is a working continuous loop confirming real city↔world toggles, and the "operator must crop the placeholder" step is done and gone. Live-verified on a Mode 2 BD virtual display: `ROK_BOT_MAX_TICKS=1` → exit 0 with a `needle-swap verify passed` log line, `ROK_BOT_MAX_TICKS=3` → exit 0 with 3 confirmed toggles (was exit 21 `LoopAborted` before the fix).
 
 ---
 
@@ -159,20 +171,6 @@ Both surface `BotError::PermissionsMissing { which: "..." }` (exit 13). `docs/se
 
 ---
 
-## P2: v0.2 — snapshot retry loop for BD reconfig race (deferred from /review 76f9d41)
-
-**Source:** /review cross-model finding (Claude adversarial A8 + Codex adversarial #4, multi-confirmed)
-**Effort:** human ~1 hour / CC ~20 min
-**Depends on:** v0.2 Mode 2 lifecycle (the race becomes critical when the bot manages BD lifecycle)
-
-`main::run` takes two unrelated snapshots: first the RoK window frame via `find_rok_window`, then the live display arrangement via `display::detect_mode`. Between those calls (microseconds normally, longer under BetterDisplay reconnect storms / Sidecar attach-detach / sleep-wake / a user dragging the window between displays), the two snapshots can describe different worlds. Result: transient `WindowScreenUnresolved` or wrong-mode classification even when the steady-state setup is valid.
-
-**Approach for v0.2:**
-- Wrap the find-window + detect-mode pair in a retry loop with exponential backoff (~3 attempts, 100ms / 250ms / 500ms gaps). If the window+display pair stays inconsistent across all attempts, surface the original error.
-- Tolerate up to N consecutive transient errors before failing (per /plan-eng-review A3 — same pattern that v0.2's drop-detection thread will use).
-
----
-
 ## P2: v0.2 — switch from `OnScreenOnly` to `optionAll` with state-aware filtering (deferred from /review 76f9d41)
 
 **Source:** /review cross-model finding (Claude adversarial A10 + Codex adversarial #5, multi-confirmed)
@@ -185,22 +183,6 @@ Both surface `BotError::PermissionsMissing { which: "..." }` (exit 13). `docs/se
 - Switch to `kCGWindowListOptionAll` (or `OnScreenOnly | IncludingWindow` if window IDs are cached).
 - Add a state filter: only consider windows where `kCGWindowIsOnscreen == 1` for the Mode classification step, but keep all RoK-owned windows in scope for "is RoK running at all?" detection.
 - Distinguish three states in error reporting: RoK process not running (rare), RoK running but window minimized/off-Space, RoK present and on-screen.
-
----
-
-## P2: v0.2 — re-validate window identity at capture time (deferred from /review cf45fd5)
-
-**Source:** /review of v0.1.1 capture milestone — multi-confirmed by Claude adversarial subagent + Codex adversarial (D3 in the AskUserQuestion batch)
-**Effort:** human ~30 min / CC ~10 min
-**Depends on:** v0.2 migration to `objc2-screen-capture-kit`
-
-`src/window.rs::find_rok_window` validates RoK by owner+title+bundle-ID prefix during enumeration, but `src/main.rs::run` then captures using only the cached `window.id` 50–150ms later. macOS aggressively reuses CGWindowIDs after a window closes — if RoK quits mid-flow (player reflex-closing the game, a crash, BD reconnect dance), the same u32 can be reassigned to another app's window. Best case `screencapture` fails with non-zero exit and we see exit 14. Worst case we capture a different app's window: still a valid PNG, the bot logs success, and v0.1.2 template-match silently misses with no signal it captured the wrong thing.
-
-Not addressed in v0.1.1 because v0.2's capture-pipeline migration to `objc2-screen-capture-kit` reshapes this entirely — any revalidation we add now is throwaway.
-
-**Approach for v0.2:**
-- At the SCStream / SCContentFilter setup step, re-resolve the target by owner+title+bundle-ID prefix rather than by cached CGWindowID. SCK's content-filter API takes an `SCWindow` reference, not a raw window ID, so identity is bound at use-time by construction.
-- If we still want CGWindowID for diagnostics, add a re-validation call: `CGWindowListCreateDescriptionFromArray([wid])` immediately before capture, fail with a new variant (e.g., `WindowVanished`) if owner/title/bundle no longer match.
 
 ---
 
@@ -588,29 +570,35 @@ The v0.2 loop clicks at a fixed ~500ms+ cadence, at the exact same screen coordi
 
 ---
 
-## P2: v0.2.x — window re-discovery after RoK relaunch mid-loop (deferred from /plan-eng-review 2026-05-16)
+## P3: v0.2.x — AC-D15: validate not_visible fires under screensaver (deferred from v0.2.1 ship)
 
-**Source:** /plan-eng-review of the v0.2 continuous loop — outside-voice (Claude subagent) finding #4.
-**Effort:** human ~1.5 hours / CC ~40 min
-**Depends on:** v0.2 continuous loop landed. **Design together with** the two existing P2 window items — "re-validate window identity at capture time" and "snapshot retry loop for BD reconfig race" — they are the same window-lifecycle cluster.
+**Source:** v0.2.1 ship — the D15 `not_visible` recovery code shipped but the empirical acceptance check (AC-D15) was not run.
+**Effort:** human ~15 min (run the loop, trigger the screensaver, observe).
+**Depends on:** v0.2.1 shipped.
 
-The v0.2 loop runs `find_rok_window` once at boot and holds the resulting `RokWindow` (SCWindow handle + WID) for every tick. If RoK crashes and auto-restarts mid-loop, the new instance gets a fresh WID; the cached SCWindow handle is stale. The next captures time out (5s each) and after 3 the loop aborts `LoopAborted` exit 21 — a clean abort, but the loop ends on a RoK crash instead of riding through the restart.
+v0.2.1's `recover_window` sub-loop treats a `WindowHidden` (`WindowChanged{not_visible}`) signal by waiting the window out instead of aborting. The recovery code is in and unit-tested, but it has NOT been confirmed that a `WindowChanged{not_visible}` actually *fires* for a window on a BetterDisplay virtual display when the system screensaver / display sleep kicks in. If `not_visible` never fires in that scenario, the screensaver branch of the recovery path is dead code and Mode 2 still wouldn't survive a real idle.
 
 **Approach:**
-- On a stale-window signal (`CaptureFailed{window_not_found}` or repeated capture timeout), re-run `find_rok_window`, refresh the cached `RokWindow`, and resume the loop rather than counting toward the abort budget.
-- Bound re-discovery attempts so a genuinely-gone RoK still aborts.
-- Co-design with the window-identity-revalidation P2 item: SCK's content-filter binds identity at use-time, so revalidation and re-discovery share machinery.
+- Run the loop on a Mode 2 BD virtual display with `ROK_BOT_MAX_TICKS` high enough to outlast the screensaver delay.
+- Trigger the screensaver / display sleep manually (hot corner, or wait out the idle timer).
+- Observe: does a tick log a `WindowHidden` / `not_visible` signal and enter recovery, then resume when the screensaver dismisses? Or does the loop sail through unaffected (capture still succeeds), or fail some other way?
+- If `not_visible` never fires, close AC-D15 as a non-issue and note that Mode 2 capture survives a screensaver natively. If it fires, confirm the recovery sub-loop rides it out and the run resumes.
 
 ---
 
-## P2: v0.2.x — not_visible wait-and-retry for full screensaver survival (deferred from /plan-eng-review 2026-05-16)
+## P3: v0.2.x — slim the L4 pre-capture liveness probe if per-tick timing shows it heavy (deferred from /plan-eng-review 2026-05-17)
 
-**Source:** /plan-eng-review of the v0.2 continuous loop — decision D12, deferred option B.
-**Effort:** human ~1.5 hours / CC ~40 min
-**Depends on:** v0.2 continuous loop landed. **Design with** the window re-discovery TODO above (same window-lifecycle cluster). **Gated on** an empirical check: does `WindowChanged{not_visible}` actually fire for a window on a BetterDisplay virtual display when the system idles / screensavers? D12 and the outside voice disagreed and neither verified it.
+**Source:** /plan-eng-review of the v0.2.1 window-lifecycle design — decision D9 (outside-voice finding #2).
+**Effort:** human ~30 min / CC ~15 min
+**Depends on:** v0.2.1 shipped AND per-tick probe timing logs collected from real runs.
 
-D12 classified `not_visible` as a transient failure: the loop tolerates a brief blip (Space switch, momentary idle) but still aborts after 3 consecutive hidden ticks (~5s). It does NOT survive a multi-minute screensaver or display sleep. Mode 2's value proposition — run RoK on a virtual display while you work elsewhere — implies the system can idle and the loop should survive it.
+v0.2.1's L4 runs a full `validate_window_present` at the start of every loop tick to detect a RoK relaunch (`wid_gone`) or a hidden window (`not_visible`) before the ~140ms capture. `validate_window_present` does two `copy_window_info` CGWindow enumerations (`OnScreenOnly` + `All`), each parsing every window on the system. D9 kept the full probe (it catches `not_visible` pre-capture, avoiding a wasted capture on a hidden window) and added a per-tick timing log line alongside `capture_ms` so the cost is observable.
+
+If real runs on a busy desktop show the probe is heavy relative to the per-tick budget, slim it:
 
 **Approach:**
-- First, empirically settle whether `not_visible` even fires in Mode 2 under system idle (run the loop, trigger a screensaver, observe). If it never fires, this TODO closes as a non-issue.
-- If it does: on `not_visible`, enter a dedicated wait-and-poll sub-loop that sleeps and re-checks window visibility WITHOUT counting against the abort budget, resuming the main loop when RoK reappears. Bound the total wait so a permanently-gone RoK still aborts.
+- Probe only `kCGWindowListOptionAll` for the `(WID, PID)` pair — one enumeration instead of two. This still catches a relaunch (`wid_gone`) but loses pre-capture `not_visible` detection: a hidden RoK would then burn a full capture + match each tick until the post-click `validate_window_present` notices.
+- Alternatively, add a cheaper liveness primitive (e.g., a PID-only `kill(pid, 0)` liveness check) as a fast pre-filter, falling back to the full `validate_window_present` only when the fast check is ambiguous.
+- Decide the tradeoff with timing data in hand — do not slim speculatively.
+
+**Why deferred:** the probe is expected to be a few ms against a ~140ms capture; slimming it without data is premature, and the cheaper variant trades away a real correctness property (pre-capture hidden detection). The v0.2.1 timing log gates this naturally.
