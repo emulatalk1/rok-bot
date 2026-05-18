@@ -35,13 +35,16 @@
 //! is why `match_in` rejects zero-variance needles before invoking imageproc.
 //!
 //! Assets: the needles are `include_bytes!`-embedded at compile time from
-//! `assets/targets/`. `city-button.png` is a 180×180 crop of the bottom-left
-//! castle medallion in city view; `world-button.png` is its world-view
-//! counterpart (a sentinel placeholder until an operator crops the real
-//! art). A `needle_has_placeholder_sentinel` safety brake inside
-//! [`find_best_needle`] skips any needle carrying the v0.1.4-era synthetic
-//! placeholder pattern, so a placeholder needle is dormant rather than a
-//! false-match hazard.
+//! `assets/targets/`. Both are 96×96 tight crops of the inner glyph of
+//! RoK's bottom-left city↔world toggle button — `city-button.png` is the
+//! castle-medallion glyph, `world-button.png` is the map glyph. The crops
+//! deliberately exclude the gold-rim/blue-circle chrome the two toggle
+//! states share: under the matcher's non-mean-centered NCC a full-button
+//! crop scores ~0.96 against the wrong state (shared chrome dominates the
+//! correlation), while the tight glyph crop drops that to ~0.88. A
+//! `needle_has_placeholder_sentinel` safety brake inside [`find_best_needle`]
+//! still skips any needle carrying the v0.1.4-era synthetic placeholder
+//! pattern — defense-in-depth against a placeholder being committed again.
 
 use std::path::Path;
 use std::time::Instant;
@@ -101,36 +104,35 @@ pub const MATCH_THRESHOLD: f32 = 0.85;
 /// decode arm in `find_best_needle` catches as `ImageLoadFailed`. The
 /// `embedded_needle_decodes` test pins decode-validity at `cargo test` time.
 ///
-/// As of v0.1.5 the committed bytes are a 180×180 crop of the bottom-left
-/// castle medallion in **city view**. v0.1.4 shipped with a synthetic
-/// placeholder carrying `PLACEHOLDER_SENTINEL_LUMA` so the matcher could
-/// refuse false-matches via the safety brake; with the real crop, the
-/// sentinel is absent and the brake is dormant defense-in-depth against
-/// accidental re-introduction of the placeholder (see /qa live-smoke
-/// 2026-05-11 for the original false-match incident).
+/// The committed bytes are a 96×96 tight crop of the castle-medallion
+/// glyph of RoK's city↔world toggle button. The crop excludes the
+/// gold-rim/blue-circle chrome shared with the map-glyph world needle so
+/// the non-mean-centered NCC can discriminate the two toggle states. The
+/// sentinel-placeholder safety brake is dormant defense-in-depth (a real
+/// crop carries no sentinel; see /qa live-smoke 2026-05-11 for the
+/// original placeholder false-match incident).
 pub const TARGET_BYTES: &[u8] = include_bytes!("../assets/targets/city-button.png");
 
 /// Compile-time-embedded world-view needle — index 1 in [`NEEDLES`].
 ///
 /// v0.2's continuous loop targets the city↔world toggle. Confirming a
 /// click actually toggled the view (design D11 needle-swap verify)
-/// needs a needle for EACH view: `TARGET_BYTES` is the city-view art
-/// of the castle medallion, `WORLD_TARGET_BYTES` is the world-view art
-/// of the same on-screen button.
+/// needs a needle for EACH state of the toggle button: `TARGET_BYTES`
+/// is the castle-medallion glyph, `WORLD_TARGET_BYTES` is the map glyph.
 ///
-/// As of v0.2 the committed bytes are a PLACEHOLDER carrying the
-/// `PLACEHOLDER_SENTINEL_LUMA` pattern. [`find_best_needle`] skips any
-/// needle the sentinel gate flags, so the world needle is dormant —
-/// the loop matches only the city needle and the needle-swap verify
-/// can never confirm a toggle, so every tick fails `ClickNotVerified`
-/// and the loop aborts (`LoopAborted`, exit 21). v0.2 is functionally
-/// gated on an operator replacing this file with a real 180×180
-/// world-view crop. This mirrors the v0.1.4-era city-button
-/// placeholder; the crop procedure is in `docs/setup.md`.
+/// The committed bytes are a 96×96 tight crop of the map glyph. v0.2
+/// shipped this as a sentinel placeholder, which left the needle-swap
+/// verify dormant — every tick failed `no_swap` because only one real
+/// needle was matchable. The v0.2.x needle re-crop replaced it with the
+/// real RoK art. The tight inner-glyph crop is deliberate: a full-button
+/// crop NCC-matches the castle state at ~0.96, leaving `find_best_needle`'s
+/// best-of-N a fragile ~0.04 margin; the glyph crop drops the cross-state
+/// score to ~0.88 for a ~0.12 margin. The crop procedure is in
+/// `docs/setup.md`.
 pub const WORLD_TARGET_BYTES: &[u8] = include_bytes!("../assets/targets/world-button.png");
 
-/// The two needles in canonical index order: 0 = city-view art,
-/// 1 = world-view art. The continuous loop's per-tick match and the
+/// The two needles in canonical index order: 0 = castle-medallion
+/// glyph, 1 = map glyph. The continuous loop's per-tick match and the
 /// needle-swap verify both key off these indices — a confirmed toggle
 /// is "the post-click best match has a different index than the
 /// pre-click best match did."
@@ -528,8 +530,7 @@ pub fn find_target_in_castle_roi(haystack_path: &Path) -> Result<Option<Match>> 
 /// Per-needle handling:
 /// * A needle carrying the `PLACEHOLDER_SENTINEL_LUMA` pattern is
 ///   skipped (logged at warn), not matched — so a placeholder needle
-///   (the v0.2 `WORLD_TARGET_BYTES` until an operator crops it) is
-///   dormant rather than poisoning the result with a false match.
+///   is dormant rather than poisoning the result with a false match.
 /// * A needle that fails to decode surfaces as
 ///   `BotError::ImageLoadFailed { which: "needle" }`.
 ///
@@ -621,8 +622,7 @@ where
             .to_luma8();
 
         // Placeholder sentinel gate. A needle carrying the v0.1.4-era
-        // synthetic placeholder pattern (the v0.2 WORLD_TARGET_BYTES
-        // until an operator crops it) is SKIPPED, not matched: the
+        // synthetic placeholder pattern is SKIPPED, not matched: the
         // matcher's non-mean-centered NCC scores low-entropy needles
         // 0.9+ against arbitrary haystacks, so matching a placeholder
         // would post a false-positive click. Skipping (vs aborting the
@@ -1244,6 +1244,32 @@ mod tests {
         rgba.save(path).expect("write tempfile PNG");
     }
 
+    /// A synthetic sentinel needle as RGBA PNG bytes — top row carries the
+    /// `PLACEHOLDER_SENTINEL_LUMA` pattern, the rest is mid-gray. Both
+    /// embedded needles are real RoK crops since the v0.2.x needle re-crop,
+    /// so the sentinel-gate tests build their own placeholder rather than
+    /// leaning on a shipped asset.
+    fn sentinel_needle_png_bytes() -> Vec<u8> {
+        let mut img = GrayImage::from_pixel(8, 8, Luma([128]));
+        for (x, &l) in PLACEHOLDER_SENTINEL_LUMA.iter().enumerate() {
+            img.put_pixel(
+                u32::try_from(x).expect("sentinel index fits u32"),
+                0,
+                Luma([l]),
+            );
+        }
+        let mut rgba = image::RgbaImage::new(img.width(), img.height());
+        for (x, y, p) in img.enumerate_pixels() {
+            let l = p[0];
+            rgba.put_pixel(x, y, image::Rgba([l, l, l, 255]));
+        }
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(rgba)
+            .write_to(&mut cursor, image::ImageFormat::Png)
+            .expect("encode sentinel test PNG");
+        cursor.into_inner()
+    }
+
     #[test]
     fn find_target_round_trip_with_real_haystack() {
         // Integration happy path: plant the real embedded needle into a noise
@@ -1261,10 +1287,10 @@ mod tests {
         let path = dir.path().join("haystack.png");
 
         let needle = embedded_needle_luma();
-        // Haystack must be larger than the needle in both dimensions plus the
-        // plant offset. v0.1.5 needle is 180x180 logical; pick 400x320 to
-        // leave ~100 px of background context on the right/bottom for NCC's
-        // sliding window to confirm uniqueness of the planted position.
+        // Haystack must be larger than the needle in both dimensions plus
+        // the plant offset. The v0.2.x needle is 96×96; 400x320 leaves
+        // ample background context on the right/bottom for NCC's sliding
+        // window to confirm uniqueness of the planted position.
         let mut haystack = noise_image(400, 320, 0xF00D);
         plant_needle_at(&mut haystack, &needle, 100, 60);
         write_luma_as_rgba_png(&haystack, &path);
@@ -2094,12 +2120,12 @@ mod tests {
     }
 
     #[test]
-    fn find_best_needle_skips_sentinel_world_placeholder_and_matches_city() {
-        // NEEDLES = [city (real crop), world (sentinel placeholder)].
-        // Plant the city needle: find_best_needle must skip the
-        // sentinel world needle and still return the city match at
-        // needle_idx 0. This is the v0.2 reality until an operator
-        // crops the real world art.
+    fn find_best_needle_returns_city_match_when_only_city_planted() {
+        // NEEDLES = [city, world], both real RoK crops since the v0.2.x
+        // re-crop. Plant only the city (castle-medallion) needle into a
+        // noise haystack: find_best_needle's best-of-N must return the
+        // city match at needle_idx 0 — the world needle has nothing to
+        // correlate with in the noise.
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("haystack.png");
         let needle = embedded_needle_luma();
@@ -2112,7 +2138,36 @@ mod tests {
             .expect("city needle planted exactly → clears threshold");
         assert_eq!(
             nm.needle_idx, 0,
-            "city needle (idx 0) must win; the world placeholder is sentinel-skipped",
+            "city needle (idx 0) planted exactly must win best-of-N",
+        );
+        assert_eq!((nm.m.x, nm.m.y), (200, 150));
+    }
+
+    #[test]
+    fn find_best_needle_returns_world_match_when_only_world_planted() {
+        // Regression for the v0.2.x needle re-crop. While world-button.png
+        // was the magenta-X sentinel placeholder, find_best_needle skipped
+        // the world needle entirely, so the needle-swap verify could never
+        // observe a city→world toggle (every tick failed `no_swap`).
+        // Planting the real world (map-glyph) needle must now yield a
+        // needle_idx 1 match; with the placeholder this panics on the
+        // `.expect` below (sentinel-skipped → no idx-1 match).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("haystack.png");
+        let world = image::load_from_memory(WORLD_TARGET_BYTES)
+            .expect("world needle decodes")
+            .to_luma8();
+        let mut haystack = noise_image(800, 600, 0xD00D_0001);
+        plant_needle_at(&mut haystack, &world, 200, 150);
+        write_luma_as_rgba_png(&haystack, &path);
+
+        let nm = find_best_needle(&path, &NEEDLES, |_, _| None)
+            .expect("haystack decodes")
+            .expect("world needle planted exactly → clears threshold");
+        assert_eq!(
+            nm.needle_idx, 1,
+            "world needle (idx 1) planted exactly must win best-of-N — it was \
+             sentinel-skipped while world-button.png was the placeholder",
         );
         assert_eq!((nm.m.x, nm.m.y), (200, 150));
     }
@@ -2133,21 +2188,21 @@ mod tests {
     }
 
     #[test]
-    fn embedded_world_needle_is_placeholder_until_operator_crops_it() {
-        // v0.2 ships WORLD_TARGET_BYTES as a sentinel placeholder — the
-        // needle-swap verify is dormant until an operator crops the
-        // real world-view art. When that crop lands, this test FAILS:
-        // that is the forcing function. Flip it then to assert NO
-        // sentinel (mirroring `embedded_needle_carries_no_sentinel`).
+    fn embedded_world_needle_carries_no_sentinel() {
+        // The v0.2.x needle re-crop replaced the magenta-X placeholder
+        // with a real RoK map-glyph crop. The sentinel pattern must NOT
+        // be present, or find_best_needle would sentinel-skip the world
+        // needle and the needle-swap verify would go dormant again
+        // (every tick `no_swap`). Mirror of `embedded_needle_carries_no_sentinel`.
         let needle = image::load_from_memory(WORLD_TARGET_BYTES)
             .expect("embedded world needle must decode")
             .to_luma8();
         assert!(
-            needle_has_placeholder_sentinel(&needle),
-            "WORLD_TARGET_BYTES is expected to be the sentinel placeholder in \
-             v0.2. If an operator has cropped the real world-view art into \
-             assets/targets/world-button.png, flip this test to assert \
-             !needle_has_placeholder_sentinel (and update the embedded-asset doc)."
+            !needle_has_placeholder_sentinel(&needle),
+            "committed world needle must NOT carry the placeholder sentinel \
+             pattern [255, 0, 255, 0]. If this fires, \
+             assets/targets/world-button.png was reverted to the placeholder \
+             — restore the real RoK map-button crop."
         );
     }
 
@@ -2323,28 +2378,31 @@ mod tests {
 
     #[test]
     fn find_best_needle_all_sentinel_needles_returns_none() {
-        // Every needle sentinel-gated (WORLD_TARGET_BYTES is the v0.2
-        // placeholder) → all skipped → Ok(None): no match, no error.
+        // Every needle carries the placeholder sentinel → all skipped →
+        // Ok(None): no match, no error. Both shipped needles are real RoK
+        // crops now, so the test builds synthetic sentinel needles.
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("haystack.png");
         write_luma_as_rgba_png(&noise_image(300, 300, 0xABCD_1234), &path);
-        let got = find_best_needle(&path, &[WORLD_TARGET_BYTES, WORLD_TARGET_BYTES], |_, _| {
-            None
-        })
-        .expect("haystack decodes");
+        let sentinel = sentinel_needle_png_bytes();
+        let s: &[u8] = &sentinel;
+        let got = find_best_needle(&path, &[s, s], |_, _| None).expect("haystack decodes");
         assert!(got.is_none(), "every needle sentinel-gated → Ok(None)");
     }
 
     #[test]
     fn count_placeholder_needles_counts_sentinel_needles() {
-        // City is a real crop (0 placeholders); world is the v0.2
-        // sentinel placeholder. Drives the run_loop boot warning.
+        // Both embedded needles are real RoK crops since the v0.2.x
+        // re-crop → zero placeholders. Synthetic sentinel needles drive
+        // the counting assertions. count_placeholder_needles(&NEEDLES)
+        // returning 0 is what keeps the run_loop boot warning silent.
+        assert_eq!(count_placeholder_needles(&NEEDLES), 0);
         assert_eq!(count_placeholder_needles(&[TARGET_BYTES]), 0);
-        assert_eq!(count_placeholder_needles(&[WORLD_TARGET_BYTES]), 1);
-        assert_eq!(count_placeholder_needles(&NEEDLES), 1);
-        assert_eq!(
-            count_placeholder_needles(&[WORLD_TARGET_BYTES, WORLD_TARGET_BYTES]),
-            2,
-        );
+        assert_eq!(count_placeholder_needles(&[WORLD_TARGET_BYTES]), 0);
+        let sentinel = sentinel_needle_png_bytes();
+        let s: &[u8] = &sentinel;
+        assert_eq!(count_placeholder_needles(&[s]), 1);
+        assert_eq!(count_placeholder_needles(&[s, s]), 2);
+        assert_eq!(count_placeholder_needles(&[TARGET_BYTES, s]), 1);
     }
 }
